@@ -1,0 +1,22 @@
+[package]
+name = "dex-decompiler"
+version = "0.1.0"
+edition = "2021"
+description = "DEX to Java decompiler in pure Rust"
+license = "Apache-2.0"
+
+[dependencies]
+dex-bytecode = { git = "https://github.com/androguard/dex-bytecode.git" }
+dex-parser = { git = "https://github.com/androguard/dex-parser", branch = "main" }
+thiserror = "2.0.18"
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.18.3"
+
+[lib]
+name = "dex_decompiler"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dex-decompile"
+path = "src/bin/dex-decompile.rs"
