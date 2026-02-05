@@ -14,7 +14,6 @@ A **DEX to Java decompiler** in pure Rust. It parses DEX files, disassembles Dal
 - **SSA-style IR**: Versioned vars, type inference (params, return, propagation), invoke simplification (invoke + move-result + return → single return), dead-assign pass with method-wide used regs.
 - **Java emission**: Class and method signatures, field declarations, method bodies as Java-like source; optional raw DEX instruction listing as comments before each method.
 - **Library API**: Parse DEX, decompile classes/methods, and get **per-method bytecode and CFG** (nodes/edges) for visualization or tooling.
-- **Web (WASM)**: Browser-based UI to load a DEX, browse by package → class → method, and view **CFG graph** (with bytecode in each block) and decompilation. See [web/README.md](web/README.md).
 
 ## Dependencies
 
@@ -83,6 +82,26 @@ let (rows, nodes, edges) = decompiler.get_method_bytecode_and_cfg(encoded)?;
 // nodes: Vec<CfgNodeInfo> { id, start_offset, end_offset, label }
 // edges: Vec<CfgEdgeInfo> { from_id, to_id }
 ```
+
+### Python bindings
+
+A [PyO3](https://pyo3.rs/) / [maturin](https://www.maturin.rs/) crate in **`dex-decompiler-py/`** exposes the decompiler to Python:
+
+```bash
+cd dex-decompiler-py && maturin build --release && pip install target/wheels/dex_decompiler-*.whl
+```
+
+```python
+import dex_decompiler
+
+dex = dex_decompiler.parse_dex(open("classes.dex", "rb").read())
+java_src = dex.decompile()
+dex.decompile_to_dir("out/")
+method_java = dex.decompile_method("com.example.MainActivity", "onCreate")
+bytecode_rows, cfg_nodes, cfg_edges = dex.get_method_bytecode_and_cfg("com.example.MainActivity", "onCreate")
+```
+
+See [dex-decompiler-py/README.md](dex-decompiler-py/README.md) for full API and installation options.
 
 ## Tests
 

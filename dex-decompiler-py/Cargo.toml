@@ -1,0 +1,13 @@
+[package]
+name = "dex-decompiler-py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for dex-decompiler (DEX to Java decompiler)"
+
+[lib]
+name = "dex_decompiler"
+crate-type = ["cdylib"]
+
+[dependencies]
+dex-decompiler = { path = ".." }
+pyo3 = { version = "0.23", features = ["extension-module"] }
