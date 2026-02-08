@@ -10,6 +10,8 @@ pub use error::{DexDecompilerError, Result};
 pub use decompile::{
     CfgEdgeInfo, CfgNodeInfo, Decompiler, DecompilerOptions, MethodBytecodeRow,
 };
+pub use decompile::value_flow::{ValueFlowAnalysis, ValueFlowAnalysisOwned, ValueFlowResult};
+pub use decompile::pending_intent::{PendingIntentFinding, scan_pending_intents};
 
 /// Parse a DEX file from raw bytes. Returns decompiler Result (maps parser errors to Parse).
 pub fn parse_dex(data: &[u8]) -> Result<DexFile> {

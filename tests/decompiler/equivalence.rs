@@ -16,6 +16,7 @@ fn test_decompiler_minimal_dex_empty_output() {
     );
 }
 
+/// Parse of invalid bytes must fail.
 #[test]
 fn test_decompiler_parse_fails_invalid() {
     assert!(parse_dex(&[]).is_err());

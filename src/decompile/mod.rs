@@ -6,9 +6,12 @@ mod cfg;
 pub mod graph;
 mod ir;
 pub mod pass;
+pub mod pending_intent;
+mod read_write;
 pub mod region;
 mod simplify;
 mod type_infer;
+pub mod value_flow;
 
 use cfg::{BlockEnd, BlockId, MethodCfg};
 use region::{build_regions, Region};
@@ -21,6 +24,10 @@ use ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
 use pass::{run_dead_assign_with_used_regs, DeadAssignPass, InvokeChainPass, PassRunner, SsaRenamePass, used_regs};
 use std::collections::{HashMap, HashSet};
 use type_infer::{build_var_names, infer_types};
+use value_flow::{
+    build_api_return_sources, build_invoke_method_map, build_instruction_rw_map,
+    ValueFlowAnalysisOwned,
+};
 
 /// Options for filtering which classes are decompiled (e.g. `--only-package`, `--exclude`).
 #[derive(Clone, Default)]
@@ -326,6 +333,36 @@ impl<'a> Decompiler<'a> {
             .map(|(from_id, to_id)| CfgEdgeInfo { from_id, to_id })
             .collect();
         Ok((rows, nodes, edges))
+    }
+
+    /// Value-flow / tainting: build CFG and per-instruction read/write map for a method.
+    /// Use `.analysis().value_flow_from_seed(offset, reg)` to get all reads/writes of a value.
+    pub fn value_flow_analysis(&self, encoded: &EncodedMethod) -> Result<ValueFlowAnalysisOwned> {
+        if encoded.code_off == 0 {
+            return Err(DexDecompilerError::Decompilation(
+                "value_flow_analysis: method has no code".into(),
+            ));
+        }
+        let code = self.dex.get_code_item(encoded.code_off).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let insns_bytes = code.insns_slice(&*self.dex.data);
+        let base_offset = 0usize;
+        let instructions = decode_all(insns_bytes, base_offset)
+            .map_err(|e| DexDecompilerError::Disassembly(e.to_string()))?;
+        let condition_for = |ins: &Instruction| {
+            let resolved = self.resolve_operands(ins.operands());
+            format_condition(ins.mnemonic(), &resolved)
+        };
+        // CFG and rw_map use the same offset space (relative to method code start: 0, 2, 4, ...).
+        let cfg = MethodCfg::build(&instructions, insns_bytes, base_offset, &condition_for);
+        let rw_map = build_instruction_rw_map(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
+        let api_return_sources = build_api_return_sources(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
+        let invoke_method_map = build_invoke_method_map(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
+        Ok(ValueFlowAnalysisOwned {
+            cfg,
+            rw_map,
+            api_return_sources,
+            invoke_method_map,
+        })
     }
 
     /// Raw DEX instructions line by line as comments (before the method body).
@@ -1169,7 +1206,7 @@ pub(crate) fn parse_three_regs(ops: &str) -> Option<(u32, u32, u32)> {
 
 /// Parse iget/iput operands: "vA, vB, ClassName.fieldName" -> (dest_reg, object_reg, field_name).
 /// field_name is the segment after the last dot (Java instance field access).
-fn parse_instance_field_operands(ops: &str) -> Option<(u32, u32, String)> {
+pub(crate) fn parse_instance_field_operands(ops: &str) -> Option<(u32, u32, String)> {
     let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
     if parts.len() < 3 {
         return None;
@@ -1182,7 +1219,7 @@ fn parse_instance_field_operands(ops: &str) -> Option<(u32, u32, String)> {
 }
 
 /// Parse sget/sput operands: "vA, ClassName.fieldName" -> (reg, field_ref).
-fn parse_static_field_operands(ops: &str) -> Option<(u32, String)> {
+pub(crate) fn parse_static_field_operands(ops: &str) -> Option<(u32, String)> {
     let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
     if parts.len() < 2 {
         return None;
