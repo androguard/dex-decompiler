@@ -53,6 +53,7 @@ fn test_decompiler_try_catch_comment() {
     let options = DecompilerOptions {
         only_package: Some("androguard.test".to_string()),
         exclude: vec![],
+        ..Default::default()
     };
     let dc = Decompiler::with_options(&dex, options);
     let _java = dc.decompile().unwrap();
@@ -71,6 +72,7 @@ fn test_decompiler_switch_packed_cases() {
     let options = DecompilerOptions {
         only_package: Some("androguard.test".to_string()),
         exclude: vec![],
+        ..Default::default()
     };
     let dc = Decompiler::with_options(&dex, options);
     let java = dc.decompile().unwrap();

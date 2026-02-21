@@ -182,6 +182,7 @@ fn main() -> Result<()> {
     let options = DecompilerOptions {
         only_package: args.only_package,
         exclude: args.exclude.clone(),
+        show_bytecode: args.show_bytecode,
     };
     let decompiler = Decompiler::with_options(&dex, options);
 
@@ -258,4 +259,8 @@ struct Args {
     /// Scan all methods for PendingIntent creation sites (PITracker-like). Reports base Intent emptiness and destination.
     #[arg(long = "scan-pending-intent")]
     scan_pending_intent: bool,
+
+    /// Emit raw DEX instructions as comments before each method body (for debugging).
+    #[arg(long = "show-bytecode")]
+    show_bytecode: bool,
 }

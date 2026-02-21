@@ -36,6 +36,8 @@ pub struct DecompilerOptions {
     pub only_package: Option<String>,
     /// Exclude classes whose name equals or starts with any of these (after trimming trailing `.` or `.*`). E.g. `android.`
     pub exclude: Vec<String>,
+    /// If true, emit raw DEX instructions as comments before each method body.
+    pub show_bytecode: bool,
 }
 
 /// One instruction row for bytecode display (e.g. in web UI).
@@ -84,6 +86,7 @@ pub struct Decompiler<'a> {
     pub dex: &'a DexFile,
     only_package: Option<String>,
     exclude: Vec<String>,
+    show_bytecode: bool,
 }
 
 impl<'a> Decompiler<'a> {
@@ -92,6 +95,7 @@ impl<'a> Decompiler<'a> {
             dex,
             only_package: None,
             exclude: vec![],
+            show_bytecode: false,
         }
     }
 
@@ -101,6 +105,7 @@ impl<'a> Decompiler<'a> {
             dex,
             only_package: options.only_package,
             exclude: options.exclude,
+            show_bytecode: options.show_bytecode,
         }
     }
 
@@ -243,11 +248,13 @@ impl<'a> Decompiler<'a> {
             return Ok(out);
         }
         let code = self.dex.get_code_item(encoded.code_off).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-        // Raw DEX instructions line by line before the method body.
-        let raw_listing = self.raw_dex_instructions_listing(&code)?;
-        if !raw_listing.is_empty() {
-            writeln!(&mut out).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-            write!(&mut out, "{}", raw_listing).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        // Raw DEX instructions as comments before the method body (only when requested).
+        if self.show_bytecode {
+            let raw_listing = self.raw_dex_instructions_listing(&code)?;
+            if !raw_listing.is_empty() {
+                writeln!(&mut out).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                write!(&mut out, "{}", raw_listing).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            }
         }
         let body = self.decompile_method_body(&code, encoded)?;
         writeln!(&mut out, "{{").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;

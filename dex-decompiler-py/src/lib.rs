@@ -73,6 +73,7 @@ impl DexFileWrapper {
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
+            ..Default::default()
         };
         let decompiler = Decompiler::with_options(&dex, options);
         decompiler.decompile().map_err(|e| PyValueError::new_err(e.to_string()))

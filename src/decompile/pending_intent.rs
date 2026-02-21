@@ -194,7 +194,6 @@ pub fn scan_pending_intents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::value_flow::InstructionRwMap;
     use std::collections::HashMap;
 
     fn make_cfg(instruction_offsets: Vec<u32>) -> MethodCfg {
@@ -223,7 +222,7 @@ mod tests {
     ) -> ValueFlowAnalysisOwned {
         let offsets = vec![0u32, 2, 4, 6, 8];
         let cfg = make_cfg(offsets.clone());
-        let mut rw_map: InstructionRwMap = HashMap::new();
+        let mut rw_map: HashMap<u32, (Vec<u32>, Vec<u32>)> = HashMap::new();
         if intent_has_setter {
             rw_map.insert(0, (vec![0, 1], vec![])); // invoke setAction(v0, v1)
             rw_map.insert(2, (vec![], vec![2]));    // move-result v2
@@ -285,7 +284,7 @@ mod tests {
     fn scan_returns_empty_when_no_pending_intent_creation() {
         let offsets = vec![0u32, 2, 4];
         let cfg = make_cfg(offsets);
-        let mut rw_map: InstructionRwMap = HashMap::new();
+        let mut rw_map: HashMap<u32, (Vec<u32>, Vec<u32>)> = HashMap::new();
         rw_map.insert(0, (vec![], vec![0]));
         rw_map.insert(4, (vec![0], vec![]));
         let owned = ValueFlowAnalysisOwned {

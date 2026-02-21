@@ -74,11 +74,12 @@ A **DEX to Java decompiler** in pure Rust. It parses DEX files, disassembles Dal
 
 Both are pulled from GitHub in `Cargo.toml`; no local paths required.
 
-## Build
+## Run
 
 ```bash
-cargo build --release
+cargo run --release --bin dex-decompile -- -i classes.dex
 ```
+This builds (if needed) and runs the decompiler. See [Usage](#usage) below for more options.
 
 ## Usage
 
@@ -122,6 +123,7 @@ cargo run --bin dex-decompile -- -i app.dex --taint-method "com.example.Main#onC
 | `--taint-reg` | | Register number for taint seed (e.g. `0` for v0). |
 | `--taint-api` | | Taint returns of Android API methods (e.g. `getLastLocation`, `FusedLocationProviderClient.getLastLocation`). Repeatable; matches if method ref contains the pattern. |
 | `--scan-pending-intent` | | Scan all methods for PendingIntent creation sites (PITracker-like). Reports whether the base Intent has modifiable fields set and whether the PendingIntent flows to a dangerous sink (e.g. Notification). See [PITracker (WiSec'22)](https://diaowenrui.github.io/paper/wisec22-zhang.pdf). |
+| `--show-bytecode` | | Emit raw DEX instructions as comments before each method body (for debugging). |
 
 When `--output-dir` is set, progress is shown per class. When `--taint-method` is set with either (`--taint-offset` and `--taint-reg`) or `--taint-api`, the tool prints value-flow (reads/writes) and exits without decompiling. When `--scan-pending-intent` is set, the tool scans every method in the given DEX file(s) for PendingIntent creation and prints a risk report. When both `-o` and `-d` are omitted and neither taint nor scan is used, decompiled Java is printed to stdout.
 
@@ -137,6 +139,7 @@ let dex = parse_dex(&data)?;
 let options = DecompilerOptions {
     only_package: Some("com.example".into()),
     exclude: vec!["android.".into()],
+    ..Default::default()
 };
 let decompiler = Decompiler::with_options(&dex, options);
 let java = decompiler.decompile()?;

@@ -28,6 +28,7 @@ fn test_filter_only_package_matching_includes_class() {
     let options = DecompilerOptions {
         only_package: Some(class_name.clone()),
         exclude: vec![],
+        ..Default::default()
     };
     let dc = Decompiler::with_options(&dex, options);
     let java = dc.decompile().unwrap();
@@ -43,6 +44,7 @@ fn test_filter_only_package_non_matching_excludes_class() {
     let options = DecompilerOptions {
         only_package: Some("other.package".to_string()),
         exclude: vec![],
+        ..Default::default()
     };
     let dc = Decompiler::with_options(&dex, options);
     let java = dc.decompile().unwrap();
@@ -59,6 +61,7 @@ fn test_filter_exclude_class_excludes_it() {
     let options = DecompilerOptions {
         only_package: None,
         exclude: vec![class_name.clone()],
+        ..Default::default()
     };
     let dc = Decompiler::with_options(&dex, options);
     let java = dc.decompile().unwrap();
@@ -75,6 +78,7 @@ fn test_filter_exclude_other_keeps_class() {
     let options = DecompilerOptions {
         only_package: None,
         exclude: vec!["android.".to_string(), "other.".to_string()],
+        ..Default::default()
     };
     let dc = Decompiler::with_options(&dex, options);
     let java = dc.decompile().unwrap();
