@@ -2,11 +2,9 @@
 //! Supports structured control flow: if/else, while loops (via CFG).
 //! Simplification pass: collapse invoke + move-result + return into single return.
 
-mod cfg;
-pub mod graph;
+pub mod cfg;
 mod ir;
 pub mod pass;
-pub mod pending_intent;
 mod read_write;
 pub mod region;
 mod simplify;

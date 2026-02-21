@@ -1,8 +1,9 @@
 //! DEX to Java decompiler in pure Rust.
 //! Uses dex-bytecode for Dalvik instruction disassembly and dex-parser for DEX parsing.
 
-pub mod error;
 pub mod decompile;
+pub mod detectors;
+pub mod error;
 pub mod java;
 
 pub use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod};
@@ -11,7 +12,8 @@ pub use decompile::{
     CfgEdgeInfo, CfgNodeInfo, Decompiler, DecompilerOptions, MethodBytecodeRow,
 };
 pub use decompile::value_flow::{ValueFlowAnalysis, ValueFlowAnalysisOwned, ValueFlowResult};
-pub use decompile::pending_intent::{PendingIntentFinding, scan_pending_intents};
+pub use detectors::pending_intent::{PendingIntentFinding, scan_pending_intents};
+pub use detectors::{run_all_detectors, VulnFinding};
 
 /// Parse a DEX file from raw bytes. Returns decompiler Result (maps parser errors to Parse).
 pub fn parse_dex(data: &[u8]) -> Result<DexFile> {

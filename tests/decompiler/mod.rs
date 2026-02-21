@@ -9,4 +9,5 @@ mod dataflow;
 mod equivalence;
 mod filters;
 mod helpers;
+mod pending_intent;
 mod value_flow;

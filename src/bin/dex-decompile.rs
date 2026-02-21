@@ -6,7 +6,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::Parser;
 use dex_decompiler::{
-    parse_dex, scan_pending_intents, Decompiler, DecompilerOptions, DexFile, EncodedMethod,
+    parse_dex, run_all_detectors, scan_pending_intents, Decompiler, DecompilerOptions, DexFile,
+    EncodedMethod,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -175,6 +176,72 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Vulnerability scan: run all detectors (intent spoofing, RCE, logging, SQL, WebView, secrets, IPC) on every method.
+    if args.scan_vulns {
+        let mut all_findings = Vec::new();
+        for path in &args.input {
+            let data = fs::read(path).with_context(|| format!("read {}", path))?;
+            let dex = parse_dex(&data).context("parse DEX")?;
+            let decompiler = Decompiler::new(&dex);
+            for class_def_result in dex.class_defs() {
+                let class_def = match class_def_result {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let class_type = match dex.get_type(class_def.class_idx) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let class_name = dex_decompiler::java::descriptor_to_java(&class_type);
+                let class_data = match dex.get_class_data(&class_def) {
+                    Ok(Some(cd)) => cd,
+                    _ => continue,
+                };
+                for encoded in class_data
+                    .direct_methods
+                    .iter()
+                    .chain(class_data.virtual_methods.iter())
+                {
+                    if encoded.code_off == 0 {
+                        continue;
+                    }
+                    let method_info = match dex.get_method_info(encoded.method_idx) {
+                        Ok(mi) => mi,
+                        Err(_) => continue,
+                    };
+                    let method_name = method_info.name.to_string();
+                    let owned = match decompiler.value_flow_analysis(encoded) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let findings = run_all_detectors(
+                        &owned,
+                        &class_name,
+                        &method_name,
+                        if args.taint_api.is_empty() {
+                            None
+                        } else {
+                            Some(&args.taint_api)
+                        },
+                    );
+                    all_findings.extend(findings);
+                }
+            }
+        }
+        println!("Vulnerability scan: {} finding(s)", all_findings.len());
+        for f in &all_findings {
+            println!(
+                "  [{}] {}#{}  sink @ 0x{:x}  {}",
+                f.category,
+                f.class_name,
+                f.method_name,
+                f.sink_offset,
+                f.sink_desc
+            );
+        }
+        return Ok(());
+    }
+
     // Decompile: use first DEX file (multi-DEX is supported for taint mode above).
     let path = &args.input[0];
     let data = fs::read(path).with_context(|| format!("read {}", path))?;
@@ -263,4 +330,8 @@ struct Args {
     /// Emit raw DEX instructions as comments before each method body (for debugging).
     #[arg(long = "show-bytecode")]
     show_bytecode: bool,
+
+    /// Run all vulnerability detectors on every method (intent spoofing, RCE dynamic loading, insecure logging, SQL, WebView, hardcoded secrets, IPC). Optional: combine with --taint-api to add logging sources.
+    #[arg(long = "scan-vulns")]
+    scan_vulns: bool,
 }
