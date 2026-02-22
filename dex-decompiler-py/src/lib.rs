@@ -118,8 +118,13 @@ impl DexFileWrapper {
         let encoded = find_method(&dex, class_name, method_name)
             .ok_or_else(|| PyValueError::new_err(format!("method not found: {}#{}", class_name, method_name)))?;
         let decompiler = Decompiler::new(&dex);
+        let class_simple_opt = if method_name == "<init>" {
+            Some(class_name.rsplit('.').next().unwrap_or(class_name))
+        } else {
+            None
+        };
         decompiler
-            .decompile_method(&encoded)
+            .decompile_method(&encoded, class_simple_opt, Some(class_name))
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 

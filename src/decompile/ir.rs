@@ -113,6 +113,10 @@ impl Stmt {
 }
 
 /// Replace variable references (vN or vN_k) in text with names from the map.
+pub fn substitute_names_in_text_pub(s: &str, names: &HashMap<VarId, String>) -> String {
+    substitute_names_in_text(s, names)
+}
+
 fn substitute_names_in_text(s: &str, names: &HashMap<VarId, String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -152,11 +156,7 @@ fn substitute_names_in_text(s: &str, names: &HashMap<VarId, String>) -> String {
     out
 }
 
-fn append_comment(base: String, comment: Option<&str>) -> String {
-    match comment {
-        None => base,
-        Some(c) if c.is_empty() => base,
-        Some(c) => format!("{}  // // {}", base, c),
-    }
+fn append_comment(base: String, _comment: Option<&str>) -> String {
+    base
 }
 

@@ -335,6 +335,99 @@ fn rename_vars_in_text(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
     out
 }
 
+/// Merge `new Foo()` + `receiver.<init>(args)` → `new Foo(args)`, and remove the bare `<init>` call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConstructorMergePass;
+
+impl Pass for ConstructorMergePass {
+    fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
+        let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len());
+        let mut i = 0;
+        while i < stmts.len() {
+            // Pattern: Assign(dst, Raw("new Foo()")) + Expr(Call { target: "dst.<init>", args })
+            if i + 1 < stmts.len() {
+                if let IrStmt::Assign { dst, rhs: IrExpr::Raw(raw), comment } = &stmts[i] {
+                    if let Some(class_name) = raw.strip_prefix("new ").and_then(|s| s.strip_suffix("()")) {
+                        let dst_name = if dst.ver == 0 {
+                            format!("v{}", dst.reg)
+                        } else {
+                            format!("v{}_{}", dst.reg, dst.ver)
+                        };
+                        if let IrStmt::Expr { expr: IrExpr::Call { target, args }, comment: c2 } = &stmts[i + 1] {
+                            if target == &format!("{}.<init>", dst_name) {
+                                let merged_comment = merge_comment(comment.as_deref(), c2.as_deref());
+                                out.push(IrStmt::Assign {
+                                    dst: *dst,
+                                    rhs: IrExpr::Raw(format!("new {}({})", class_name, args)),
+                                    comment: merged_comment,
+                                });
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(stmts[i].clone());
+            i += 1;
+        }
+        out
+    }
+}
+
+/// Expression simplification: `v0 = v0 + 1` → `v0++`, `v0 = v0 + x` → `v0 += x`.
+/// Also simplifies assignments where dst == src (self-assign after copy-prop).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExprSimplifyPass;
+
+impl Pass for ExprSimplifyPass {
+    fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
+        stmts
+            .into_iter()
+            .map(|s| match &s {
+                IrStmt::Assign {
+                    dst,
+                    rhs: IrExpr::Raw(raw),
+                    comment,
+                } => {
+                    if let Some(simplified) = simplify_compound_assign(*dst, raw) {
+                        IrStmt::Assign {
+                            dst: *dst,
+                            rhs: IrExpr::Raw(simplified),
+                            comment: comment.clone(),
+                        }
+                    } else {
+                        s
+                    }
+                }
+                _ => s,
+            })
+            .collect()
+    }
+}
+
+/// Try to simplify `v0 = v0 + 1` → compound assign. Returns the new RHS string.
+fn simplify_compound_assign(dst: VarId, raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let dst_name = if dst.ver == 0 {
+        format!("v{}", dst.reg)
+    } else {
+        format!("v{}_{}", dst.reg, dst.ver)
+    };
+    for op in &["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"] {
+        // Pattern: "vN op expr" where vN is the dst
+        let prefix = format!("{} {} ", dst_name, op);
+        if raw.starts_with(&prefix) {
+            let rhs_part = raw[prefix.len()..].trim();
+            if rhs_part == "1" && (*op == "+" || *op == "-") {
+                return Some(format!("__compound_{}{}_{}", dst_name, op, op));
+            }
+            return Some(format!("__compound_{} {}= {}", dst_name, op, rhs_part));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

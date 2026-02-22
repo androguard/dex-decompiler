@@ -166,3 +166,133 @@ pub fn minimal_dex_with_method_code(insns: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&data_section);
     out
 }
+
+/// Minimal valid DEX with one class `Lpkg/Test;`, one method `getList()Ljava/util/List;`, so that
+/// decompiled output should contain "import java.util.List;" and short name "List" in the signature.
+pub fn minimal_dex_with_list_return_type() -> Vec<u8> {
+    let mut data_section = Vec::new();
+    let mut string_offsets = Vec::new();
+    for (utf16_len, s) in [
+        (1u32, "V"),
+        (18, "Ljava/lang/Object;"),
+        (19, "Ljava/util/List;"),
+        (10, "Lpkg/Test;"),
+        (7, "getList"),
+        (19, "()Ljava/util/List;"),
+        (1, "L"),
+    ] {
+        string_offsets.push(data_section.len() as u32);
+        push_uleb128(&mut data_section, utf16_len);
+        data_section.extend_from_slice(s.as_bytes());
+        data_section.push(0);
+    }
+    while data_section.len() % 4 != 0 {
+        data_section.push(0);
+    }
+    let type_list_off = data_section.len();
+    data_section.extend_from_slice(&0u32.to_le_bytes());
+    let class_data_off = data_section.len();
+    push_uleb128(&mut data_section, 0);
+    push_uleb128(&mut data_section, 0);
+    push_uleb128(&mut data_section, 1);
+    push_uleb128(&mut data_section, 0);
+    push_uleb128(&mut data_section, 0);
+    push_uleb128(&mut data_section, 1);
+    let data_off_val = 0x160u32;
+    let code_item_start_in_data = (data_section.len() + 2) as u32;
+    push_uleb128(&mut data_section, data_off_val + code_item_start_in_data);
+    let code_item_start = data_section.len();
+    data_section.extend_from_slice(&2u16.to_le_bytes());
+    data_section.extend_from_slice(&0u16.to_le_bytes());
+    data_section.extend_from_slice(&0u16.to_le_bytes());
+    data_section.extend_from_slice(&0u16.to_le_bytes());
+    data_section.extend_from_slice(&0u32.to_le_bytes());
+    data_section.extend_from_slice(&1u32.to_le_bytes());
+    data_section.extend_from_slice(&[0x0e, 0x00]); // return-void
+
+    let data_off = 0x160u32;
+    let string_ids_off = 0x70u32;
+    let type_ids_off = 0x8cu32; // 0x70 + 7*4
+    let proto_ids_off = 0x98u32;
+    let field_ids_off = 0xa4u32;
+    let method_ids_off = 0xa4u32;
+    let class_defs_off = 0xacu32;
+    let map_off = 0xccu32;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0x64u8, 0x65, 0x78, 0x0a]);
+    out.extend_from_slice(b"035\0");
+    out.resize(32, 0);
+    let file_size = (data_off as usize) + data_section.len();
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&0x70u32.to_le_bytes());
+    out.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&map_off.to_le_bytes());
+    out.extend_from_slice(&7u32.to_le_bytes());
+    out.extend_from_slice(&string_ids_off.to_le_bytes());
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.extend_from_slice(&type_ids_off.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&proto_ids_off.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&field_ids_off.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&method_ids_off.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&class_defs_off.to_le_bytes());
+    out.extend_from_slice(&(data_section.len() as u32).to_le_bytes());
+    out.extend_from_slice(&data_off.to_le_bytes());
+
+    out.resize(string_ids_off as usize, 0);
+    for &off in &string_offsets {
+        out.extend_from_slice(&(data_off + off).to_le_bytes());
+    }
+    out.resize(type_ids_off as usize, 0);
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.resize(proto_ids_off as usize, 0);
+    out.extend_from_slice(&6u32.to_le_bytes()); // shorty_idx = 6 ("L")
+    out.extend_from_slice(&1u32.to_le_bytes()); // return_type_idx = 1 (List)
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.resize(method_ids_off as usize, 0);
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&4u32.to_le_bytes());
+    out.resize(class_defs_off as usize, 0);
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&0x01u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(data_off + class_data_off as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+
+    out.resize(map_off as usize, 0);
+    out.extend_from_slice(&12u32.to_le_bytes());
+    let map_entries: [(u16, u32, u32); 12] = [
+        (0x0000, 1, 0),
+        (0x0002, 7, string_ids_off),
+        (0x0003, 3, type_ids_off),
+        (0x0004, 1, proto_ids_off),
+        (0x0005, 0, field_ids_off),
+        (0x0006, 1, method_ids_off),
+        (0x0007, 1, class_defs_off),
+        (0x1000, 1, map_off),
+        (0x1001, 1, data_off + type_list_off as u32),
+        (0x2002, 7, data_off),
+        (0x2000, 1, data_off + class_data_off as u32),
+        (0x2001, 1, data_off + code_item_start as u32),
+    ];
+    for (ty, size, offset) in map_entries {
+        out.extend_from_slice(&ty.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+    }
+    out.extend_from_slice(&data_section);
+    out
+}

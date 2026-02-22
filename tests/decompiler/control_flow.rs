@@ -104,3 +104,27 @@ fn test_decompiler_loop_exit_path_two_blocks() {
     // (e.g. const/4 into unused register). The important fix is that build_regions_rec includes
     // the fall-through predecessor of the return block in then_branch.
 }
+
+/// Classic for-loop shape: init (const/4 v0,0); header (if-eqz → exit); add-int; goto back.
+/// When the region tree is Seq([Block(init), Loop {...}]) with init/update pattern we emit for (...).
+#[test]
+fn test_decompiler_for_loop_pattern() {
+    // 0: const/4 v0, 0; 2: if-eqz v0, +6 (exit); 6: add-int/lit8 v0,v0,1; 10: goto -4 (back); 14: return
+    let bytecode: &[u8] = &[
+        0x12, 0x00,             // const/4 v0, 0
+        0x38, 0x00, 0x06, 0x00, // if-eqz v0, +6 (target 14)
+        0xd8, 0x00, 0x00, 0x01, // add-int/lit8 v0, v0, 1
+        0x28, 0xfc,             // goto -4 (back to 2)
+        0x0e, 0x00,             // return-void at 14
+    ];
+    let dex_bytes = minimal_dex_with_method_code(bytecode);
+    let dex = parse_dex(&dex_bytes).unwrap();
+    let dc = Decompiler::new(&dex);
+    let java = dc.decompile().unwrap();
+    let has_loop = java.contains("for (") || java.contains("while (");
+    assert!(
+        has_loop,
+        "init/cond/update loop should decompile to 'for (' or 'while (', got:\n{}",
+        java
+    );
+}

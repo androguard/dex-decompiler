@@ -78,6 +78,20 @@ pub fn infer_types(
                 IrExpr::Call { target, args } => {
                     let n = count_args(args);
                     find_method_return_type_java(target, n)
+                        .or_else(|| {
+                            // receiver-style: "v0.method" -> reconstruct "Class.method" from receiver type
+                            if let Some(dot) = target.rfind('.') {
+                                let receiver_part = &target[..dot];
+                                if let Some(vid) = parse_var_id(receiver_part) {
+                                    if let Some(class) = types.get(&vid) {
+                                        let method = &target[dot + 1..];
+                                        let fq = format!("{}.{}", class, method);
+                                        return find_method_return_type_java(&fq, n);
+                                    }
+                                }
+                            }
+                            None
+                        })
                 }
                     IrExpr::Raw(s) => infer_type_from_raw(s, &types),
                     IrExpr::PendingResult => None,
@@ -95,20 +109,35 @@ pub fn infer_types(
     types
 }
 
-/// Infer type from Raw RHS: string literal, new-array "new Type[size]", literal, or first variable reference's type.
+/// Infer type from Raw RHS: string literal, new-array "new Type[size]", new-instance, literal, or first variable reference's type.
 fn infer_type_from_raw(s: &str, types: &HashMap<VarId, String>) -> Option<String> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    // new-array: "new Type[size]" or "new boolean[v0]" -> array type is Type (already has [] in DEX resolution)
     if s.starts_with("new ") {
+        // new-array: "new Type[size]" or "new boolean[v0]" -> array type
         if let Some(bracket) = s.find('[') {
-            let element_and_brackets = s[4..bracket].trim(); // "boolean" or "int[]"
+            let element_and_brackets = s[4..bracket].trim();
             if !element_and_brackets.is_empty() {
-                // Resolved type is e.g. "boolean[]" or "int[]"; use as-is for variable type.
                 let ty = element_and_brackets.to_string();
                 return Some(if ty.ends_with(']') { ty } else { format!("{}[]", ty) });
+            }
+        }
+        // new-instance: "new Foo()" or "new Foo(args)" -> type is Foo
+        if let Some(paren) = s.find('(') {
+            let class = s[4..paren].trim();
+            if !class.is_empty() {
+                return Some(class.to_string());
+            }
+        }
+    }
+    // check-cast: "(Type) expr" -> type is Type
+    if s.starts_with('(') {
+        if let Some(close) = s.find(") ") {
+            let ty = s[1..close].trim();
+            if !ty.is_empty() && ty.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                return Some(ty.to_string());
             }
         }
     }
@@ -426,13 +455,25 @@ fn name_for_var(
 
 fn type_prefix(ty: &str) -> &'static str {
     match ty {
-        "int" => "n",
-        "boolean" => "flag",
-        "long" => "l",
-        "java.lang.String" | "String" => "s",
+        "int" | "short" | "byte" => "n",
+        "boolean" => "z",
+        "long" => "j",
+        "java.lang.String" | "String" => "str",
         "float" => "f",
         "double" => "d",
-        _ => "local",
+        "char" => "c",
+        "java.lang.Object" | "Object" => "obj",
+        "java.lang.StringBuilder" | "StringBuilder" => "sb",
+        "android.content.Intent" | "Intent" => "intent",
+        "android.os.Bundle" | "Bundle" => "bundle",
+        "android.content.Context" | "Context" => "context",
+        "android.view.View" | "View" => "view",
+        _ if ty.ends_with("[]") => "arr",
+        _ if ty.ends_with("Exception") => "e",
+        _ if ty.ends_with("List") => "list",
+        _ if ty.ends_with("Map") => "map",
+        _ if ty.ends_with("Set") => "set",
+        _ => "v",
     }
 }
 

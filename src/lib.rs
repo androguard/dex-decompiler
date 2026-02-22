@@ -9,7 +9,7 @@ pub mod java;
 pub use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod};
 pub use error::{DexDecompilerError, Result};
 pub use decompile::{
-    CfgEdgeInfo, CfgNodeInfo, Decompiler, DecompilerOptions, MethodBytecodeRow,
+    class_name_to_path, CfgEdgeInfo, CfgNodeInfo, Decompiler, DecompilerOptions, MethodBytecodeRow,
 };
 pub use decompile::value_flow::{ValueFlowAnalysis, ValueFlowAnalysisOwned, ValueFlowResult};
 pub use detectors::pending_intent::{PendingIntentFinding, scan_pending_intents};

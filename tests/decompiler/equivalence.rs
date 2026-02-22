@@ -1,6 +1,6 @@
 //! Decompilation output tests: minimal DEX, parse failures, optional fixtures.
 
-use super::helpers::minimal_dex_bytes;
+use super::helpers::{minimal_dex_bytes, minimal_dex_with_method_code};
 use dex_decompiler::{parse_dex, Decompiler, DecompilerOptions};
 use std::path::Path;
 
@@ -21,6 +21,44 @@ fn test_decompiler_minimal_dex_empty_output() {
 fn test_decompiler_parse_fails_invalid() {
     assert!(parse_dex(&[]).is_err());
     assert!(parse_dex(b"not a DEX file!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!").is_err());
+}
+
+/// Non-enum class (extends Object) must emit "class" not "enum".
+#[test]
+fn test_decompiler_non_enum_emits_class() {
+    let dex_bytes = minimal_dex_with_method_code(&[0x0e, 0x00]);
+    let dex = parse_dex(&dex_bytes).unwrap();
+    let dc = Decompiler::new(&dex);
+    let java = dc.decompile().unwrap();
+    assert!(
+        java.contains("class "),
+        "non-enum class should emit 'class'; got: {}",
+        java
+    );
+    assert!(
+        !java.contains("enum "),
+        "non-enum class should not emit 'enum'; got: {}",
+        java
+    );
+}
+
+/// If testdata/Enum.dex exists (DEX with a class extending java.lang.Enum and static final self-type fields),
+/// decompile and assert output contains "enum" and constant list.
+#[test]
+fn test_decompiler_enum_emits_enum() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/Enum.dex");
+    if !path.exists() {
+        return;
+    }
+    let data = std::fs::read(&path).unwrap();
+    let dex = parse_dex(&data).unwrap();
+    let dc = Decompiler::new(&dex);
+    let java = dc.decompile().unwrap();
+    assert!(
+        java.contains("enum "),
+        "enum class should emit 'enum'; got: {}",
+        java
+    );
 }
 
 /// Optional: if tests/data/APK/Test.dex exists, assert decompiled source contains simplification pattern.

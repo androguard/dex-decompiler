@@ -2,14 +2,19 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use dex_decompiler::{
-    parse_dex, run_all_detectors, scan_pending_intents, Decompiler, DecompilerOptions, DexFile,
-    EncodedMethod,
+    class_name_to_path, parse_dex, run_all_detectors, scan_pending_intents, Decompiler,
+    DecompilerOptions, DexFile, EncodedMethod,
 };
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 
 /// Parse offset as decimal or 0x-prefixed hex.
 fn parse_offset(s: &str) -> Result<u32, std::num::ParseIntError> {
@@ -251,25 +256,98 @@ fn main() -> Result<()> {
         exclude: args.exclude.clone(),
         show_bytecode: args.show_bytecode,
     };
-    let decompiler = Decompiler::with_options(&dex, options);
+    let decompiler = Decompiler::with_options(&dex, options.clone());
 
     if let Some(ref out_dir) = args.output_dir {
-        let path = Path::new(out_dir);
+        let base_path = Path::new(out_dir);
         let pb = ProgressBar::new(0);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("[{bar:40.cyan/blue}] {pos}/{len} {msg}")?
                 .progress_chars("=>-"),
         );
-        pb.set_message("starting…");
-        decompiler
-            .decompile_to_dir_with_progress(path, Some(&mut |current, total, class_name| {
-                pb.set_length(total as u64);
-                pb.set_position(current as u64);
-                pb.set_message(class_name.to_string());
-            }))
+        let included = decompiler
+            .collect_included_classes()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        pb.finish_with_message("done");
+        let total = included.len();
+        if total == 0 {
+            pb.finish_with_message("no classes to decompile");
+            return Ok(());
+        }
+        pb.set_length(total as u64);
+        pb.set_message("starting…");
+        // DexFile is not Send (uses Rc), so we share raw bytes and parse once per worker.
+        let data = Arc::new(data);
+        let options = options.clone();
+        let pb_shared = Arc::new(pb);
+        // Writer thread: write files on the fly as they are decompiled.
+        let (tx, rx) = mpsc::channel::<(std::path::PathBuf, String, String)>();
+        let write_error: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+        let write_error_clone = Arc::clone(&write_error);
+        let pb_writer = Arc::clone(&pb_shared);
+        let writer_handle = thread::spawn(move || {
+            while let Ok((full_dir, file_name, class_java)) = rx.recv() {
+                if write_error_clone.lock().unwrap().is_some() {
+                    continue;
+                }
+                if let Err(e) = fs::create_dir_all(&full_dir)
+                    .with_context(|| format!("create dir {}", full_dir.display()))
+                {
+                    *write_error_clone.lock().unwrap() = Some(e);
+                    continue;
+                }
+                let file_path = full_dir.join(&file_name);
+                if let Err(e) =
+                    fs::write(&file_path, class_java).with_context(|| format!("write {}", file_path.display()))
+                {
+                    *write_error_clone.lock().unwrap() = Some(e);
+                    continue;
+                }
+                pb_writer.inc(1);
+            }
+        });
+        let tx = Arc::new(tx);
+        // Use more chunks than workers for better load balance (slow classes don't leave others idle).
+        let num_workers = rayon::current_num_threads().max(1);
+        let num_chunks = (num_workers * 4).max(1);
+        let chunk_size = (total + num_chunks - 1) / num_chunks;
+        let chunked: Vec<Vec<(_, String)>> = included
+            .chunks(chunk_size.max(1))
+            .map(|c| c.to_vec())
+            .collect();
+        let results: Vec<Result<()>> = chunked
+            .par_iter()
+            .flat_map(|chunk| {
+                let dex = parse_dex(data.as_ref()).expect("DEX already parsed");
+                let d = Decompiler::with_options(&dex, options.clone());
+                let tx = Arc::clone(&tx);
+                let pb = Arc::clone(&pb_shared);
+                chunk
+                    .iter()
+                    .map(|(class_def, class_name)| {
+                        pb.set_message(class_name.clone());
+                        let java =
+                            d.decompile_class(class_def).map_err(|e| anyhow::anyhow!("{}", e))?;
+                        let (rel_dir, file_name) = class_name_to_path(class_name);
+                        let full_dir = base_path.join(rel_dir);
+                        tx.send((full_dir, file_name, java))
+                            .map_err(|e| anyhow::anyhow!("writer thread dropped: {}", e))?;
+                        Ok(())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        drop(tx);
+        writer_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+        if let Some(e) = write_error.lock().unwrap().take() {
+            return Err(e);
+        }
+        for r in results {
+            r?;
+        }
+        pb_shared.finish_with_message("done");
     } else {
         let java = decompiler.decompile().context("decompile")?;
         if let Some(ref out_path) = args.output {

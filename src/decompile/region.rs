@@ -41,6 +41,38 @@ pub fn region_is_empty(region: &Region) -> bool {
     }
 }
 
+/// Like region_is_empty but uses the CFG to treat a Block as empty when that block has no instructions.
+/// This allows flipping "if (cond) { } else { body }" to "if (!cond) { body }" when the then-branch is an empty block.
+pub fn region_is_empty_with_cfg(region: &Region, cfg: &MethodCfg) -> bool {
+    match region {
+        Region::Block(bid) => cfg
+            .blocks
+            .get(*bid)
+            .map(|b| b.instruction_offsets.is_empty())
+            .unwrap_or(false),
+        Region::Seq(children) => {
+            children.is_empty() || children.iter().all(|c| region_is_empty_with_cfg(c, cfg))
+        }
+        Region::If { .. } | Region::Loop { .. } | Region::Switch { .. } => false,
+    }
+}
+
+/// Returns true if the region contains a Loop (at any depth).
+/// Used to prefer "if (cond) { short/return } else { loop }" by swapping when then has loop and else doesn't.
+pub fn region_contains_loop(region: &Region) -> bool {
+    match region {
+        Region::Block(_) => false,
+        Region::Seq(children) => children.iter().any(region_contains_loop),
+        Region::If { then_branch, else_branch, .. } => {
+            region_contains_loop(then_branch) || region_contains_loop(else_branch)
+        }
+        Region::Loop { .. } => true,
+        Region::Switch { cases, default, .. } => {
+            cases.iter().any(|(_, r)| region_contains_loop(r)) || region_contains_loop(default)
+        }
+    }
+}
+
 /// If loop body is Seq([Block(header), If { condition, then_branch, else_branch }]), returns
 /// (condition, else_branch, then_branch) so emitter can emit "while (!(condition)) { else_branch }; then_branch".
 /// When then_branch is non-empty (e.g. exit block with Swap + return), it is emitted after the while.
@@ -74,6 +106,78 @@ pub fn first_block(region: &Region) -> Option<BlockId> {
             cases.first().and_then(|(_, r)| first_block(r)).or_else(|| first_block(default))
         }
     }
+}
+
+/// Last Block(block_id) in a Seq (depth-first, last child); used to detect for-loop update tail.
+pub fn last_block(region: &Region) -> Option<BlockId> {
+    match region {
+        Region::Block(bid) => Some(*bid),
+        Region::Seq(children) => children.last().and_then(last_block),
+        Region::If { .. } | Region::Loop { .. } | Region::Switch { .. } => None,
+    }
+}
+
+/// If region is a Seq ending with a single Block, returns (prefix region without that block, that block id).
+pub fn split_tail_block(region: &Region) -> Option<(Region, BlockId)> {
+    match region {
+        Region::Seq(children) if !children.is_empty() => {
+            let last = children.last()?;
+            if let Region::Block(bid) = last {
+                let prefix: Vec<Region> = children[..children.len() - 1].to_vec();
+                Some((Region::Seq(prefix), *bid))
+            } else {
+                None
+            }
+        }
+        Region::Block(bid) => Some((Region::Seq(vec![]), *bid)),
+        _ => None,
+    }
+}
+
+/// If region is a Seq ending with two Blocks, returns (prefix, second-to-last block id, last block id).
+pub fn split_tail_two_blocks(region: &Region) -> Option<(Region, BlockId, BlockId)> {
+    match region {
+        Region::Seq(children) if children.len() >= 2 => {
+            let last = children.last()?;
+            let second = children.get(children.len() - 2)?;
+            match (second, last) {
+                (Region::Block(bid1), Region::Block(bid2)) => {
+                    let prefix: Vec<Region> = children[..children.len() - 2].to_vec();
+                    Some((Region::Seq(prefix), *bid1, *bid2))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// For-loop pattern: when we have Seq([Block(init), Loop { header, body }]) and body is
+/// Seq([Block(header), If { condition, then_branch, else_branch }]), and else_branch ends with
+/// either (1) a single Block (update+goto) or (2) two Blocks (update block, goto-only block),
+/// returns (init_block_id, header, condition, body_without_update, then_branch, update_block_id).
+pub fn for_loop_pattern(seq: &[Region]) -> Option<(BlockId, BlockId, &str, Region, &Region, BlockId)> {
+    if seq.len() != 2 {
+        return None;
+    }
+    let (init_region, loop_region) = (&seq[0], &seq[1]);
+    let init_block = match init_region {
+        Region::Block(bid) => *bid,
+        _ => return None,
+    };
+    let (header, body) = match loop_region {
+        Region::Loop { header, body } => (*header, body.as_ref()),
+        _ => return None,
+    };
+    let (condition, else_branch, then_branch) = loop_body_break_pattern(body, header)?;
+    let (body_without_update, update_block) = if let Some((prefix, update_bid, _back_bid)) = split_tail_two_blocks(else_branch) {
+        (prefix, update_bid)
+    } else if let Some((prefix, single_bid)) = split_tail_block(else_branch) {
+        (prefix, single_bid)
+    } else {
+        return None;
+    };
+    Some((init_block, header, condition, body_without_update, then_branch, update_block))
 }
 
 /// Build a region tree from the CFG starting at entry.

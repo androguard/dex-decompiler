@@ -62,10 +62,45 @@ A **DEX to Java decompiler** in pure Rust. It parses DEX files, disassembles Dal
 - **Pure Rust**: No JVM or external tools.
 - **DEX parsing**: Full parsing of DEX format (header, string_ids, type_ids, proto_ids, field_ids, method_ids, class_defs, class_data_item, code_item) via [dex-parser](https://github.com/androguard/dex-parser/tree/main/dexparser-rs).
 - **Disassembly**: Uses [dex-bytecode](https://github.com/androguard/dex-bytecode) for linear-sweep Dalvik instruction decoding and CFG (basic blocks).
-- **Structured control flow**: if/else, `while (!cond)` and `while (true)` with break, **packed-switch / sparse-switch** → `switch (var) { case … default: … }`, break/continue where applicable.
-- **SSA-style IR**: Versioned vars, type inference (params, return, propagation), invoke simplification (invoke + move-result + return → single return), dead-assign pass with method-wide used regs.
+- **Structured control flow**: if/else, `while (!cond)` and `while (true)` with break/continue, **for loops** (init; cond; update), **packed-switch / sparse-switch** → `switch (var) { case … default: … }`.
+- **SSA-style IR**: Versioned vars, type inference (params, return, propagation), dead-assign pass with method-wide used regs.
 - **Java emission**: Class and method signatures, field declarations, method bodies as Java-like source; optional raw DEX instruction listing as comments before each method.
-- **Library API**: Parse DEX, decompile classes/methods, and get **per-method bytecode and CFG** (nodes/edges) for visualization or tooling.
+- **Imports**: Per-class import block; short names in body (e.g. `java.lang.String` → `String`).
+- **Try/catch**: From DEX try_item and encoded_catch_handler; body wrapped in `try { … } catch (Type e) { … }` with type names.
+- **Enum**: Class extends `java.lang.Enum` and has static final fields of its own type → emitted as `enum Name { A, B, C; … }` (constants first, then `;`, then other members).
+- **Annotations**: Class annotations from annotations_directory_item → `@Name` before the class.
+- **Constructors**: Emitted as `ClassName(params)` (not `void <init>()`); parameterless `<init>()` in body → `super();`.
+- **Anonymous Thread inlining**: Pattern `X.<init>(args);` + `X.start();` → inlined `new Thread() { public void run() { … } }.start();` with inner `run()` body and capture replacement (e.g. `val$o` → outer variable); **synchronized** blocks from monitor-enter/exit; unreachable exception-handler lines after `return;` stripped.
+- **Library API**: Parse DEX, decompile classes/methods, **find_method**, get **per-method bytecode and CFG** (nodes/edges) for visualization or tooling.
+- **Value flow / tainting**: Reaching definitions, def-use/use-def, propagation from seed or from API sources (e.g. `getLastLocation`).
+- **Vulnerability detectors**: PendingIntent scan (`--scan-pending-intent`), full scan (`--scan-vulns`: intent spoofing, RCE, insecure logging, SQL injection, WebView, hardcoded-secrets, IPC).
+- **Progress**: With `--output-dir`, progress bar shows current class being decompiled.
+
+## Simplifications
+
+Method bodies and IR are simplified so output looks like idiomatic Java.
+
+### IR passes (before emission)
+
+- **InvokeChainPass**: `invoke(...); vN = <result>; return vN;` → `return method(args);`; `invoke(...); vN = <result>;` → `vN = method(args);`; `invoke(...); return;` left as call + return.
+- **ConstructorMergePass**: `vN = new Foo();` + `vN.<init>(args);` → `vN = new Foo(args);` (when in same block).
+- **SsaRenamePass**: SSA-style versioned variables.
+- **DeadAssignPass**: Removes dead stores (with method-wide used regs).
+- **ExprSimplifyPass**: `v0 = v0 + 1` → `v0++`, `v0 = v0 + x` → `v0 += x`; removes redundant self-assigns.
+
+### Method-body simplifications (after emission)
+
+- **Invoke + move-result + return**: `invoke(...); vN = <result>; return vN;` → `return method(args);`.
+- **Invoke + move-result**: `invoke(...); vN = <result>;` → `vN = method(args);`.
+- **Invoke + return void**: `invoke(...); return;` → `method(args); return;`.
+- **Ternary**: `if (cond) { return a; } else { return b; }` → `return cond ? a : b;`.
+- **String concatenation**: `new StringBuilder(); sb.append(a); sb.append(b); s = sb.toString();` → `s = a + b;` (and `return sb.toString();` → `return a + b;`).
+- **Arithmetic**: `x + -N` → `x - N`.
+- **Constructors**: In constructor bodies only, `receiver.<init>();` (no args) → `super();`.
+- **Synchronized**: `try { /* monitor-enter(lock) */ … /* monitor-exit */ } catch (Throwable …)` → `synchronized (lock) { … }` (run after try/catch wrapping).
+- **Unreachable code**: Lines after `return;` with greater indent are skipped until `}` or `} catch`.
+- **Unreachable exception junk** (in inlined Thread run): After `return;`, lines containing `/* move-exception */`, `/* monitor-exit(...) */`, or `throw …;` are removed.
+
 
 ## Dependencies
 
@@ -80,6 +115,8 @@ Both are pulled from GitHub in `Cargo.toml`; no local paths required.
 cargo run --release --bin dex-decompile -- -i classes.dex
 ```
 This builds (if needed) and runs the decompiler. See [Usage](#usage) below for more options.
+
+**Speed:** For large DEX files, always use `--release` (e.g. `cargo run --release --bin dex-decompile -- -i classes.dex -d out`). With `-d`/`--output-dir`, decompilation is parallelized, files are written on the fly, and work is split into many chunks for better load balance.
 
 ## Usage
 
@@ -115,7 +152,7 @@ cargo run --bin dex-decompile -- -i app.dex --taint-method "com.example.Main#onC
 |--------|--------|-------------|
 | `--input` | `-i` | Input DEX file path(s). May be repeated for **multi-DEX** apps (e.g. `classes.dex`, `classes2.dex`). Taint mode searches for `CLASS#METHOD` in each file in order; decompile uses the first file. |
 | `--output` | `-o` | Output Java file (single file); default: stdout. |
-| `--output-dir` | `-d` | Output directory: one `.java` per class under package structure. |
+| `--output-dir` | `-d` | Output directory: one `.java` per class under package structure. Decompilation is parallelized for large DEX files. |
 | `--only-package` | | Only decompile classes in this package (e.g. `com.example`). Subpackages included. |
 | `--exclude` | | Exclude classes in this package (e.g. `android.`). Repeatable. |
 | `--taint-method` | | Data flow: method as `CLASS#METHOD` (e.g. `com.example.Main#onCreate`). Use with `--taint-offset` and `--taint-reg`, or with `--taint-api`. |
