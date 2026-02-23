@@ -189,6 +189,7 @@ mod tests {
             block_by_start,
             loop_headers: HashSet::new(),
             entry: 0,
+            folded_const_offsets: HashSet::new(),
         }
     }
 

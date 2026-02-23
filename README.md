@@ -132,6 +132,10 @@ cargo run --bin dex-decompile -- -i classes.dex -o Main.java
 # Decompile to a directory with package structure (e.g. out/com/example/MyClass.java)
 cargo run --bin dex-decompile -- -i classes.dex -d out
 
+# Same, with raw DEX instructions as comments in each method (for debugging).
+# Output goes to the directory you pass with -d (e.g. out/), not to any other path.
+cargo run --bin dex-decompile -- -i classes.dex -d out --show-bytecode
+
 # Only decompile classes in a package (and subpackages)
 cargo run --bin dex-decompile -- -i classes.dex -d out --only-package com.example
 
@@ -160,10 +164,85 @@ cargo run --bin dex-decompile -- -i app.dex --taint-method "com.example.Main#onC
 | `--taint-reg` | | Register number for taint seed (e.g. `0` for v0). |
 | `--taint-api` | | Taint returns of Android API methods (e.g. `getLastLocation`, `FusedLocationProviderClient.getLastLocation`). Repeatable; matches if method ref contains the pattern. |
 | `--scan-pending-intent` | | Scan all methods for PendingIntent creation sites (PITracker-like). Reports whether the base Intent has modifiable fields set and whether the PendingIntent flows to a dangerous sink (e.g. Notification). See [PITracker (WiSec'22)](https://diaowenrui.github.io/paper/wisec22-zhang.pdf). |
-| `--show-bytecode` | | Emit raw DEX instructions as comments before each method body (for debugging). |
+| `--show-bytecode` | | Emit raw DEX instructions as comments before each method body and on statement lines (for debugging). Works with both stdout and `-d`/`--output-dir`: written `.java` files will contain the bytecode comments. |
 | `--scan-vulns` | | Run all vulnerability detectors on every method: intent spoofing, RCE (dynamic code loading), insecure logging, SQL injection, WebView (unsafe URL + JavaScriptInterface), hardcoded-secrets review, IPC intent validation. Optional: use with `--taint-api` to add logging sources. |
 
 When `--output-dir` is set, progress is shown per class. When `--taint-method` is set with either (`--taint-offset` and `--taint-reg`) or `--taint-api`, the tool prints value-flow (reads/writes) and exits without decompiling. When `--scan-pending-intent` is set, the tool scans every method for PendingIntent creation and prints a risk report. When `--scan-vulns` is set, the tool runs all detectors and prints one line per finding (category, class#method, sink offset, sink method). When both `-o` and `-d` are omitted and neither taint nor scan is used, decompiled Java is printed to stdout.
+
+### Emulator
+
+You can run a specific method in the bytecode emulator and see console output, return value, and (with `--emulate-verbose`, `--emulate-progress`, or `--emulate-interactive`) per-step VM state. Useful for testing decompilation or tracing logic on a DEX (e.g. from [androguard test data](https://github.com/androguard/androguard/tree/master/tests/data)).
+
+**Step-by-step execution** is supported for use in other tools or scripts: the library exposes `emu.step()` which returns a `StepResult` (instruction executed, state after, description, finished flag). Call it in a loop to drive the emulator one instruction at a time. From the CLI, use `--emulate-interactive` to run step-by-step and wait for Enter (or `q`+Enter to stop) after each step.
+
+**Parameter types** for `--emulate-params`: use **semicolon `;`** to separate parameters (so array values can contain commas). Quote the value in the shell (e.g. `'...'`) so `;` is not interpreted as a command separator. In order of method parameters:
+
+| Syntax | Type | Example |
+|--------|------|--------|
+| `42`, `-1`, `0` | `int` | `5;10` (two params) |
+| `123L` | `long` | `0L;42L` |
+| `"hello"`, `hello` | `String` | `"key";"value"` |
+| `null` | null reference | `null` |
+| `[1,2,3]`, `[I]1,2,3` | `int[]` | `[0,1,2,3,4]` |
+| `[B]0,1,2`, `[byte]0,1,2` | `byte[]` | `[B]1,2,3,4,5` (key bytes) |
+
+Arrays are passed by reference: the emulator pre-allocates them on the heap and passes `Ref(0)`, `Ref(1)`, … as the parameter values.
+
+**Example: RC4.rc4_crypt (byte[] key, byte[] data)**
+
+Original Java: [androguard/test/RC4.java](https://github.com/androguard/androguard/blob/master/tests/data/AndroguardTest/app/src/main/java/androguard/test/RC4.java) — `public static void rc4_crypt(byte[] key, byte[] data)`.
+
+Using `testdata/classes4.dex` (or the androguard test DEX), the class may be under `androguard.test.RC4` or `tests.androguard.RC4` depending on the DEX; the emulator resolves by simple class name if the full name is not found.
+
+```bash
+# Two byte-array params: key (e.g. 5 bytes) and data (e.g. 4 bytes to encrypt in-place).
+# Use ";" to separate params so array elements can use commas.
+cargo run --release --bin dex-decompile -- -i testdata/classes4.dex \
+  --emulate "androguard.test.RC4#rc4_crypt" \
+  --emulate-params "[B]1,2,3,4,5;[B]0,0,0,0" \
+  --emulate-max-steps 5000
+```
+
+If the method is in a different package (e.g. `tests.androguard.RC4`):
+
+```bash
+cargo run --release --bin dex-decompile -- -i testdata/androguard_test_classes.dex \
+  --emulate "tests.androguard.RC4#rc4_crypt" \
+  --emulate-params "[B]1,2,3,4,5;[B]0,0,0,0"
+```
+
+**More examples**
+
+```bash
+# Int and string params (semicolon separates params)
+cargo run --release --bin dex-decompile -- -i app.dex \
+  --emulate "pkg.Utils#parse" --emulate-params "42;\"hello\""
+
+# Int array param (single param)
+cargo run --release --bin dex-decompile -- -i app.dex \
+  --emulate "pkg.ArrayTest#sum" --emulate-params "[1,2,3,4,5]"
+
+# Verbose: print every instruction and VM state (registers, heap) after each step
+cargo run --release --bin dex-decompile -- -i app.dex \
+  --emulate "pkg.Main#foo" --emulate-params "1;2" --emulate-verbose --emulate-max-steps 50
+
+# Progress bar: current instruction and register state
+cargo run --release --bin dex-decompile -- -i app.dex \
+  --emulate "pkg.Main#foo" --emulate-progress --emulate-max-steps 2000
+
+# Interactive: after each step, wait for Enter (or q+Enter to stop)
+cargo run --release --bin dex-decompile -- -i app.dex \
+  --emulate "pkg.Main#foo" --emulate-interactive
+```
+
+| Option | Description |
+|--------|-------------|
+| `--emulate` | Method as `CLASS#METHOD` (e.g. `androguard.test.RC4#rc4_crypt`). Class can be full or simple name. |
+| `--emulate-params` | Comma-separated values: scalars and arrays (see table above). |
+| `--emulate-max-steps` | Step limit (default 10000). |
+| `--emulate-verbose` | Print each instruction and VM state after every step. |
+| `--emulate-progress` | Show a progress bar with current instruction and registers. |
+| `--emulate-interactive` | Step-by-step: after each instruction, print state and wait for Enter (or `q`+Enter to stop). |
 
 ### Library
 

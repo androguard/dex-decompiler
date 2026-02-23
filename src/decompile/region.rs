@@ -184,7 +184,21 @@ pub fn for_loop_pattern(seq: &[Region]) -> Option<(BlockId, BlockId, &str, Regio
 /// Uses the same structure as the current emit (loop headers -> Loop, conditionals -> If, rest -> Seq).
 pub fn build_regions(cfg: &MethodCfg, entry: BlockId) -> Option<Region> {
     let mut emitted = HashSet::new();
-    build_regions_rec(cfg, entry, None, &mut emitted)
+    build_regions_rec(cfg, entry, None, &mut emitted, None)
+}
+
+/// Like build_regions but only includes blocks in `allowed`. Used for try body (only try-range blocks)
+/// or catch body (only handler-range blocks). Successors outside `allowed` are treated as exit.
+pub fn build_regions_filtered(
+    cfg: &MethodCfg,
+    entry: BlockId,
+    allowed: &HashSet<BlockId>,
+) -> Option<Region> {
+    if !allowed.contains(&entry) {
+        return None;
+    }
+    let mut emitted = HashSet::new();
+    build_regions_rec(cfg, entry, None, &mut emitted, Some(allowed))
 }
 
 fn build_regions_rec(
@@ -192,16 +206,22 @@ fn build_regions_rec(
     block_id: BlockId,
     loop_header: Option<BlockId>,
     emitted: &mut HashSet<BlockId>,
+    allowed: Option<&HashSet<BlockId>>,
 ) -> Option<Region> {
     if emitted.contains(&block_id) {
         return None;
+    }
+    if let Some(allowed_set) = allowed {
+        if !allowed_set.contains(&block_id) {
+            return None;
+        }
     }
     let block = &cfg.blocks[block_id];
     let is_loop_header = cfg.loop_headers.contains(&block_id);
 
     if is_loop_header && loop_header != Some(block_id) {
         emitted.insert(block_id);
-        let body = build_loop_body(cfg, block_id, emitted);
+        let body = build_loop_body(cfg, block_id, emitted, allowed);
         return Some(Region::Loop {
             header: block_id,
             body: Box::new(body),
@@ -219,11 +239,17 @@ fn build_regions_rec(
         BlockEnd::Exit => Some(block_region),
         BlockEnd::FallThrough => {
             let ft = cfg.fall_through_block(block_id)?;
-            let next = build_regions_rec(cfg, ft, loop_header, emitted)?;
+            if allowed.map(|a| !a.contains(&ft)).unwrap_or(false) {
+                return Some(block_region);
+            }
+            let next = build_regions_rec(cfg, ft, loop_header, emitted, allowed)?;
             Some(Region::Seq(vec![block_region, next]))
         }
         BlockEnd::Goto(t) => {
-            let next = build_regions_rec(cfg, *t, loop_header, emitted)?;
+            if allowed.map(|a| !a.contains(t)).unwrap_or(false) {
+                return Some(block_region);
+            }
+            let next = build_regions_rec(cfg, *t, loop_header, emitted, allowed)?;
             Some(Region::Seq(vec![block_region, next]))
         }
         BlockEnd::Conditional {
@@ -249,15 +275,15 @@ fn build_regions_rec(
             // Inside a loop, build else (loop body) before then so the body blocks (e.g. in-loop Swap)
             // are claimed by else_branch, not stolen by then_start when a body block falls through to then target.
             let (then_r, else_r) = if loop_header.is_some() {
-                let else_r = build_regions_rec(cfg, *fall_through, loop_header, emitted)
+                let else_r = build_regions_rec(cfg, *fall_through, loop_header, emitted, allowed)
                     .unwrap_or_else(|| Region::Seq(vec![]));
-                let then_r = build_regions_rec(cfg, then_start, loop_header, emitted)
+                let then_r = build_regions_rec(cfg, then_start, loop_header, emitted, allowed)
                     .unwrap_or_else(|| Region::Seq(vec![]));
                 (then_r, else_r)
             } else {
-                let then_r = build_regions_rec(cfg, then_start, loop_header, emitted)
+                let then_r = build_regions_rec(cfg, then_start, loop_header, emitted, allowed)
                     .unwrap_or_else(|| Region::Seq(vec![]));
-                let else_r = build_regions_rec(cfg, *fall_through, loop_header, emitted)
+                let else_r = build_regions_rec(cfg, *fall_through, loop_header, emitted, allowed)
                     .unwrap_or_else(|| Region::Seq(vec![]));
                 (then_r, else_r)
             };
@@ -279,12 +305,12 @@ fn build_regions_rec(
             let case_regions: Vec<(i32, Box<Region>)> = cases
                 .iter()
                 .filter_map(|(val, bid)| {
-                    let r = build_regions_rec_until(cfg, *bid, &stop_at, loop_header, emitted)
+                    let r = build_regions_rec_until(cfg, *bid, &stop_at, loop_header, emitted, allowed)
                         .unwrap_or_else(|| Region::Seq(vec![]));
                     Some((*val, Box::new(r)))
                 })
                 .collect();
-            let default_r = build_regions_rec(cfg, *default_block, loop_header, emitted)
+            let default_r = build_regions_rec(cfg, *default_block, loop_header, emitted, allowed)
                 .unwrap_or_else(|| Region::Seq(vec![]));
             Some(Region::Seq(vec![
                 block_region,
@@ -305,12 +331,18 @@ fn build_regions_rec_until(
     stop_at: &HashSet<BlockId>,
     loop_header: Option<BlockId>,
     emitted: &mut HashSet<BlockId>,
+    allowed: Option<&HashSet<BlockId>>,
 ) -> Option<Region> {
     if stop_at.contains(&block_id) {
         return None;
     }
     if emitted.contains(&block_id) {
         return None;
+    }
+    if let Some(allowed_set) = allowed {
+        if !allowed_set.contains(&block_id) {
+            return None;
+        }
     }
     let block = &cfg.blocks[block_id];
     emitted.insert(block_id);
@@ -326,14 +358,20 @@ fn build_regions_rec_until(
                 Some(id) if !stop_at.contains(&id) => id,
                 _ => return Some(block_region),
             };
-            let next = build_regions_rec_until(cfg, ft, stop_at, loop_header, emitted)?;
+            if allowed.map(|a| !a.contains(&ft)).unwrap_or(false) {
+                return Some(block_region);
+            }
+            let next = build_regions_rec_until(cfg, ft, stop_at, loop_header, emitted, allowed)?;
             Some(Region::Seq(vec![block_region, next]))
         }
         BlockEnd::Goto(t) => {
             if stop_at.contains(t) {
                 return Some(block_region);
             }
-            let next = build_regions_rec_until(cfg, *t, stop_at, loop_header, emitted)?;
+            if allowed.map(|a| !a.contains(t)).unwrap_or(false) {
+                return Some(block_region);
+            }
+            let next = build_regions_rec_until(cfg, *t, stop_at, loop_header, emitted, allowed)?;
             Some(Region::Seq(vec![block_region, next]))
         }
         BlockEnd::Conditional {
@@ -345,13 +383,13 @@ fn build_regions_rec_until(
             let then_r = if stop_at.contains(&then_start) {
                 Region::Seq(vec![])
             } else {
-                build_regions_rec_until(cfg, then_start, stop_at, loop_header, emitted)
+                build_regions_rec_until(cfg, then_start, stop_at, loop_header, emitted, allowed)
                     .unwrap_or_else(|| Region::Seq(vec![]))
             };
             let else_r = if stop_at.contains(fall_through) {
                 Region::Seq(vec![])
             } else {
-                build_regions_rec_until(cfg, *fall_through, stop_at, loop_header, emitted)
+                build_regions_rec_until(cfg, *fall_through, stop_at, loop_header, emitted, allowed)
                     .unwrap_or_else(|| Region::Seq(vec![]))
             };
             Some(Region::Seq(vec![
@@ -367,14 +405,19 @@ fn build_regions_rec_until(
     }
 }
 
-fn build_loop_body(cfg: &MethodCfg, header_id: BlockId, emitted: &mut HashSet<BlockId>) -> Region {
+fn build_loop_body(
+    cfg: &MethodCfg,
+    header_id: BlockId,
+    emitted: &mut HashSet<BlockId>,
+    allowed: Option<&HashSet<BlockId>>,
+) -> Region {
     let block = &cfg.blocks[header_id];
     let block_reg = Region::Block(header_id);
     match &block.end {
         BlockEnd::Exit => block_reg,
         BlockEnd::FallThrough => {
             if let Some(ft) = cfg.fall_through_block(header_id) {
-                let next = build_regions_rec(cfg, ft, Some(header_id), emitted)
+                let next = build_regions_rec(cfg, ft, Some(header_id), emitted, allowed)
                     .unwrap_or_else(|| Region::Seq(vec![]));
                 return Region::Seq(vec![block_reg, next]);
             }
@@ -382,7 +425,7 @@ fn build_loop_body(cfg: &MethodCfg, header_id: BlockId, emitted: &mut HashSet<Bl
         }
         BlockEnd::Goto(t) if *t == header_id => block_reg,
         BlockEnd::Goto(t) => {
-            let next = build_regions_rec(cfg, *t, Some(header_id), emitted)
+            let next = build_regions_rec(cfg, *t, Some(header_id), emitted, allowed)
                 .unwrap_or_else(|| Region::Seq(vec![]));
             Region::Seq(vec![block_reg, next])
         }
@@ -403,9 +446,9 @@ fn build_loop_body(cfg: &MethodCfg, header_id: BlockId, emitted: &mut HashSet<Bl
                         && !cfg.reachable_from(*fall_through, bid, Some(header_id))
                 })
                 .unwrap_or(*branch_target);
-            let then_r = build_regions_rec(cfg, then_start, Some(header_id), emitted)
+            let then_r = build_regions_rec(cfg, then_start, Some(header_id), emitted, allowed)
                 .unwrap_or_else(|| Region::Seq(vec![]));
-            let else_r = build_regions_rec(cfg, *fall_through, Some(header_id), emitted)
+            let else_r = build_regions_rec(cfg, *fall_through, Some(header_id), emitted, allowed)
                 .unwrap_or_else(|| Region::Seq(vec![]));
             Region::Seq(vec![
                 block_reg,

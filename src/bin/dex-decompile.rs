@@ -9,6 +9,7 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use colored::Colorize;
 use dex_decompiler::{
     class_name_to_path, parse_dex, run_all_detectors, scan_pending_intents, Decompiler,
     DecompilerOptions, DexFile, EncodedMethod,
@@ -26,8 +27,18 @@ fn parse_offset(s: &str) -> Result<u32, std::num::ParseIntError> {
     }
 }
 
+/// Simple name: last component after the final dot (e.g. "TestExceptions" from "tests.androguard.TestExceptions").
+fn simple_class_name(full: &str) -> &str {
+    full.rsplit('.').next().unwrap_or(full)
+}
+
 /// Find the first EncodedMethod in the DEX for the given class and method name.
+/// Tries exact class name first; if not found, matches any class with the same simple name
+/// (so "tests.androguard.TestExceptions" also matches "androguard.test.TestExceptions" in the DEX).
 fn find_method(dex: &DexFile, class_name: &str, method_name: &str) -> Option<EncodedMethod> {
+    let want_simple = simple_class_name(class_name);
+
+    // First pass: exact match
     for class_def_result in dex.class_defs() {
         let class_def = class_def_result.ok()?;
         let class_type = dex.get_type(class_def.class_idx).ok()?;
@@ -35,24 +46,358 @@ fn find_method(dex: &DexFile, class_name: &str, method_name: &str) -> Option<Enc
         if name != class_name {
             continue;
         }
-        let class_data_opt = dex.get_class_data(&class_def).ok()?;
-        let class_data = class_data_opt.as_ref()?;
-        for encoded in class_data
-            .direct_methods
-            .iter()
-            .chain(class_data.virtual_methods.iter())
-        {
-            let info = dex.get_method_info(encoded.method_idx).ok()?;
-            if info.name == method_name {
-                return Some(encoded.clone());
-            }
+        if let Some(enc) = find_method_in_class(dex, &class_def, method_name) {
+            return Some(enc);
+        }
+    }
+
+    // Fallback: match by simple name (e.g. "TestExceptions" in any package)
+    for class_def_result in dex.class_defs() {
+        let class_def = class_def_result.ok()?;
+        let class_type = dex.get_type(class_def.class_idx).ok()?;
+        let name = dex_decompiler::java::descriptor_to_java(&class_type);
+        if simple_class_name(&name) != want_simple {
+            continue;
+        }
+        if let Some(enc) = find_method_in_class(dex, &class_def, method_name) {
+            return Some(enc);
         }
     }
     None
 }
 
+fn find_method_in_class(
+    dex: &DexFile,
+    class_def: &dex_decompiler::ClassDef,
+    method_name: &str,
+) -> Option<EncodedMethod> {
+    let class_data_opt = dex.get_class_data(class_def).ok()?;
+    let class_data = class_data_opt.as_ref()?;
+    for encoded in class_data
+        .direct_methods
+        .iter()
+        .chain(class_data.virtual_methods.iter())
+    {
+        let info = dex.get_method_info(encoded.method_idx).ok()?;
+        if info.name == method_name {
+            return Some(encoded.clone());
+        }
+    }
+    None
+}
+
+/// Format registers for emulator VM state (integers in hex).
+fn format_registers_short_hex(regs: &[dex_decompiler::emulator::RegisterInfo]) -> String {
+    regs.iter()
+        .filter(|r| !matches!(r.value, dex_decompiler::emulator::Value::Unset))
+        .map(|r| format!("{}={}", r.name, r.value.display_short_hex()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Run emulator step-by-step, printing each instruction and VM state (colored, hex for integers).
+fn run_emulate_verbose(emu: &mut dex_decompiler::emulator::Emulator) -> Result<()> {
+    while !emu.finished && emu.step_count < emu.max_steps {
+        let result = match emu.step() {
+            Ok(r) => r,
+            Err(e) => {
+                println!("{}", format!("Execution error: {}", e).red());
+                break;
+            }
+        };
+        let ins = &result.instruction;
+        let snap = &result.state_after;
+        println!(
+            "{}   {}  {}  {}",
+            format!("Step {}:", result.step_count).cyan().bold(),
+            format!("0x{:04x}", ins.offset).yellow(),
+            ins.mnemonic.green(),
+            ins.operands.white()
+        );
+        println!("  {} {}", "->".dimmed(), result.description.white());
+        let regs = format_registers_short_hex(&snap.registers);
+        if !regs.is_empty() {
+            println!("  {} {}", "Registers:".dimmed(), regs);
+        }
+        if !snap.heap.is_empty() {
+            let heap_str: Vec<String> = snap
+                .heap
+                .iter()
+                .map(|h| {
+                    match &h.object {
+                        dex_decompiler::emulator::HeapObjectKind::Array { element_type, values } => {
+                            let vals: Vec<String> = values.iter().map(|v| v.display_short_hex()).take(5).collect();
+                            let more = if values.len() > 5 { "..." } else { "" };
+                            format!("@{}={}[{}]({}){}", h.index, element_type, values.len(), vals.join(", "), more)
+                        }
+                        dex_decompiler::emulator::HeapObjectKind::Instance { class, .. } => {
+                            format!("@{}={}", h.index, class)
+                        }
+                    }
+                })
+                .collect();
+            println!("  {} {}", "Heap:".dimmed(), heap_str.join(", "));
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// Run emulator with a progress bar; message shows current instruction and register state (hex).
+fn run_emulate_progress(emu: &mut dex_decompiler::emulator::Emulator) -> Result<()> {
+    use indicatif::{ProgressBar, ProgressStyle};
+    let pb = ProgressBar::new(emu.max_steps as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .expect("template")
+            .progress_chars("=>-"),
+    );
+    while !emu.finished && emu.step_count < emu.max_steps {
+        let result = match emu.step() {
+            Ok(r) => r,
+            Err(e) => {
+                pb.finish_with_message(format!("Error: {}", e));
+                return Ok(());
+            }
+        };
+        pb.set_position(result.step_count as u64);
+        let ins = &result.instruction;
+        let regs = format_registers_short_hex(&result.state_after.registers);
+        let reg_short = if regs.len() > 60 { format!("{}...", &regs[..60]) } else { regs };
+        let msg = format!("0x{:04x} {} {} | {}", ins.offset, ins.mnemonic, ins.operands, reg_short);
+        pb.set_message(msg);
+    }
+    pb.finish_with_message(format!("Done ({} steps)", emu.step_count));
+    Ok(())
+}
+
+/// Run emulator step-by-step; after each instruction print state and wait for Enter (colored, hex).
+fn run_emulate_interactive(emu: &mut dex_decompiler::emulator::Emulator) -> Result<()> {
+    use std::io::{self, BufRead, Write};
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let mut stdout = io::stdout();
+    while !emu.finished && emu.step_count < emu.max_steps {
+        let result = match emu.step() {
+            Ok(r) => r,
+            Err(e) => {
+                println!("{}", format!("Execution error: {}", e).red());
+                break;
+            }
+        };
+        let ins = &result.instruction;
+        let snap = &result.state_after;
+        println!(
+            "{}   {}  {}  {}",
+            format!("Step {}:", result.step_count).cyan().bold(),
+            format!("0x{:04x}", ins.offset).yellow(),
+            ins.mnemonic.green(),
+            ins.operands.white()
+        );
+        println!("  {} {}", "->".dimmed(), result.description.white());
+        let regs = format_registers_short_hex(&snap.registers);
+        if !regs.is_empty() {
+            println!("  {} {}", "Registers:".dimmed(), regs);
+        }
+        if !snap.heap.is_empty() {
+            let heap_str: Vec<String> = snap
+                .heap
+                .iter()
+                .map(|h| {
+                    match &h.object {
+                        dex_decompiler::emulator::HeapObjectKind::Array { element_type, values } => {
+                            let vals: Vec<String> = values.iter().map(|v| v.display_short_hex()).take(5).collect();
+                            let more = if values.len() > 5 { "..." } else { "" };
+                            format!("@{}={}[{}]({}){}", h.index, element_type, values.len(), vals.join(", "), more)
+                        }
+                        dex_decompiler::emulator::HeapObjectKind::Instance { class, .. } => {
+                            format!("@{}={}", h.index, class)
+                        }
+                    }
+                })
+                .collect();
+            println!("  {} {}", "Heap:".dimmed(), heap_str.join(", "));
+        }
+        print!("  {} ", "[Enter to continue, q+Enter to stop]".dimmed());
+        stdout.flush()?;
+        let mut line = String::new();
+        stdin.read_line(&mut line)?;
+        if line.trim().eq_ignore_ascii_case("q") {
+            println!("{}", "Stopped by user.".yellow());
+            break;
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// Split params: use semicolon as top-level separator so array params can contain commas.
+/// E.g. "5;10" = two ints, "[B]1,2,3;[B]0,0" = two byte arrays.
+fn split_params_top_level(s: &str) -> Vec<String> {
+    s.split(';')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Parse one array token e.g. "[1,2,3]", "[B]0,1,2", or "[B]1,2,3,4,5" (no trailing ]).
+/// Returns (element_type, values).
+fn parse_array_token(token: &str) -> Option<(String, Vec<dex_decompiler::emulator::Value>)> {
+    let t = token.trim();
+    if !t.starts_with('[') {
+        return None;
+    }
+    let after_open = t[1..].trim_start();
+    let (elem_ty, rest) = if let Some(close) = after_open.find(']') {
+        let ty = after_open[..close].trim();
+        let after = after_open[close + 1..].trim_start();
+        match ty {
+            "B" | "byte" => ("B".to_string(), after),
+            "I" | "int" => ("I".to_string(), after),
+            _ => {
+                // "[1,2,3]" form: list is between [ and last ]
+                if t.ends_with(']') {
+                    ("I".to_string(), t[1..t.len() - 1].trim())
+                } else {
+                    ("I".to_string(), after_open)
+                }
+            }
+        }
+    } else {
+        return None;
+    };
+    let values: Vec<dex_decompiler::emulator::Value> = if rest.is_empty() {
+        vec![]
+    } else {
+        rest.split(',')
+            .map(|s| {
+                let s = s.trim().trim_end_matches(']');
+                s.parse::<i32>()
+                    .map(dex_decompiler::emulator::Value::Int)
+                    .unwrap_or(dex_decompiler::emulator::Value::Int(0))
+            })
+            .collect()
+    };
+    Some((elem_ty, values))
+}
+
+/// Parse --emulate-params into (params, initial_heap). Supports int, long, string, null, and arrays:
+/// "[1,2,3]" = int array, "[B]0,1,2" or "[byte]0,1,2" = byte array. Arrays are pushed to initial_heap
+/// and params get Value::Ref(index).
+fn parse_emulate_params(s: &str) -> (Vec<dex_decompiler::emulator::Value>, Vec<dex_decompiler::emulator::HeapObject>) {
+    use dex_decompiler::emulator::{HeapObject, HeapObjectKind, Value};
+    let tokens = split_params_top_level(s);
+    let mut params = Vec::new();
+    let mut initial_heap = Vec::new();
+    for token in tokens {
+        let t = token.trim();
+        if t.eq_ignore_ascii_case("null") {
+            params.push(Value::Null);
+        } else if let Some((elem_ty, values)) = parse_array_token(t) {
+            let obj = HeapObject {
+                kind: HeapObjectKind::Array {
+                    element_type: elem_ty.clone(),
+                    values,
+                },
+            };
+            initial_heap.push(obj);
+            params.push(Value::Ref(initial_heap.len() - 1));
+        } else if let Ok(v) = t.parse::<i32>() {
+            params.push(Value::Int(v));
+        } else if let Ok(v) = t.parse::<i64>() {
+            params.push(Value::Long(v));
+        } else {
+            params.push(Value::Str(t.trim_matches('"').to_string()));
+        }
+    }
+    (params, initial_heap)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Emulate: run method with given params and print console output + return value.
+    if let Some(ref emulate_spec) = args.emulate {
+        let (class_name, method_name) = match emulate_spec.split_once('#') {
+            Some((c, m)) => (c.trim(), m.trim()),
+            None => anyhow::bail!("--emulate must be CLASS#METHOD (e.g. com.example.Main#foo)"),
+        };
+        let mut encoded = None;
+        let mut dex = None;
+        for path in &args.input {
+            let data = fs::read(path).with_context(|| format!("read {}", path))?;
+            let d = parse_dex(&data).context("parse DEX")?;
+            if let Some(enc) = find_method(&d, class_name, method_name) {
+                encoded = Some(enc);
+                dex = Some(d);
+                break;
+            }
+        }
+        let (dex, encoded) = match (dex, encoded) {
+            (Some(d), Some(e)) => (d, e),
+            _ => anyhow::bail!(
+                "method {}#{} not found in any of {} DEX file(s)",
+                class_name,
+                method_name,
+                args.input.len()
+            ),
+        };
+        let decompiler = Decompiler::new(&dex);
+        let (params, initial_heap) = args
+            .emulate_params
+            .as_deref()
+            .map(parse_emulate_params)
+            .unwrap_or_else(|| (Vec::new(), Vec::new()));
+        let mut emu = decompiler
+            .build_emulator(&encoded, params.clone(), initial_heap)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let max_steps = args.emulate_max_steps.unwrap_or(10_000);
+        emu.max_steps = max_steps;
+
+        println!("{}", format!("=== Emulate {}#{} ===", class_name, method_name).cyan().bold());
+        if !params.is_empty() {
+            println!("{} {:?}", "Params:".dimmed(), params);
+        }
+        println!("{} {}", "Max steps:".dimmed(), max_steps);
+        println!();
+
+        if args.emulate_interactive {
+            run_emulate_interactive(&mut emu)?;
+        } else if args.emulate_verbose {
+            run_emulate_verbose(&mut emu)?;
+        } else if args.emulate_progress {
+            run_emulate_progress(&mut emu)?;
+        } else {
+            match emu.run_to_end() {
+                Ok(()) => {}
+                Err(e) => println!("{}", format!("Execution error: {}", e).red()),
+            }
+        }
+
+        if !emu.console_output.is_empty() {
+            println!("\n{}", "--- Console output ---".dimmed());
+            for line in &emu.console_output {
+                print!("{}", line);
+            }
+            println!();
+        }
+
+        if let Some(ref v) = emu.return_value {
+            println!("{}", "--- Return value ---".dimmed());
+            println!("{}", v.display_short_hex());
+        }
+        if let Some(ref e) = emu.exception {
+            println!("{}", "--- Exception ---".dimmed());
+            println!("{}", e.red());
+        }
+
+        println!("{}", "--- Summary ---".dimmed());
+        println!("Steps: {}", emu.step_count);
+        println!("Finished: {}", emu.finished);
+        return Ok(());
+    }
 
     // Data flow / tainting: show reads and writes for a value in a method.
     // With multiple DEX inputs (e.g. classes.dex, classes2.dex), the method is searched in order.
@@ -412,4 +757,28 @@ struct Args {
     /// Run all vulnerability detectors on every method (intent spoofing, RCE dynamic loading, insecure logging, SQL, WebView, hardcoded secrets, IPC). Optional: combine with --taint-api to add logging sources.
     #[arg(long = "scan-vulns")]
     scan_vulns: bool,
+
+    /// Emulate method CLASS#METHOD with optional params; print console output and return value to stdout.
+    #[arg(long = "emulate", value_name = "CLASS#METHOD")]
+    emulate: Option<String>,
+
+    /// Comma-separated parameter values for --emulate (e.g. "5,10" or "\"hello\",42"). Strings can be quoted.
+    #[arg(long = "emulate-params", value_name = "VALS")]
+    emulate_params: Option<String>,
+
+    /// Maximum emulation steps (default: 10000). Use with --emulate.
+    #[arg(long = "emulate-max-steps", value_name = "N")]
+    emulate_max_steps: Option<usize>,
+
+    /// Emulation verbose mode: print every instruction and VM state (registers, heap) after each step.
+    #[arg(long = "emulate-verbose")]
+    emulate_verbose: bool,
+
+    /// Emulation progress bar: show step count and current instruction + registers in the bar message.
+    #[arg(long = "emulate-progress")]
+    emulate_progress: bool,
+
+    /// Emulation step-by-step: after each instruction, print state and wait for Enter before continuing.
+    #[arg(long = "emulate-interactive")]
+    emulate_interactive: bool,
 }

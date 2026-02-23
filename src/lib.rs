@@ -3,6 +3,7 @@
 
 pub mod decompile;
 pub mod detectors;
+pub mod emulator;
 pub mod error;
 pub mod java;
 

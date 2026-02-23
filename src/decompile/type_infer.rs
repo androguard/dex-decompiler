@@ -324,9 +324,20 @@ fn parse_var_id(s: &str) -> Option<VarId> {
 }
 
 /// Build a display name for each variable: "result" for return value, "this"/"p0"/"p1" for params, semantic (array/index/length) or type-based.
-pub fn build_var_names(
+#[cfg(test)]
+fn build_var_names(
     stmts: &[IrStmt],
     type_map: &HashMap<VarId, String>,
+    ins_size: u32,
+    is_static: bool,
+) -> HashMap<VarId, String> {
+    build_var_names_with_regs(stmts, type_map, ins_size, ins_size, is_static)
+}
+
+pub fn build_var_names_with_regs(
+    stmts: &[IrStmt],
+    type_map: &HashMap<VarId, String>,
+    registers_size: u32,
     ins_size: u32,
     is_static: bool,
 ) -> HashMap<VarId, String> {
@@ -341,7 +352,7 @@ pub fn build_var_names(
     let mut names = HashMap::new();
     let mut counters: HashMap<&'static str, u32> = HashMap::new();
     let mut index_counter = 0u32;
-    let mut array_counter = 0u32;
+    let param_base = registers_size.saturating_sub(ins_size);
     for s in stmts {
         let (def, uses) = match s {
             IrStmt::Assign { dst, rhs, .. } => {
@@ -355,12 +366,12 @@ pub fn build_var_names(
         };
         for v in &uses {
             if !names.contains_key(v) {
-                names.insert(*v, name_for_var(*v, type_map, return_var, ins_size, is_static, &roles, &mut counters, &mut index_counter, &mut array_counter));
+                names.insert(*v, name_for_var(*v, type_map, return_var, param_base, ins_size, is_static, &roles, &mut counters, &mut index_counter));
             }
         }
         if let Some(d) = def {
             if !names.contains_key(&d) {
-                names.insert(d, name_for_var(d, type_map, return_var, ins_size, is_static, &roles, &mut counters, &mut index_counter, &mut array_counter));
+                names.insert(d, name_for_var(d, type_map, return_var, param_base, ins_size, is_static, &roles, &mut counters, &mut index_counter));
             }
         }
     }
@@ -412,22 +423,24 @@ fn name_for_var(
     v: VarId,
     type_map: &HashMap<VarId, String>,
     return_var: Option<VarId>,
+    param_base: u32,
     ins_size: u32,
     is_static: bool,
     roles: &HashMap<VarId, SemanticRole>,
     counters: &mut HashMap<&'static str, u32>,
     index_counter: &mut u32,
-    array_counter: &mut u32,
 ) -> String {
     if return_var == Some(v) {
         return "result".to_string();
     }
-    // Parameter registers (version 0, reg in [0, ins_size)) use signature names: this, p0, p1, ...
-    if v.ver == 0 && v.reg < ins_size {
-        if !is_static && v.reg == 0 {
+    // Parameter registers: version 0, reg in [param_base, param_base + ins_size).
+    // In Dalvik, parameters occupy the highest registers: v(registers_size - ins_size) .. v(registers_size - 1).
+    if v.ver == 0 && ins_size > 0 && v.reg >= param_base && v.reg < param_base + ins_size {
+        let param_offset = v.reg - param_base;
+        if !is_static && param_offset == 0 {
             return "this".to_string();
         }
-        let param_idx = if is_static { v.reg } else { v.reg.saturating_sub(1) };
+        let param_idx = if is_static { param_offset } else { param_offset.saturating_sub(1) };
         return format!("p{}", param_idx);
     }
     if let Some(role) = roles.get(&v) {
@@ -440,9 +453,10 @@ fn name_for_var(
             }
             SemanticRole::Length => return "length".to_string(),
             SemanticRole::Array => {
-                let c = *array_counter;
-                *array_counter = array_counter.saturating_add(1);
-                return if c == 0 { "array".to_string() } else { format!("array{}", c) };
+                let c = counters.entry("arr").or_insert(0);
+                let name = format!("arr{}", *c);
+                *c += 1;
+                return name;
             }
         }
     }
@@ -540,7 +554,7 @@ mod tests {
         ];
         let type_map = std::collections::HashMap::new();
         let names = build_var_names(&stmts, &type_map, 0, true);
-        assert_eq!(names.get(&VarId::new(1, 0)), Some(&"array".to_string()));
+        assert_eq!(names.get(&VarId::new(1, 0)), Some(&"arr0".to_string()));
         assert_eq!(names.get(&VarId::new(2, 0)), Some(&"i".to_string()));
         assert_eq!(names.get(&VarId::new(3, 0)), Some(&"length".to_string()));
     }

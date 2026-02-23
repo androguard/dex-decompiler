@@ -148,6 +148,8 @@ pub struct MethodCfg {
     pub loop_headers: HashSet<BlockId>,
     /// Entry block id (block containing first instruction).
     pub entry: BlockId,
+    /// Instruction offsets of const values folded into conditions (skip during emission).
+    pub folded_const_offsets: HashSet<u32>,
 }
 
 impl MethodCfg {
@@ -165,6 +167,7 @@ impl MethodCfg {
                 block_by_start: HashMap::new(),
                 loop_headers: HashSet::new(),
                 entry: 0,
+                folded_const_offsets: HashSet::new(),
             };
         }
 
@@ -375,6 +378,7 @@ impl MethodCfg {
             block_by_start,
             loop_headers,
             entry,
+            folded_const_offsets: HashSet::new(),
         }
     }
 
@@ -425,6 +429,17 @@ impl MethodCfg {
             }
         }
         preds
+    }
+
+    /// Block id that contains the given byte offset (start_offset <= offset < end_offset).
+    pub fn block_id_at_offset(&self, byte_offset: u32) -> Option<BlockId> {
+        for (bid, block) in self.blocks.iter().enumerate() {
+            let end = block.end_offset;
+            if block.start_offset <= byte_offset && (byte_offset < end || end == u32::MAX) {
+                return Some(bid);
+            }
+        }
+        None
     }
 
     /// True if `target` is reachable from `start` without entering `exclude` (e.g. loop header).

@@ -143,13 +143,48 @@ fn parse_new_stringbuilder(line: &str) -> Option<(String, Option<String>)> {
     Some((var, first_arg))
 }
 
-/// Match "var.append(arg);", return Some((var, arg)).
+/// Match "var.append(arg);" or "dest = var.append(arg);", return Some((var, arg)).
 fn parse_append(line: &str) -> Option<(String, String)> {
     let binding = strip_trailing_comment(line);
     let stmt = binding.trim();
     let dot = stmt.find(".append(")?;
-    let var = stmt[..dot].trim().to_string();
+    let before_dot = &stmt[..dot];
+    let var = if let Some(eq) = before_dot.find(" = ") {
+        before_dot[eq + 3..].trim().to_string()
+    } else {
+        before_dot.trim().to_string()
+    };
     let start = dot + ".append(".len();
+    let end = stmt.rfind(");")?;
+    let arg = stmt[start..end].trim().to_string();
+    Some((var, arg))
+}
+
+/// Match "var.<init>();" or "var.<init>(arg);", return Some((var, optional_arg)).
+fn parse_init_call(line: &str) -> Option<(String, Option<String>)> {
+    let binding = strip_trailing_comment(line);
+    let stmt = binding.trim();
+    let init_pos = stmt.find(".<init>(")?;
+    let var = stmt[..init_pos].trim().to_string();
+    let start = init_pos + ".<init>(".len();
+    let end = stmt.rfind(");")?;
+    let inner = stmt[start..end].trim();
+    let arg = if inner.is_empty() { None } else { Some(inner.to_string()) };
+    Some((var, arg))
+}
+
+/// Match "var.println(arg);" or "dest = var.println(arg);", return Some((var, arg)).
+fn parse_println(line: &str) -> Option<(String, String)> {
+    let binding = strip_trailing_comment(line);
+    let stmt = binding.trim();
+    let dot = stmt.find(".println(")?;
+    let before_dot = &stmt[..dot];
+    let var = if let Some(eq) = before_dot.find(" = ") {
+        before_dot[eq + 3..].trim().to_string()
+    } else {
+        before_dot.trim().to_string()
+    };
+    let start = dot + ".println(".len();
     let end = stmt.rfind(");")?;
     let arg = stmt[start..end].trim().to_string();
     Some((var, arg))
@@ -172,6 +207,163 @@ fn parse_to_string(line: &str) -> Option<(String, String)> {
         return Some((dest, var.trim().to_string()));
     }
     None
+}
+
+/// Extract the register number from SSA variable names like "v2", "local2", "localN".
+fn extract_reg_number(var: &str) -> Option<&str> {
+    if let Some(n) = var.strip_prefix("local") {
+        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) { return Some(n); }
+    }
+    if let Some(n) = var.strip_prefix('v') {
+        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) { return Some(n); }
+    }
+    None
+}
+
+/// Inline static field references: "var = System.out;" followed by "var.println(x)" → "System.out.println(x)".
+/// Handles SSA aliasing where "local2 = System.out;" and "v2.println(x)" refer to the same register.
+fn inline_static_field_refs(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut aliases: Vec<(String, String, Option<String>)> = Vec::new();
+    for line in &lines {
+        let stmt = strip_trailing_comment(line);
+        let t = stmt.trim();
+        if let Some(eq) = t.find(" = ") {
+            let var = t[..eq].trim();
+            let val = t[eq + 3..].trim_end_matches(';').trim();
+            if val.contains('.') && !val.contains('(') && !val.contains(' ') {
+                let reg_num = extract_reg_number(var).map(String::from);
+                aliases.push((var.to_string(), val.to_string(), reg_num));
+            }
+        }
+    }
+    if aliases.is_empty() {
+        return body.to_string();
+    }
+    let match_vars_for = |alias_var: &str, reg_num: &Option<String>| -> Vec<String> {
+        let mut vars = vec![alias_var.to_string()];
+        if let Some(n) = reg_num {
+            let v_form = format!("v{}", n);
+            let local_form = format!("local{}", n);
+            if v_form != alias_var { vars.push(v_form); }
+            if local_form != alias_var { vars.push(local_form); }
+        }
+        vars
+    };
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let stmt = strip_trailing_comment(line);
+        let t = stmt.trim();
+        let mut skip = false;
+        for (var, val, reg_num) in &aliases {
+            let assign_stmt = format!("{} = {};", var, val);
+            if t == assign_stmt {
+                let candidate_vars = match_vars_for(var, reg_num);
+                let non_print_use = lines.iter().enumerate().any(|(j, l)| {
+                    j != idx && candidate_vars.iter().any(|cv| {
+                        let prefix = format!("{}.", cv);
+                        l.contains(&prefix)
+                            && !l.contains(&format!("{}.println(", cv))
+                            && !l.contains(&format!("{}.print(", cv))
+                    })
+                });
+                if !non_print_use {
+                    skip = true;
+                    break;
+                }
+            }
+        }
+        if skip { continue; }
+        let mut current_line = line.to_string();
+        for (var, val, reg_num) in &aliases {
+            let candidate_vars = match_vars_for(var, reg_num);
+            for cv in &candidate_vars {
+                for method in &["println", "print"] {
+                    let from = format!("{}.{}(", cv, method);
+                    let to = format!("{}.{}(", val, method);
+                    current_line = current_line.replace(&from, &to);
+                }
+            }
+        }
+        out.push_str(&current_line);
+        if idx < lines.len().saturating_sub(1) {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Remove bare "var; /* move-exception */" statements and inline single-use string/numeric constants.
+fn cleanup_decompiler_artifacts(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+
+    // Collect string constants (safe to inline) and numeric constants (only remove if dead).
+    let mut string_consts: Vec<(usize, String, String)> = Vec::new();
+    let mut numeric_consts: Vec<(usize, String)> = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let binding = strip_trailing_comment(line);
+        let t = binding.trim();
+        if let Some(eq) = t.find(" = ") {
+            let lhs = t[..eq].trim();
+            let val = t[eq + 3..].trim_end_matches(';').trim();
+            let var = lhs.rsplit(' ').next().unwrap_or(lhs);
+            if !var.is_empty() && !var.contains(' ') {
+                if val.starts_with('"') && val.ends_with('"') {
+                    string_consts.push((idx, var.to_string(), val.to_string()));
+                } else if !val.is_empty() && val.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+                    numeric_consts.push((idx, var.to_string()));
+                }
+            }
+        }
+    }
+
+    // String constants: inline if used exactly once
+    let single_use_strings: Vec<(usize, String, String)> = string_consts
+        .into_iter()
+        .filter(|(def_idx, var, _)| {
+            let use_count = lines.iter().enumerate()
+                .filter(|(j, l)| *j != *def_idx && l.contains(var.as_str()))
+                .count();
+            use_count == 1
+        })
+        .collect();
+
+    // Numeric constants: remove definition only if the variable is completely unused
+    let dead_numeric_indices: std::collections::HashSet<usize> = numeric_consts
+        .into_iter()
+        .filter(|(def_idx, var)| {
+            lines.iter().enumerate()
+                .filter(|(j, l)| *j != *def_idx && l.contains(var.as_str()))
+                .count() == 0
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+
+    let mut skip_indices: std::collections::HashSet<usize> = single_use_strings.iter().map(|(i, _, _)| *i).collect();
+    skip_indices.extend(&dead_numeric_indices);
+
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let binding = strip_trailing_comment(line);
+        let t = binding.trim();
+        if t.ends_with("; /* move-exception */") || t.ends_with("/* move-exception */;") {
+            continue;
+        }
+        if skip_indices.contains(&idx) {
+            continue;
+        }
+        let mut current = line.to_string();
+        for (_, var, val) in &single_use_strings {
+            if current.contains(var.as_str()) {
+                current = current.replace(var.as_str(), val.as_str());
+            }
+        }
+        out.push_str(&current);
+        if idx < lines.len().saturating_sub(1) {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Simplify method body: collapse "invoke(...); vN = <result>; return vN;" into "return method(args);"
@@ -280,38 +472,92 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
         }
 
         // Try: StringBuilder chain → a + b + c
-        if let Some((sb_var, first_opt)) = parse_new_stringbuilder(line) {
+        // Handles SSA-aliased variables: new StringBuilder() on sb0 may be used as v3 in
+        // <init>, append, toString. Also folds into println if the toString result is used there.
+        if let Some((_sb_var, first_opt)) = parse_new_stringbuilder(line) {
             let mut parts: Vec<String> = if let Some(a) = first_opt {
                 vec![a]
             } else {
                 vec![]
             };
             let mut j = i + 1;
+            let chain_start = i;
+            let mut const_assigns: Vec<(String, String)> = Vec::new();
+
             while j < lines.len() {
-                if let Some((v, arg)) = parse_append(&lines[j]) {
-                    if v == sb_var {
+                let jline = lines[j].trim();
+                if let Some((_init_var, init_arg)) = parse_init_call(&lines[j]) {
+                    if let Some(arg) = init_arg {
                         parts.push(arg);
-                        j += 1;
-                        continue;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if jline.contains(" = ") && !jline.contains(".append(") && !jline.contains(".toString(") && !jline.contains("new ") && !jline.contains(".println(") {
+                    if let Some(eq) = jline.find(" = ") {
+                        let var = jline[..eq].trim();
+                        let val = jline[eq + 3..].trim_end_matches(';').trim();
+                        if !var.is_empty() && !val.is_empty() && !val.contains('(') {
+                            const_assigns.push((var.to_string(), val.to_string()));
+                            j += 1;
+                            continue;
+                        }
                     }
                 }
                 break;
             }
-            if j >= i + 1 && j < lines.len() && !parts.is_empty() {
-                if let Some((dest, to_str_var)) = parse_to_string(&lines[j]) {
-                    if to_str_var == sb_var {
-                        let indent = leading_indent(line);
-                        let concat = parts.join(" + ");
-                        if dest == "return" {
-                            writeln!(out, "{}return {};", indent, concat).ok();
-                            skip_unreachable_indent = Some(indent.len());
-                        } else {
-                            writeln!(out, "{}{} = {};", indent, dest, concat).ok();
+
+            while j < lines.len() {
+                if let Some((_v, arg)) = parse_append(&lines[j]) {
+                    parts.push(arg);
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+
+            if j < lines.len() && !parts.is_empty() {
+                if let Some((dest, _to_str_var)) = parse_to_string(&lines[j]) {
+                    let indent = leading_indent(line);
+                    let inline_const = |s: &str| -> String {
+                        for (cvar, cval) in &const_assigns {
+                            if s == cvar { return cval.clone(); }
                         }
+                        s.to_string()
+                    };
+                    let parts_inlined: Vec<String> = parts.iter().map(|p| inline_const(p)).collect();
+                    let concat = parts_inlined.join(" + ");
+
+                    if dest == "return" {
+                        writeln!(out, "{}return {};", indent, concat).ok();
+                        skip_unreachable_indent = Some(indent.len());
                         i = j + 1;
                         continue;
                     }
+                    if j + 1 < lines.len() {
+                        if let Some((print_obj, print_arg)) = parse_println(&lines[j + 1]) {
+                            if print_arg == dest {
+                                let receiver = const_assigns.iter()
+                                    .rfind(|(_, v)| v == "System.out")
+                                    .map(|(k, _)| k.as_str());
+                                let obj = if receiver.is_some_and(|r| r == print_obj || print_obj.starts_with("local") || print_obj.starts_with("v")) {
+                                    "System.out"
+                                } else {
+                                    &print_obj
+                                };
+                                writeln!(out, "{}{}.println({});", indent, obj, concat).ok();
+                                i = j + 2;
+                                continue;
+                            }
+                        }
+                    }
+                    writeln!(out, "{}{} = {};", indent, dest, concat).ok();
+                    i = j + 1;
+                    continue;
                 }
+            }
+            if j > chain_start + 1 {
+                // partial chain matched but no toString found; emit original lines
             }
         }
 
@@ -326,6 +572,10 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     }
     // Simplify "x + -N" to "x - N" (e.g. "local0 + -3" → "local0 - 3").
     out = out.replace(" + -", " - ");
+    // Inline "var = System.out;" → replace var.println(x) with System.out.println(x) and remove the assignment.
+    out = inline_static_field_refs(&out);
+    // Remove bare "var; /* move-exception */" lines and inline single-use string constants.
+    out = cleanup_decompiler_artifacts(&out);
     // Only in constructors: simplify "receiver.<init>();" (no args) to "super();".
     if is_constructor {
         let mut simplified = String::new();
@@ -543,5 +793,80 @@ mod tests {
             "expected 'return x + y;' in {:?}",
             simplified
         );
+    }
+
+    #[test]
+    fn simplify_stringbuilder_ssa_aliased_with_init_and_println() {
+        let body = "\
+                        local2 = System.out;\n\
+                        StringBuilder sb0 = new StringBuilder();\n\
+                        str0 = \"test2 \";\n\
+                        v3.<init>(str0);\n\
+                        local3 = v3.append(n0);\n\
+                        local4 = v3.toString();\n\
+                        v2.println(local4);";
+        let simplified = simplify_method_body(body, false);
+        assert!(
+            simplified.contains("System.out.println(\"test2 \" + n0);"),
+            "expected 'System.out.println(\"test2 \" + n0);' in {:?}",
+            simplified
+        );
+        assert!(!simplified.contains("StringBuilder"), "StringBuilder should be gone: {:?}", simplified);
+    }
+
+    #[test]
+    fn simplify_stringbuilder_dest_assign_append() {
+        let body = "\
+                sb = new StringBuilder();\n\
+                local0 = sb.append(a);\n\
+                local1 = sb.append(b);\n\
+                s = sb.toString();";
+        let simplified = simplify_method_body(body, false);
+        assert!(
+            simplified.contains("s = a + b;"),
+            "expected 's = a + b;' in {:?}",
+            simplified
+        );
+        assert!(!simplified.contains("StringBuilder"));
+    }
+
+    #[test]
+    fn simplify_remove_move_exception() {
+        let body = "\
+                local0; /* move-exception */\n\
+                n0 = 12;\n\
+                System.out.println(n0);";
+        let simplified = simplify_method_body(body, false);
+        assert!(!simplified.contains("move-exception"), "move-exception should be removed: {:?}", simplified);
+        assert!(simplified.contains("n0 = 12;"), "n0 = 12 should remain (used later): {:?}", simplified);
+    }
+
+    #[test]
+    fn simplify_inline_single_use_string_constant() {
+        let body = "\
+                str0 = \"test\";\n\
+                System.out.println(str0);";
+        let simplified = simplify_method_body(body, false);
+        assert!(
+            simplified.contains("System.out.println(\"test\");"),
+            "expected inlined string constant: {:?}",
+            simplified
+        );
+        assert!(!simplified.contains("str0"), "str0 assignment should be removed: {:?}", simplified);
+    }
+
+    #[test]
+    fn simplify_dead_sysout_assignment_removed() {
+        let body = "\
+                local0 = System.out;\n\
+                str0 = \"hello\";\n\
+                v0.println(str0);";
+        let simplified = simplify_method_body(body, false);
+        assert!(
+            simplified.contains("System.out.println(\"hello\");"),
+            "expected System.out.println(\"hello\") in {:?}",
+            simplified
+        );
+        assert!(!simplified.contains("local0 = System.out"), "dead assignment should be removed: {:?}", simplified);
     }
 }

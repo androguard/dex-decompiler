@@ -63,10 +63,13 @@ impl Expr {
                 }
             }
             Expr::Call { target, args } => {
+                let target_str = names
+                    .map(|n| substitute_names_in_text(target, n))
+                    .unwrap_or_else(|| target.clone());
                 let args_str = names
                     .map(|n| substitute_names_in_text(args, n))
                     .unwrap_or_else(|| args.clone());
-                format!("{}({})", target, args_str)
+                format!("{}({})", target_str, args_str)
             }
             Expr::PendingResult => "<result>".to_string(),
             Expr::Raw(s) => names

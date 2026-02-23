@@ -270,7 +270,7 @@ impl Pass for SsaRenamePass {
 fn rename_expr(expr: IrExpr, cur_ver: &HashMap<u32, u32>) -> IrExpr {
     match expr {
         IrExpr::Var(v) => IrExpr::Var(rename_var(v, cur_ver)),
-        IrExpr::Call { target, args } => IrExpr::Call { target, args: rename_vars_in_text(&args, cur_ver) },
+        IrExpr::Call { target, args } => IrExpr::Call { target: rename_vars_in_text(&target, cur_ver), args: rename_vars_in_text(&args, cur_ver) },
         IrExpr::PendingResult => IrExpr::PendingResult,
         IrExpr::Raw(s) => IrExpr::Raw(rename_vars_in_text(&s, cur_ver)),
     }
