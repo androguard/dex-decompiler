@@ -16,8 +16,12 @@ const LOGGING_SOURCE_DEFAULTS: &[&str] = &[
     "getAndroidId",
     "getPrimaryClip",
     "getText",
+    "getStringExtra",
     "getString",
     "getToken",
+    "getPassword",
+    "LoginData",
+    "getLoginData",
 ];
 
 pub fn scan_insecure_logging(

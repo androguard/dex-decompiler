@@ -41,7 +41,8 @@ impl PassRunner {
 
 /// Merges invoke + move-result + return into single statements:
 /// - `Expr(Call)` + `Assign(reg, PendingResult)` → `Assign(reg, Call)`
-/// - `Assign(reg, Call)` + `Return(Var(reg))` → `Return(Call)`
+/// - `Expr(Raw)` + `Assign(reg, PendingResult)` → `Assign(reg, Raw)` (lambdas)
+/// - `Assign(reg, rhs)` + `Return(Var(reg))` → `Return(rhs)` (literals, calls, …)
 /// - `Expr(Call)` + `Return(None)` → left as-is (call; return;)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InvokeChainPass;
@@ -83,15 +84,42 @@ impl Pass for InvokeChainPass {
                     i += 2;
                     continue;
                 }
+                // Expr(Raw) + Assign(PendingResult) → Assign(Raw) — lambda / invoke-custom
+                if let (
+                    IrStmt::Expr { expr: IrExpr::Raw(raw), comment: c1 },
+                    IrStmt::Assign {
+                        dst,
+                        rhs: IrExpr::PendingResult,
+                        comment: c2,
+                    },
+                ) = (&stmts[i], &stmts[i + 1])
+                {
+                    let comment = merge_comment(c1.as_deref(), c2.as_deref());
+                    out.push(IrStmt::Assign {
+                        dst: *dst,
+                        rhs: IrExpr::Raw(raw.clone()),
+                        comment,
+                    });
+                    i += 2;
+                    continue;
+                }
             }
 
-            // Try: Assign(reg, Call) + Return(Var(reg)) → Return(Call)
+            // Try: Assign(reg, any) + Return(Var(reg)) → Return(any)
+            // Covers Call and Raw/literals: `result = "bad_name"; return result;` → `return "bad_name";`
             if i + 1 < stmts.len() {
-                if let (IrStmt::Assign { dst, rhs: IrExpr::Call { target, args }, comment: c1 }, IrStmt::Return { value: Some(IrExpr::Var(ret_reg)), comment: c2 }) = (&stmts[i], &stmts[i + 1]) {
-                    if dst == ret_reg {
+                if let (
+                    IrStmt::Assign { dst, rhs, comment: c1 },
+                    IrStmt::Return {
+                        value: Some(IrExpr::Var(ret_reg)),
+                        comment: c2,
+                    },
+                ) = (&stmts[i], &stmts[i + 1])
+                {
+                    if dst == ret_reg && !matches!(rhs, IrExpr::PendingResult) {
                         let comment = merge_comment(c1.as_deref(), c2.as_deref());
                         out.push(IrStmt::Return {
-                            value: Some(IrExpr::Call { target: target.clone(), args: args.clone() }),
+                            value: Some(rhs.clone()),
                             comment,
                         });
                         i += 2;
@@ -138,6 +166,9 @@ impl Pass for DeadAssignPass {
         stmts
             .into_iter()
             .filter(|s| {
+                if matches!(s, IrStmt::Phi { .. }) {
+                    return false;
+                }
                 if let IrStmt::Assign { dst, .. } = s {
                     used.contains(dst)
                 } else {
@@ -158,6 +189,9 @@ pub fn run_dead_assign_with_used_regs(
     stmts
         .into_iter()
         .filter(|s| {
+            if matches!(s, IrStmt::Phi { .. }) {
+                return false;
+            }
             if let IrStmt::Assign { dst, .. } = s {
                 used_regs.contains(&dst.reg)
             } else {
@@ -182,6 +216,11 @@ fn used_var_ids(stmts: &[IrStmt]) -> HashSet<VarId> {
             IrStmt::Expr { expr, .. } => collect_var_ids_expr(expr, &mut set),
             IrStmt::Return { value: Some(e), .. } => collect_var_ids_expr(e, &mut set),
             IrStmt::Return { value: None, .. } | IrStmt::Raw(_) => {}
+            IrStmt::Phi { incomings, .. } => {
+                for (_, v) in incomings {
+                    set.insert(*v);
+                }
+            }
         }
     }
     set
@@ -228,12 +267,10 @@ fn var_ids_in_text(s: &str, set: &mut HashSet<VarId>) {
     }
 }
 
-/// Linear SSA renaming (no phi insertion yet).
+/// Linear SSA renaming for a flat statement list (no CFG).
 ///
-/// - Every `Stmt::Assign { dst: VarId { reg, .. }, .. }` becomes a new SSA version for that reg.
-/// - All `Expr::Var` uses are rewritten to the current version at that point.
-/// - `Expr::Call.args`, `Expr::Raw`, and `Stmt::Raw` get textual `vN` rewrites to `vN_k`
-///   using the current version map (best-effort; does not create new defs from raw text).
+/// For CFG-aware SSA with φ-nodes, see [`crate::decompile::ssa::construct_ssa`]
+/// (used by `--decompilation-mode simple` and for φ-register naming in restructure).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SsaRenamePass;
 
@@ -260,6 +297,14 @@ impl Pass for SsaRenamePass {
                     let value = value.map(|e| rename_expr(e, &cur_ver));
                     out.push(IrStmt::Return { value, comment });
                 }
+                IrStmt::Phi { mut dst, incomings } => {
+                    // Flat-list pass: treat phi as a def (should not appear in linear mode).
+                    let v = next_ver.entry(dst.reg).or_insert(0);
+                    *v += 1;
+                    dst.ver = *v;
+                    cur_ver.insert(dst.reg, dst.ver);
+                    out.push(IrStmt::Phi { dst, incomings });
+                }
                 IrStmt::Raw(s) => out.push(IrStmt::Raw(rename_vars_in_text(&s, &cur_ver))),
             }
         }
@@ -279,6 +324,12 @@ fn rename_expr(expr: IrExpr, cur_ver: &HashMap<u32, u32>) -> IrExpr {
 fn rename_var(v: VarId, cur_ver: &HashMap<u32, u32>) -> VarId {
     let ver = cur_ver.get(&v.reg).copied().unwrap_or(0);
     VarId::new(v.reg, ver)
+}
+
+/// Best-effort text rewrite: `vN` -> `vN_k` if current version for N is k>0.
+/// Leaves already-versioned `vN_k` unchanged.
+pub(crate) fn rename_vars_in_text_public(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
+    rename_vars_in_text(s, cur_ver)
 }
 
 /// Best-effort text rewrite: `vN` -> `vN_k` if current version for N is k>0.
@@ -336,6 +387,7 @@ fn rename_vars_in_text(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
 }
 
 /// Merge `new Foo()` + `receiver.<init>(args)` → `new Foo(args)`, and remove the bare `<init>` call.
+/// Allows intervening simple assignments (e.g. `const-class`) that don't redefine the receiver.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConstructorMergePass;
 
@@ -344,35 +396,131 @@ impl Pass for ConstructorMergePass {
         let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len());
         let mut i = 0;
         while i < stmts.len() {
-            // Pattern: Assign(dst, Raw("new Foo()")) + Expr(Call { target: "dst.<init>", args })
-            if i + 1 < stmts.len() {
-                if let IrStmt::Assign { dst, rhs: IrExpr::Raw(raw), comment } = &stmts[i] {
-                    if let Some(class_name) = raw.strip_prefix("new ").and_then(|s| s.strip_suffix("()")) {
-                        let dst_name = if dst.ver == 0 {
-                            format!("v{}", dst.reg)
-                        } else {
-                            format!("v{}_{}", dst.reg, dst.ver)
-                        };
-                        if let IrStmt::Expr { expr: IrExpr::Call { target, args }, comment: c2 } = &stmts[i + 1] {
-                            if target == &format!("{}.<init>", dst_name) {
-                                let merged_comment = merge_comment(comment.as_deref(), c2.as_deref());
-                                out.push(IrStmt::Assign {
-                                    dst: *dst,
-                                    rhs: IrExpr::Raw(format!("new {}({})", class_name, args)),
-                                    comment: merged_comment,
-                                });
-                                i += 2;
-                                continue;
-                            }
-                        }
-                    }
-                }
+            if let Some((merged, next_i)) = try_merge_constructor(&stmts, i) {
+                out.extend(merged);
+                i = next_i;
+                continue;
             }
             out.push(stmts[i].clone());
             i += 1;
         }
         out
     }
+}
+
+fn call_is_init_for_reg(target: &str, reg: u32) -> bool {
+    // vN.<init> or vN_k.<init>
+    let Some((recv, meth)) = target.rsplit_once('.') else {
+        return false;
+    };
+    if meth != "<init>" {
+        return false;
+    }
+    if let Some(r) = recv.strip_prefix('v') {
+        let reg_str = r.split('_').next().unwrap_or(r);
+        return reg_str.parse::<u32>().ok() == Some(reg);
+    }
+    false
+}
+
+fn try_merge_constructor(stmts: &[IrStmt], i: usize) -> Option<(Vec<IrStmt>, usize)> {
+    let IrStmt::Assign {
+        dst,
+        rhs: IrExpr::Raw(raw),
+        comment,
+    } = &stmts[i]
+    else {
+        return None;
+    };
+    let class_name = raw.strip_prefix("new ").and_then(|s| s.strip_suffix("()"))?;
+    let dst_reg = dst.reg;
+    let mut intervening: Vec<IrStmt> = Vec::new();
+    let mut j = i + 1;
+    while j < stmts.len() {
+        match &stmts[j] {
+            IrStmt::Assign { dst: mid, .. } if mid.reg == dst_reg => return None,
+            IrStmt::Expr {
+                expr: IrExpr::Call { target, args },
+                comment: c2,
+            } if call_is_init_for_reg(target, dst_reg) => {
+                let merged_comment = merge_comment(comment.as_deref(), c2.as_deref());
+                // Inline intervening const-class / const-string temps into constructor args so
+                // we don't emit `new Intent(this, local0)` before `local0 = Foo.class`.
+                let mut args = args.clone();
+                let mut keep_intervening: Vec<IrStmt> = Vec::new();
+                for inter in &intervening {
+                    if let IrStmt::Assign {
+                        dst: idst,
+                        rhs: IrExpr::Raw(rval),
+                        ..
+                    } = inter
+                    {
+                        let inlined = inline_var_in_args(&args, *idst, rval);
+                        if inlined != args {
+                            args = inlined;
+                            continue;
+                        }
+                    }
+                    keep_intervening.push(inter.clone());
+                }
+                let mut out = keep_intervening;
+                out.push(IrStmt::Assign {
+                    dst: *dst,
+                    rhs: IrExpr::Raw(format!("new {}({})", class_name, args)),
+                    comment: merged_comment,
+                });
+                return Some((out, j + 1));
+            }
+            s @ IrStmt::Assign { .. } => {
+                intervening.push(s.clone());
+                j += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Replace `vN` / `vN_k` for `vid` in a comma-separated arg list with `rval`.
+fn inline_var_in_args(args: &str, vid: VarId, rval: &str) -> String {
+    let names = if vid.ver == 0 {
+        vec![format!("v{}", vid.reg)]
+    } else {
+        vec![
+            format!("v{}_{}", vid.reg, vid.ver),
+            format!("v{}", vid.reg),
+        ]
+    };
+    let mut out = args.to_string();
+    for name in names {
+        out = replace_whole_ident(&out, &name, rval);
+    }
+    out
+}
+
+fn replace_whole_ident(text: &str, var: &str, replacement: &str) -> String {
+    if var.is_empty() || !text.contains(var) {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let v = var.as_bytes();
+    let mut out = String::with_capacity(text.len() + replacement.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + v.len() <= bytes.len() && &bytes[i..i + v.len()] == v {
+            let before_ok = i == 0 || !(bytes[i - 1] as char).is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+            let after_ok = i + v.len() == bytes.len()
+                || (!(bytes[i + v.len()] as char).is_ascii_alphanumeric() && bytes[i + v.len()] != b'_');
+            if before_ok && after_ok {
+                out.push_str(replacement);
+                i += v.len();
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Expression simplification: `v0 = v0 + 1` → `v0++`, `v0 = v0 + x` → `v0 += x`.
@@ -482,6 +630,30 @@ mod tests {
                 assert_eq!(args, "v2, v3");
             }
             _ => panic!("expected single Assign(Call), got {:?}", out),
+        }
+    }
+
+    #[test]
+    fn invoke_chain_fold_literal_assign_return() {
+        let stmts = vec![
+            IrStmt::Assign {
+                dst: VarId::new(0, 0),
+                rhs: IrExpr::Raw("\"bad_name\"".into()),
+                comment: None,
+            },
+            IrStmt::Return {
+                value: Some(IrExpr::Var(VarId::new(0, 0))),
+                comment: None,
+            },
+        ];
+        let out = InvokeChainPass.run(stmts);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            IrStmt::Return {
+                value: Some(IrExpr::Raw(s)),
+                ..
+            } => assert_eq!(s, "\"bad_name\""),
+            _ => panic!("expected Return(Raw(\"bad_name\")), got {:?}", out),
         }
     }
 

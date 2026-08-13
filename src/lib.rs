@@ -5,16 +5,54 @@ pub mod decompile;
 pub mod detectors;
 pub mod emulator;
 pub mod error;
+pub mod input;
 pub mod java;
+pub mod semgrep;
+pub mod taint;
+pub mod xref;
 
 pub use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod};
 pub use error::{DexDecompilerError, Result};
-pub use decompile::{
-    class_name_to_path, CfgEdgeInfo, CfgNodeInfo, Decompiler, DecompilerOptions, MethodBytecodeRow,
+pub use decompile::deobf::{
+    build_deobf_rename_map, merge_rename_maps, DeobfuscateOptions,
 };
+pub use decompile::mapping::{
+    load_mapping_file, load_mapping_str, mapping_format_from_path, save_mapping_file,
+    save_mapping_str, MappingFormat,
+};
+pub use decompile::{
+    class_name_to_path, CfgEdgeInfo, CfgNodeInfo, DecompilationMode, Decompiler, DecompilerOptions,
+    MethodBytecodeRow, rename::RenameMap,
+};
+pub use decompile::json_export::{ClassJson, DexJsonExport, FieldJson, MethodJson};
 pub use decompile::value_flow::{ValueFlowAnalysis, ValueFlowAnalysisOwned, ValueFlowResult};
 pub use detectors::pending_intent::{PendingIntentFinding, scan_pending_intents};
-pub use detectors::{run_all_detectors, VulnFinding};
+pub use detectors::{
+    category_meta, is_library_class, run_all_detectors, scan_dex_parallel,
+    scan_pending_intents_dex_parallel, CategoryMeta, VulnFinding, VulnTraceStep,
+};
+pub use semgrep::{
+    builtin_android_rules, default_android_rule_paths, load_android_rules, load_rules_from_dir,
+    load_rules_from_str, load_rules_from_yaml_file, scan_dex_semgrep, scan_dex_semgrep_sequential,
+    scan_dex_semgrep_sequential_with_progress, scan_dex_semgrep_with_progress, scan_method_semgrep,
+    scan_xml_semgrep,
+    scan_xml_semgrep_sequential, SemgrepFinding, SemgrepRule, ANDROID_ALL_RULES_YAML,
+    ANDROID_GENERAL_RULES_YAML,
+};
+pub use input::{
+    extract_android_manifest_from_apk, extract_dex_entries_from_apk, is_classes_dex_name,
+    load_dexes_from_bytes, load_dexes_from_path, load_dexes_from_paths, looks_like_text_xml,
+};
+pub use taint::{
+    convert_models_json, convert_rules_json, default_config, load_mt_case_config, method_patterns,
+    parse_mt_port, solve_dex, solve_dexes, write_issues_json, Issue, IssueReport, SolveOptions,
+    SolveResult, TaintConfig,
+};
+pub use xref::{
+    find_field_xrefs, find_method_callees, find_method_callees_by_class_method,
+    find_method_callers, find_method_callers_by_class_method, FieldXref, FieldXrefsInfo,
+    MethodCallee, MethodCalleesInfo, MethodCaller, MethodCallersInfo,
+};
 
 /// Parse a DEX file from raw bytes. Returns decompiler Result (maps parser errors to Parse).
 pub fn parse_dex(data: &[u8]) -> Result<DexFile> {

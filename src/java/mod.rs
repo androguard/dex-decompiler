@@ -32,8 +32,31 @@ pub fn descriptor_to_java(descriptor: &str) -> String {
     }
 }
 
+/// Format Java access modifiers from DEX access_flags.
+///
+/// `member_kind`: `Class`, `Field`, or `Method` — DEX reuses some bit meanings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberKind {
+    Class,
+    Field,
+    Method,
+}
+
 /// Format Java access modifiers from DEX access_flags (class or member).
+/// Prefer [`access_flags_to_java_kind`] for methods (correct bridge/varargs).
 pub fn access_flags_to_java(flags: u32, for_class: bool) -> Vec<&'static str> {
+    access_flags_to_java_kind(
+        flags,
+        if for_class {
+            MemberKind::Class
+        } else {
+            MemberKind::Field
+        },
+    )
+}
+
+/// Format modifiers with correct method vs field bit meanings.
+pub fn access_flags_to_java_kind(flags: u32, kind: MemberKind) -> Vec<&'static str> {
     let mut out = Vec::new();
     if flags & 0x1 != 0 {
         out.push("public");
@@ -50,31 +73,47 @@ pub fn access_flags_to_java(flags: u32, for_class: bool) -> Vec<&'static str> {
     if flags & 0x10 != 0 {
         out.push("final");
     }
-    if flags & 0x20 != 0 && !for_class {
+    if flags & 0x20 != 0 && kind == MemberKind::Method {
         out.push("synchronized");
     }
-    if flags & 0x40 != 0 && !for_class {
-        out.push("volatile"); // or bridge
+    match kind {
+        MemberKind::Field => {
+            if flags & 0x40 != 0 {
+                out.push("volatile");
+            }
+            if flags & 0x80 != 0 {
+                out.push("transient");
+            }
+        }
+        MemberKind::Method => {
+            // Omit bridge/synthetic from Java source — cleaned up via accessors pass.
+            if flags & 0x80 != 0 {
+                out.push("varargs");
+            }
+            if flags & 0x100 != 0 {
+                out.push("native");
+            }
+        }
+        MemberKind::Class => {}
     }
-    if flags & 0x80 != 0 && !for_class {
-        out.push("transient"); // or varargs
-    }
-    if flags & 0x100 != 0 && !for_class {
-        out.push("native");
-    }
-    if flags & 0x200 != 0 && for_class {
+    if flags & 0x200 != 0 && kind == MemberKind::Class {
         out.push("interface");
     }
     if flags & 0x400 != 0 {
         out.push("abstract");
     }
-    if flags & 0x1000 != 0 {
-        out.push("synthetic");
-    }
-    if flags & 0x10000 != 0 && !for_class {
-        // ACC_CONSTRUCTOR - we use name "<init>" for constructor, no keyword
-    }
+    // Don't emit "synthetic" keyword in Java (not valid / noisy).
     out
+}
+
+/// ACC_BRIDGE on methods.
+pub fn is_bridge_method(flags: u32) -> bool {
+    (flags & 0x40) != 0
+}
+
+/// ACC_SYNTHETIC.
+pub fn is_synthetic(flags: u32) -> bool {
+    (flags & 0x1000) != 0
 }
 
 #[cfg(test)]
@@ -141,13 +180,13 @@ mod tests {
     #[test]
     fn access_flags_method_public_static() {
         let f = access_flags_to_java(0x1 | 0x8, false);
-        assert!(f.contains(&"public"));
-        assert!(f.contains(&"static"));
+        assert_eq!(f, vec!["public", "static"]);
+        assert_eq!(f.join(" "), "public static");
     }
 
     #[test]
     fn access_flags_method_private_native() {
-        let f = access_flags_to_java(0x2 | 0x100, false);
+        let f = access_flags_to_java_kind(0x2 | 0x100, MemberKind::Method);
         assert!(f.contains(&"private"));
         assert!(f.contains(&"native"));
     }
@@ -159,18 +198,26 @@ mod tests {
     }
 
     #[test]
-    fn access_flags_synchronized_not_for_class() {
-        let f = access_flags_to_java(0x20, false);
+    fn access_flags_synchronized_method_only() {
+        let f = access_flags_to_java_kind(0x20, MemberKind::Method);
         assert!(f.contains(&"synchronized"));
         let f_class = access_flags_to_java(0x20, true);
         assert!(!f_class.contains(&"synchronized"));
     }
 
     #[test]
+    fn access_flags_bridge_not_emitted() {
+        let f = access_flags_to_java_kind(0x40 | 0x1, MemberKind::Method);
+        assert!(f.contains(&"public"));
+        assert!(!f.contains(&"bridge"));
+        assert!(!f.contains(&"volatile"));
+    }
+
+    #[test]
     fn access_flags_interface_only_for_class() {
         let f = access_flags_to_java(0x200, true);
         assert!(f.contains(&"interface"));
-        let f_method = access_flags_to_java(0x200, false);
+        let f_method = access_flags_to_java_kind(0x200, MemberKind::Method);
         assert!(!f_method.contains(&"interface"));
     }
 }

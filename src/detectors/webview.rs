@@ -8,13 +8,21 @@ const WEBVIEW_SOURCES: &[&str] = &[
     "getText",
     "getData",
     "getDataString",
+    "getQueryParameter",
+    "getIntent",
 ];
 const WEBVIEW_SINKS: &[&str] = &[
     "loadUrl",
     "loadDataWithBaseURL",
     "loadData",
+    "evaluateJavascript",
 ];
 const JAVASCRIPT_INTERFACE_PATTERNS: &[&str] = &["addJavascriptInterface"];
+const FILE_ACCESS_PATTERNS: &[&str] = &[
+    "setAllowFileAccessFromFileURLs",
+    "setAllowUniversalAccessFromFileURLs",
+    "setAllowFileAccess",
+];
 
 pub fn scan_webview_unsafe(
     owned: &ValueFlowAnalysisOwned,
@@ -29,13 +37,19 @@ pub fn scan_webview_unsafe(
         WEBVIEW_SOURCES,
         WEBVIEW_SINKS,
     );
-    let js = invoke_scan(
+    out.extend(invoke_scan(
         owned,
         class_name,
         method_name,
         "webview_javascript_interface",
         JAVASCRIPT_INTERFACE_PATTERNS,
-    );
-    out.extend(js);
+    ));
+    out.extend(invoke_scan(
+        owned,
+        class_name,
+        method_name,
+        "webview_file_access",
+        FILE_ACCESS_PATTERNS,
+    ));
     out
 }

@@ -19,9 +19,16 @@ pub struct ValueFlowAnalysisOwned {
     pub api_return_sources: Vec<((u32, u32), String)>,
     /// For each invoke offset, the resolved method ref (e.g. "android.app.PendingIntent.getActivity").
     pub invoke_method_map: InvokeMethodMap,
+    /// Disassembly label per instruction offset: `"mnemonic operands"`.
+    pub insn_at: HashMap<u32, String>,
 }
 
 impl ValueFlowAnalysisOwned {
+    /// Human-readable instruction at `offset`, or empty.
+    pub fn insn_label(&self, offset: u32) -> String {
+        self.insn_at.get(&offset).cloned().unwrap_or_default()
+    }
+
     /// Build a value-flow analysis (reaching defs, def-use, use-def). The returned analysis borrows this struct.
     pub fn analysis(&self) -> ValueFlowAnalysis<'_> {
         ValueFlowAnalysis::new(&self.cfg, &self.rw_map)
@@ -155,6 +162,29 @@ where
         let resolved = resolve_operands(ins.operands());
         let (reads, writes) = instruction_reads_writes(ins.mnemonic(), &resolved);
         map.insert(offset, (reads, writes));
+    }
+    map
+}
+
+/// Build offset → `"mnemonic operands"` labels for analysis evidence.
+pub fn build_insn_labels<F>(
+    instructions: &[Instruction],
+    base_off: u32,
+    resolve_operands: F,
+) -> HashMap<u32, String>
+where
+    F: Fn(&str) -> String,
+{
+    let mut map = HashMap::new();
+    for ins in instructions {
+        let offset = (ins.offset as u32).wrapping_add(base_off);
+        let resolved = resolve_operands(ins.operands());
+        let label = if resolved.is_empty() {
+            ins.mnemonic().to_string()
+        } else {
+            format!("{} {}", ins.mnemonic(), resolved)
+        };
+        map.insert(offset, label);
     }
     map
 }

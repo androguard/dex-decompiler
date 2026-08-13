@@ -2,20 +2,39 @@
 //! Supports structured control flow: if/else, while loops (via CFG).
 //! Simplification pass: collapse invoke + move-result + return into single return.
 
+pub mod accessors;
 pub mod annotations;
 pub mod cfg;
+pub mod const_fields;
+pub mod deobf;
+pub mod graph;
 mod ir;
+pub mod json_export;
+pub mod kotlin;
+pub mod mapping;
 pub mod pass;
 mod read_write;
 pub mod region;
+pub mod rename;
+pub mod resource_consts;
+pub mod ssa;
 mod simplify;
+pub use simplify::restore_string_switch as simplify_restore_string_switch_for_tests;
+pub use simplify::simplify_method_body as simplify_method_body_for_tests;
 mod try_catch;
-use try_catch::{try_and_handler_byte_ranges, try_handler_pairs};
+use try_catch::{
+    catch_all_byte_range, looks_like_finally,
+    try_and_handler_byte_ranges_with_end, try_handler_pairs,
+};
 mod type_infer;
 pub mod value_flow;
 
 use cfg::{BlockEnd, BlockId, MethodCfg};
-use region::{build_regions, build_regions_filtered, for_loop_pattern, region_contains_loop, region_is_empty, region_is_empty_with_cfg, Region};
+use region::{
+    as_single_if, build_regions, build_regions_filtered, for_loop_pattern,
+    loop_body_do_while_pattern, region_contains_loop, region_is_empty, region_is_empty_with_cfg,
+    Region,
+};
 use dex_bytecode::{decode_all, Instruction};
 use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod, NO_INDEX};
 use crate::error::{DexDecompilerError, Result};
@@ -23,16 +42,29 @@ use crate::java;
 use std::fmt::Write;
 use ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
 use pass::{run_dead_assign_with_used_regs, ConstructorMergePass, DeadAssignPass, ExprSimplifyPass, InvokeChainPass, PassRunner, SsaRenamePass, used_regs};
+use ssa::{apply_canonical_names, construct_ssa, phi_canonical_map, phi_registers, strip_phis};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use type_infer::{build_var_names_with_regs, infer_types};
+use type_infer::{build_var_names_with_regs, enrich_types_with_register_map, infer_types, types_compatible_for_naming};
 use value_flow::{
-    build_api_return_sources, build_invoke_method_map, build_instruction_rw_map,
+    build_api_return_sources, build_insn_labels, build_invoke_method_map, build_instruction_rw_map,
     ValueFlowAnalysisOwned,
 };
 
+/// Decompilation strategy (jadx-inspired).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecompilationMode {
+    /// Structured control flow (if/else, loops, switch, try/catch). Default.
+    #[default]
+    Restructure,
+    /// Simplified: emit CFG blocks in order without full region nesting.
+    Simple,
+    /// Linear IR listing (minimal structure) — use when restructuring fails or for debugging.
+    Fallback,
+}
+
 /// Options for filtering which classes are decompiled (e.g. `--only-package`, `--exclude`).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DecompilerOptions {
     /// If set, only classes in this package (or the exact class) are decompiled. E.g. `com.example`.
     pub only_package: Option<String>,
@@ -40,6 +72,35 @@ pub struct DecompilerOptions {
     pub exclude: Vec<String>,
     /// If true, emit raw DEX instructions as comments before each method body.
     pub show_bytecode: bool,
+    /// Optional renames for package, class, method, field, and local variables in decompiled output.
+    pub rename_map: Option<rename::RenameMap>,
+    /// Decompilation mode (restructure / simple / fallback).
+    pub mode: DecompilationMode,
+    /// Prefer DEX debug_info local/parameter names when present (default: true).
+    pub use_debug_names: bool,
+    /// Optional resource id → `R.type.name` (from `resources.arsc` / R classes).
+    pub resource_map: Option<std::collections::HashMap<u32, String>>,
+}
+
+impl Default for DecompilerOptions {
+    fn default() -> Self {
+        Self {
+            only_package: None,
+            exclude: Vec::new(),
+            show_bytecode: false,
+            rename_map: None,
+            mode: DecompilationMode::Restructure,
+            use_debug_names: true,
+            resource_map: None,
+        }
+    }
+}
+
+impl DecompilerOptions {
+    /// Options with debug names enabled (same as [`Default`]).
+    pub fn with_defaults() -> Self {
+        Self::default()
+    }
 }
 
 /// One instruction row for bytecode display (e.g. in web UI).
@@ -83,60 +144,256 @@ fn class_matches_filter(class_name: &str, only_package: Option<&str>, exclude: &
     true
 }
 
+/// True if the DEX class name is nested (`Outer$…`).
+fn is_nested_dex_class(class_name: &str) -> bool {
+    class_name.contains('$')
+}
+
+/// Direct named member of `outer` (`Outer$Foo`, not `Outer$1` / `Outer$Foo$Bar`).
+fn is_direct_named_inner(outer: &str, candidate: &str) -> bool {
+    let prefix = format!("{}$", outer);
+    let Some(suffix) = candidate.strip_prefix(&prefix) else {
+        return false;
+    };
+    !suffix.is_empty()
+        && !suffix.contains('$')
+        && !suffix.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Last emitted statement is return/throw/break/continue (no trailing break needed).
+fn body_ends_with_exit(out: &str) -> bool {
+    let Some(last) = out.trim_end().lines().last() else {
+        return false;
+    };
+    let t = last.trim();
+    t.starts_with("return")
+        || t.starts_with("throw")
+        || t == "break;"
+        || t == "continue;"
+}
+
+fn is_synthetic_local_name(s: &str) -> bool {
+    if s.starts_with("local") && s.bytes().skip(5).all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    if s.starts_with('v') && s.len() > 1 && s.bytes().skip(1).all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // Typed temps: i0, s0, v0, o0, t0, ...
+    let b = s.as_bytes();
+    if b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1..].iter().all(|c| c.is_ascii_digit())
+        && matches!(b[0], b'i' | b's' | b'z' | b'j' | b'f' | b'd' | b'l' | b'b' | b'c' | b'v' | b'o' | b't' | b'a')
+    {
+        return true;
+    }
+    false
+}
+
+fn is_java_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_alphabetic() || first == '_' || first == '$') {
+        return false;
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
 /// Decompiler: takes a parsed DexFile and emits Java source.
 pub struct Decompiler<'a> {
     pub dex: &'a DexFile,
     only_package: Option<String>,
     exclude: Vec<String>,
     show_bytecode: bool,
-    /// Lazy index: class_name -> ClassDef. Avoids repeated full DEX scan in find_class_def / find_method.
-    class_def_index: RefCell<Option<HashMap<String, ClassDef>>>,
+    /// Optional renames for package, class, method, field, and variables.
+    rename_map: Option<rename::RenameMap>,
+    mode: DecompilationMode,
+    use_debug_names: bool,
+    /// Registers that have φ-nodes in the current method (shared Java names across versions).
+    phi_regs: RefCell<HashSet<u32>>,
+    /// Lazy index: class_name -> (dex_slot, ClassDef). Slot 0 = primary `dex`, 1+ = `extra_dexes`.
+    class_def_index: RefCell<Option<HashMap<String, (usize, ClassDef)>>>,
     /// Lazy index: enclosing_class -> (inner_class_name, constructor_param_count) for inner classes extending Thread.
     inner_thread_index: RefCell<Option<HashMap<String, Vec<(String, usize)>>>>,
+    /// Lazy index: enclosing -> (inner, ctor_params, superclass_or_iface) for general anonymous inlining.
+    inner_anon_index: RefCell<Option<HashMap<String, Vec<(String, usize, String)>>>>,
     /// Cache: inner_class_name -> decompiled run() body (before capture replacement). Avoids re-decompiling same run().
     inner_run_body_cache: RefCell<HashMap<String, String>>,
+    /// Nesting depth for lambda body inlining (avoid recursive explode).
+    lambda_inline_depth: RefCell<u32>,
+    /// Literal → `Class.FIELD` replacements for the class currently being decompiled.
+    const_field_reps: RefCell<Vec<(String, String)>>,
+    /// Literal → `R.type.name` replacements (ARSC + DEX R$*).
+    resource_reps: Vec<(String, String)>,
+    /// Current class `access$*` replacements (set while decompiling a class).
+    accessor_reps: RefCell<Vec<(String, String)>>,
+    /// Extra DEXes for cross-DEX inner/anonymous class lookup (APK multi-dex).
+    extra_dexes: Vec<&'a DexFile>,
+    /// Register → Java type for the method currently being decompiled (cross-block enrichment).
+    method_reg_types: RefCell<Option<HashMap<u32, String>>>,
+    /// Register → preferred Java name for the method (stable across CFG blocks).
+    method_reg_names: RefCell<Option<HashMap<u32, String>>>,
 }
 
 impl<'a> Decompiler<'a> {
     pub fn new(dex: &'a DexFile) -> Self {
+        let resource_map = resource_consts::build_resource_name_map(dex, None);
+        let resource_reps = resource_consts::resource_replacements(&resource_map);
         Self {
             dex,
             only_package: None,
             exclude: vec![],
             show_bytecode: false,
+            rename_map: None,
+            mode: DecompilationMode::Restructure,
+            use_debug_names: true,
+            phi_regs: RefCell::new(HashSet::new()),
             class_def_index: RefCell::new(None),
             inner_thread_index: RefCell::new(None),
+            inner_anon_index: RefCell::new(None),
             inner_run_body_cache: RefCell::new(HashMap::new()),
+            lambda_inline_depth: RefCell::new(0),
+            const_field_reps: RefCell::new(Vec::new()),
+            resource_reps,
+            accessor_reps: RefCell::new(Vec::new()),
+            extra_dexes: Vec::new(),
+            method_reg_types: RefCell::new(None),
+            method_reg_names: RefCell::new(None),
         }
     }
 
-    /// Create a decompiler with package/class filters.
+    /// Create a decompiler with package/class filters and optional rename map.
     pub fn with_options(dex: &'a DexFile, options: DecompilerOptions) -> Self {
+        let resource_map =
+            resource_consts::build_resource_name_map(dex, options.resource_map.as_ref());
+        let resource_reps = resource_consts::resource_replacements(&resource_map);
         Self {
             dex,
             only_package: options.only_package,
             exclude: options.exclude,
             show_bytecode: options.show_bytecode,
+            rename_map: options.rename_map,
+            mode: options.mode,
+            use_debug_names: options.use_debug_names,
+            phi_regs: RefCell::new(HashSet::new()),
             class_def_index: RefCell::new(None),
             inner_thread_index: RefCell::new(None),
+            inner_anon_index: RefCell::new(None),
             inner_run_body_cache: RefCell::new(HashMap::new()),
+            lambda_inline_depth: RefCell::new(0),
+            const_field_reps: RefCell::new(Vec::new()),
+            resource_reps,
+            accessor_reps: RefCell::new(Vec::new()),
+            extra_dexes: Vec::new(),
+            method_reg_types: RefCell::new(None),
+            method_reg_names: RefCell::new(None),
         }
     }
 
-    /// Build class_name -> ClassDef index on first use (one pass over DEX).
+    /// Attach additional DEX files so inner/anonymous classes can be resolved across multi-DEX APKs.
+    pub fn with_extra_dexes(mut self, extra: Vec<&'a DexFile>) -> Self {
+        self.extra_dexes = extra;
+        // Force rebuild of class indexes to include extras.
+        *self.class_def_index.borrow_mut() = None;
+        *self.inner_thread_index.borrow_mut() = None;
+        *self.inner_anon_index.borrow_mut() = None;
+        self
+    }
+
+    /// Field type with generics when `dalvik.annotation.Signature` is present.
+    fn field_type_java(&self, class_def: &ClassDef, field_idx: u32, descriptor: &str) -> String {
+        if let Some(sig) = annotations::field_generic_signature(
+            self.dex.data.as_ref(),
+            class_def,
+            field_idx,
+            &|idx| self.dex.get_string(idx).ok(),
+            &|idx| self.dex.get_type(idx).ok(),
+        ) {
+            if let Some(ty) = annotations::signature_type_to_java(&sig) {
+                return ty;
+            }
+        }
+        java::descriptor_to_java(descriptor)
+    }
+
+    /// Interfaces implemented by a class (`interfaces_off` type_list).
+    fn class_interfaces(&self, class_def: &ClassDef) -> Vec<String> {
+        if class_def.interfaces_off == 0 {
+            return vec![];
+        }
+        let data = self.dex.data.as_ref();
+        let off = class_def.interfaces_off as usize;
+        if off + 4 > data.len() {
+            return vec![];
+        }
+        let size = u32::from_le_bytes(data[off..off + 4].try_into().unwrap_or([0; 4])) as usize;
+        let mut out = Vec::new();
+        for i in 0..size {
+            let base = off + 4 + i * 2;
+            if base + 2 > data.len() {
+                break;
+            }
+            let type_idx = u16::from_le_bytes(data[base..base + 2].try_into().unwrap_or([0; 2])) as u32;
+            if let Ok(desc) = self.dex.get_type(type_idx) {
+                out.push(java::descriptor_to_java(&desc));
+            }
+        }
+        out
+    }
+
+    /// ClassDefs that are direct named inners of `outer` (`Outer$Member`).
+    fn direct_named_inner_defs(&self, outer: &str) -> Result<Vec<ClassDef>> {
+        let mut out = Vec::new();
+        for class_def_result in self.dex.class_defs() {
+            let class_def = class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let class_type = self
+                .dex
+                .get_type(class_def.class_idx)
+                .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let name = java::descriptor_to_java(&class_type);
+            if is_direct_named_inner(outer, &name) {
+                out.push(class_def);
+            }
+        }
+        out.sort_by_key(|cd| cd.class_idx);
+        Ok(out)
+    }
+
+    /// Build class_name -> (dex_slot, ClassDef) index (primary DEX + extra_dexes).
     fn ensure_class_def_index(&self) -> Result<()> {
         if self.class_def_index.borrow().is_some() {
             return Ok(());
         }
         let mut map = HashMap::new();
-        for class_def_result in self.dex.class_defs() {
-            let class_def = class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-            let class_type = self.dex.get_type(class_def.class_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-            let name = java::descriptor_to_java(&class_type);
-            map.insert(name, class_def.clone());
+        let mut ingest = |slot: usize, dex: &DexFile| -> Result<()> {
+            for class_def_result in dex.class_defs() {
+                let class_def =
+                    class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                let class_type = dex
+                    .get_type(class_def.class_idx)
+                    .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                let name = java::descriptor_to_java(&class_type);
+                map.entry(name).or_insert((slot, class_def.clone()));
+            }
+            Ok(())
+        };
+        ingest(0, self.dex)?;
+        for (i, d) in self.extra_dexes.iter().enumerate() {
+            ingest(i + 1, d)?;
         }
         *self.class_def_index.borrow_mut() = Some(map);
         Ok(())
+    }
+
+    fn dex_at(&self, slot: usize) -> &'a DexFile {
+        if slot == 0 {
+            self.dex
+        } else {
+            self.extra_dexes[slot - 1]
+        }
     }
 
     /// Build enclosing_class -> [(inner_name, param_count)] for inner classes extending Thread.
@@ -146,34 +403,52 @@ impl<'a> Decompiler<'a> {
         }
         let thread_java = java::descriptor_to_java("Ljava/lang/Thread;");
         let mut map: HashMap<String, Vec<(String, usize)>> = HashMap::new();
-        for class_def_result in self.dex.class_defs() {
-            let class_def = class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-            let class_type = self.dex.get_type(class_def.class_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-            let name = java::descriptor_to_java(&class_type);
-            let Some((enclosing, suffix)) = name.rsplit_once('$') else {
-                continue;
-            };
-            if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
-            if class_def.superclass_idx == NO_INDEX {
-                continue;
-            }
-            let super_type = self.dex.get_type(class_def.superclass_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-            if java::descriptor_to_java(&super_type) != thread_java {
-                continue;
-            }
-            let class_data_opt = self.dex.get_class_data(&class_def).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-            let Some(ref class_data) = class_data_opt.as_ref() else {
-                continue;
-            };
-            for enc in &class_data.direct_methods {
-                let info = self.dex.get_method_info(enc.method_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-                if info.name == "<init>" {
-                    map.entry(enclosing.to_string()).or_default().push((name.clone(), info.params.len()));
-                    break;
+        let mut ingest = |dex: &DexFile| -> Result<()> {
+            for class_def_result in dex.class_defs() {
+                let class_def =
+                    class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                let class_type = dex
+                    .get_type(class_def.class_idx)
+                    .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                let name = java::descriptor_to_java(&class_type);
+                let Some((enclosing, suffix)) = name.rsplit_once('$') else {
+                    continue;
+                };
+                if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                if class_def.superclass_idx == NO_INDEX {
+                    continue;
+                }
+                let super_type = dex
+                    .get_type(class_def.superclass_idx)
+                    .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                if java::descriptor_to_java(&super_type) != thread_java {
+                    continue;
+                }
+                let class_data_opt = dex
+                    .get_class_data(&class_def)
+                    .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                let Some(ref class_data) = class_data_opt.as_ref() else {
+                    continue;
+                };
+                for enc in &class_data.direct_methods {
+                    let info = dex
+                        .get_method_info(enc.method_idx)
+                        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                    if info.name == "<init>" {
+                        map.entry(enclosing.to_string())
+                            .or_default()
+                            .push((name.clone(), info.params.len()));
+                        break;
+                    }
                 }
             }
+            Ok(())
+        };
+        ingest(self.dex)?;
+        for d in &self.extra_dexes {
+            ingest(d)?;
         }
         *self.inner_thread_index.borrow_mut() = Some(map);
         Ok(())
@@ -191,6 +466,10 @@ impl<'a> Decompiler<'a> {
             if !class_matches_filter(&class_name, self.only_package.as_deref(), &self.exclude) {
                 continue;
             }
+            // Named/anonymous inners are nested or inlined — not top-level classes.
+            if is_nested_dex_class(&class_name) {
+                continue;
+            }
             if !first {
                 writeln!(&mut out).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
@@ -199,6 +478,86 @@ impl<'a> Decompiler<'a> {
             write!(&mut out, "{}", class_java).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
         Ok(out)
+    }
+
+    /// Export class/method/field inventory as JSON (optionally with decompiled method bodies).
+    pub fn export_json(&self, include_bodies: bool) -> Result<String> {
+        use json_export::{ClassJson, DexJsonExport, FieldJson, MethodJson};
+        let mut classes = Vec::new();
+        for class_def_result in self.dex.class_defs() {
+            let class_def = class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let class_type = self
+                .dex
+                .get_type(class_def.class_idx)
+                .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let class_name = java::descriptor_to_java(&class_type);
+            if !class_matches_filter(&class_name, self.only_package.as_deref(), &self.exclude) {
+                continue;
+            }
+            let class_data = self
+                .dex
+                .get_class_data(&class_def)
+                .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let mut fields = Vec::new();
+            let mut methods = Vec::new();
+            if let Some(ref cd) = class_data {
+                for f in &cd.static_fields {
+                    if let Ok(fi) = self.dex.get_field_info(f.field_idx) {
+                        fields.push(FieldJson {
+                            name: fi.name.to_string(),
+                            typ: java::descriptor_to_java(&fi.typ),
+                            static_field: true,
+                        });
+                    }
+                }
+                for f in &cd.instance_fields {
+                    if let Ok(fi) = self.dex.get_field_info(f.field_idx) {
+                        fields.push(FieldJson {
+                            name: fi.name.to_string(),
+                            typ: java::descriptor_to_java(&fi.typ),
+                            static_field: false,
+                        });
+                    }
+                }
+                let simple = class_name.rsplit('.').next().unwrap_or(&class_name);
+                for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                    let info = self
+                        .dex
+                        .get_method_info(m.method_idx)
+                        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                    let params: Vec<String> = info
+                        .params
+                        .iter()
+                        .map(|p| java::descriptor_to_java(p))
+                        .collect();
+                    let descriptor = format!(
+                        "({}){}",
+                        params.join(","),
+                        java::descriptor_to_java(&info.return_type)
+                    );
+                    let java_src = if include_bodies {
+                        self.decompile_method(m, Some(simple), Some(&class_name))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    methods.push(MethodJson {
+                        name: info.name.to_string(),
+                        descriptor,
+                        access_flags: m.access_flags,
+                        java: java_src,
+                    });
+                }
+            }
+            classes.push(ClassJson {
+                name: class_name,
+                fields,
+                methods,
+            });
+        }
+        serde_json::to_string_pretty(&DexJsonExport { classes }).map_err(|e| {
+            DexDecompilerError::Decompilation(format!("json export: {e}"))
+        })
     }
 
     /// Decompile entire DEX into a directory with package structure (e.g. `out/com/example/MyClass.java`).
@@ -214,6 +573,9 @@ impl<'a> Decompiler<'a> {
             let class_def = class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
             let class_type = self.dex.get_type(class_def.class_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
             let class_name = java::descriptor_to_java(&class_type);
+            if is_nested_dex_class(&class_name) {
+                continue;
+            }
             if class_matches_filter(&class_name, self.only_package.as_deref(), &self.exclude) {
                 out.push((class_def, class_name));
             }
@@ -234,8 +596,13 @@ impl<'a> Decompiler<'a> {
             if let Some(p) = &mut progress {
                 p(i + 1, total, &class_name);
             }
-            let (rel_dir, file_name) = class_name_to_path(&class_name);
             let class_java = self.decompile_class(&class_def)?;
+            let output_class_name = self
+                .rename_map
+                .as_ref()
+                .and_then(|r| r.class.get(&class_name).cloned())
+                .unwrap_or_else(|| class_name.clone());
+            let (rel_dir, file_name) = class_name_to_path(&output_class_name);
             let full_dir = base_path.join(rel_dir);
             std::fs::create_dir_all(&full_dir).map_err(|e| DexDecompilerError::Decompilation(format!("create dir {}: {}", full_dir.display(), e)))?;
             let file_path = full_dir.join(file_name);
@@ -244,11 +611,161 @@ impl<'a> Decompiler<'a> {
         Ok(())
     }
 
+    /// Parallel decompile of all included classes into `base_path`.
+    ///
+    /// Each rayon worker builds its own [`Decompiler`] (internal caches are `!Sync`).
+    /// `DexFile` must be shareable across threads (`Arc` bytes in dex-parser).
+    /// Optional `progress` receives `(current, total, class_name)` as classes complete.
+    pub fn decompile_to_dir_parallel(
+        dex: &DexFile,
+        options: DecompilerOptions,
+        base_path: &std::path::Path,
+        progress: Option<&(dyn Fn(usize, usize, &str) + Sync)>,
+    ) -> Result<()> {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let probe = Decompiler::with_options(dex, options.clone());
+        let included = probe.collect_included_classes()?;
+        let total = included.len();
+        if total == 0 {
+            return Ok(());
+        }
+
+        let done = AtomicUsize::new(0);
+
+        let results: Vec<Result<()>> = included
+            .par_iter()
+            .map(|(class_def, class_name)| {
+                let d = Decompiler::with_options(dex, options.clone());
+                let class_java = d.decompile_class(class_def)?;
+                let output_class_name = d
+                    .rename_map
+                    .as_ref()
+                    .and_then(|r| r.class.get(class_name).cloned())
+                    .unwrap_or_else(|| class_name.clone());
+                let (rel_dir, file_name) = class_name_to_path(&output_class_name);
+                let full_dir = base_path.join(rel_dir);
+                std::fs::create_dir_all(&full_dir).map_err(|e| {
+                    DexDecompilerError::Decompilation(format!(
+                        "create dir {}: {}",
+                        full_dir.display(),
+                        e
+                    ))
+                })?;
+                let file_path = full_dir.join(file_name);
+                std::fs::write(&file_path, &class_java).map_err(|e| {
+                    DexDecompilerError::Decompilation(format!(
+                        "write {}: {}",
+                        file_path.display(),
+                        e
+                    ))
+                })?;
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(p) = progress {
+                    p(n, total, class_name);
+                }
+                Ok(())
+            })
+            .collect();
+
+        for r in results {
+            r?;
+        }
+        Ok(())
+    }
+
+    /// Parallel decompile of **multiple** DEX files into one output tree.
+    ///
+    /// Classes are collected from every DEX; on duplicate FQN the first wins.
+    pub fn decompile_dexes_to_dir_parallel(
+        dexes: &[&DexFile],
+        options: DecompilerOptions,
+        base_path: &std::path::Path,
+        progress: Option<&(dyn Fn(usize, usize, &str) + Sync)>,
+    ) -> Result<()> {
+        use rayon::prelude::*;
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        if dexes.is_empty() {
+            return Ok(());
+        }
+        if dexes.len() == 1 {
+            return Self::decompile_to_dir_parallel(dexes[0], options, base_path, progress);
+        }
+
+        // (dex_index, ClassDef, class_name)
+        let mut jobs: Vec<(usize, ClassDef, String)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (di, dex) in dexes.iter().enumerate() {
+            let probe = Decompiler::with_options(dex, options.clone());
+            for (class_def, class_name) in probe.collect_included_classes()? {
+                if seen.insert(class_name.clone()) {
+                    jobs.push((di, class_def, class_name));
+                }
+            }
+        }
+        let total = jobs.len();
+        if total == 0 {
+            return Ok(());
+        }
+        let done = AtomicUsize::new(0);
+        let results: Vec<Result<()>> = jobs
+            .par_iter()
+            .map(|(di, class_def, class_name)| {
+                let dex = dexes[*di];
+                let d = Decompiler::with_options(dex, options.clone());
+                let class_java = d.decompile_class(class_def)?;
+                let output_class_name = d
+                    .rename_map
+                    .as_ref()
+                    .and_then(|r| r.class.get(class_name).cloned())
+                    .unwrap_or_else(|| class_name.clone());
+                let (rel_dir, file_name) = class_name_to_path(&output_class_name);
+                let full_dir = base_path.join(rel_dir);
+                std::fs::create_dir_all(&full_dir).map_err(|e| {
+                    DexDecompilerError::Decompilation(format!(
+                        "create dir {}: {}",
+                        full_dir.display(),
+                        e
+                    ))
+                })?;
+                let file_path = full_dir.join(file_name);
+                std::fs::write(&file_path, &class_java).map_err(|e| {
+                    DexDecompilerError::Decompilation(format!(
+                        "write {}: {}",
+                        file_path.display(),
+                        e
+                    ))
+                })?;
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(p) = progress {
+                    p(n, total, class_name);
+                }
+                Ok(())
+            })
+            .collect();
+        for r in results {
+            r?;
+        }
+        Ok(())
+    }
+
     /// Decompile one class to Java source.
     pub fn decompile_class(&self, class_def: &ClassDef) -> Result<String> {
+        self.decompile_class_ex(class_def, false)
+    }
+
+    /// Decompile one class. When `as_member`, skip package/imports (nested class body).
+    fn decompile_class_ex(&self, class_def: &ClassDef, as_member: bool) -> Result<String> {
         let class_type = self.dex.get_type(class_def.class_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
         let class_name = java::descriptor_to_java(&class_type);
-        let (package, simple_class_name) = split_package_and_class(&class_name);
+        let (package, simple_raw) = split_package_and_class(&class_name);
+        let simple_class_name = simple_raw
+            .rsplit_once('$')
+            .map(|(_, s)| s.to_string())
+            .unwrap_or(simple_raw);
         let class_data = self.dex.get_class_data(class_def).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
         let super_type = if class_def.superclass_idx != NO_INDEX {
             let s = self.dex.get_type(class_def.superclass_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
@@ -258,29 +775,85 @@ impl<'a> Decompiler<'a> {
         };
         let flags = java::access_flags_to_java(class_def.access_flags, true);
         let mut out = String::new();
-        if !package.is_empty() {
-            writeln!(&mut out, "// package {}", package).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-        }
-        let imports = collect_class_imports(
-            self.dex,
-            class_def,
-            class_data.as_ref(),
-            &class_name,
-            &package,
-        )?;
-        for fqn in &imports {
-            writeln!(&mut out, "import {};", fqn).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-        }
-        if !imports.is_empty() {
-            writeln!(&mut out).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-        }
-        let class_annotation_type_ids = annotations::class_annotation_type_ids(self.dex.data.as_ref(), class_def).unwrap_or_default();
-        for type_idx in &class_annotation_type_ids {
-            if let Ok(desc) = self.dex.get_type(*type_idx) {
-                let java_type = java::descriptor_to_java(&desc);
-                let name = annotation_short_name(&java_type);
-                writeln!(&mut out, "@{}", name).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        if !as_member {
+            if !package.is_empty() {
+                writeln!(&mut out, "// package {}", package).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
+            let imports = collect_class_imports(
+                self.dex,
+                class_def,
+                class_data.as_ref(),
+                &class_name,
+                &package,
+            )?;
+            for fqn in &imports {
+                writeln!(&mut out, "import {};", fqn).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            }
+            if !imports.is_empty() {
+                writeln!(&mut out).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            }
+        }
+        let class_anns = annotations::class_annotations(
+            self.dex.data.as_ref(),
+            class_def,
+            &|idx| self.dex.get_string(idx).ok(),
+        )
+        .unwrap_or_default();
+        for ann in &class_anns {
+            if let Some(line) = annotations::format_annotation_java(
+                ann,
+                &|idx| self.dex.get_string(idx).ok(),
+                &|idx| self.dex.get_type(idx).ok(),
+            ) {
+                writeln!(&mut out, "{}", line)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            }
+        }
+        let method_names: Vec<String> = class_data
+            .as_ref()
+            .map(|cd| {
+                cd.direct_methods
+                    .iter()
+                    .chain(cd.virtual_methods.iter())
+                    .filter_map(|m| self.dex.get_method_info(m.method_idx).ok())
+                    .map(|info| info.name.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let kt = kotlin::analyze_kotlin_class(
+            self.dex.data.as_ref(),
+            class_def,
+            &class_name,
+            &method_names,
+            &|idx| self.dex.get_string(idx).ok(),
+            &|idx| self.dex.get_type(idx).ok(),
+        );
+        if let Some(comment) = kt.comment_prefix() {
+            writeln!(&mut out, "{}", comment)
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        }
+        let class_sig = annotations::class_generic_signature(
+            self.dex.data.as_ref(),
+            class_def,
+            &|idx| self.dex.get_string(idx).ok(),
+            &|idx| self.dex.get_type(idx).ok(),
+        )
+        .and_then(|s| annotations::parse_class_signature(&s));
+        let type_params = class_sig
+            .as_ref()
+            .and_then(|c| c.type_params.clone())
+            .unwrap_or_default();
+        let extends_ty = class_sig
+            .as_ref()
+            .and_then(|c| c.superclass.clone())
+            .filter(|s| s != "java.lang.Object" && s != "Object")
+            .unwrap_or_else(|| super_type.clone());
+        let mut ifaces: Vec<String> = class_sig
+            .as_ref()
+            .map(|c| c.interfaces.clone())
+            .unwrap_or_default();
+        if ifaces.is_empty() {
+            ifaces = self.class_interfaces(class_def);
         }
         let enum_constants = detect_enum_constants(self.dex, class_def, class_data.as_ref(), &class_name, &super_type);
         let is_enum = !enum_constants.is_empty();
@@ -288,16 +861,60 @@ impl<'a> Decompiler<'a> {
         for f in &flags {
             write!(&mut out, "{} ", f).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
+        let class_kw = if kt.is_data {
+            "/* data */ class"
+        } else if kt.is_companion {
+            "/* companion */ class"
+        } else if kt.is_coroutine {
+            "/* coroutine */ class"
+        } else {
+            "class"
+        };
         if is_enum {
-            write!(&mut out, "enum {}", simple_class_name)
+            write!(&mut out, "enum {}{} ", simple_class_name, type_params)
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         } else {
-            write!(&mut out, "class {} extends {}", simple_class_name, super_type)
-                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            write!(
+                &mut out,
+                "{} {}{}",
+                class_kw, simple_class_name, type_params
+            )
+            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            if !extends_ty.is_empty() && extends_ty != "java.lang.Object" && extends_ty != "Object" {
+                write!(&mut out, " extends {}", shorten_java_names(&extends_ty))
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            }
+            if !ifaces.is_empty() {
+                let iface_str = ifaces
+                    .iter()
+                    .map(|i| shorten_java_names(i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(&mut out, " implements {}", iface_str)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            }
         }
         writeln!(&mut out, " {{").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
 
         if let Some(ref cd) = class_data {
+            let static_inits = const_fields::parse_static_inits(self.dex, class_def, cd);
+            let access: Vec<(u32, u32)> = cd
+                .static_fields
+                .iter()
+                .map(|f| (f.field_idx, f.access_flags))
+                .collect();
+            *self.const_field_reps.borrow_mut() =
+                const_fields::const_field_replacements(&class_name, &static_inits, &access);
+            let methods: Vec<&EncodedMethod> = cd
+                .direct_methods
+                .iter()
+                .chain(cd.virtual_methods.iter())
+                .collect();
+            *self.accessor_reps.borrow_mut() =
+                accessors::build_accessor_replacements(self.dex, &class_name, &methods);
+            let init_by_idx: HashMap<u32, &const_fields::StaticInit> =
+                static_inits.iter().map(|s| (s.field_idx, s)).collect();
+
             if is_enum {
                 writeln!(&mut out, "    {}", enum_constants.join(", "))
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
@@ -308,33 +925,97 @@ impl<'a> Decompiler<'a> {
                     if is_enum && enum_constants.contains(&fi.name.to_string()) {
                         continue;
                     }
-                    let typ = java::descriptor_to_java(&fi.typ);
+                    let typ = self.field_type_java(class_def, f.field_idx, &fi.typ);
                     let name = fi.name;
                     let fflags = java::access_flags_to_java(f.access_flags, false);
-                    for fl in &fflags {
-                        write!(&mut out, "    {} ", fl).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    write!(&mut out, "    ").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    if !fflags.is_empty() {
+                        write!(&mut out, "{} ", fflags.join(" "))
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     }
-                    writeln!(&mut out, "{} {};", typ, name).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    if let Some(init) = init_by_idx.get(&f.field_idx) {
+                        writeln!(&mut out, "{} {} = {};", typ, name, init.value_java)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    } else {
+                        writeln!(&mut out, "{} {};", typ, name)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    }
                 }
             }
             for f in &cd.instance_fields {
                 if let Ok(fi) = self.dex.get_field_info(f.field_idx) {
-                    let typ = java::descriptor_to_java(&fi.typ);
+                    // Synthetic outer/captures — reconstructed via Outer.this / inlining.
+                    if fi.name == "this$0" || fi.name.starts_with("val$") {
+                        continue;
+                    }
+                    let typ = self.field_type_java(class_def, f.field_idx, &fi.typ);
                     let name = fi.name;
                     let fflags = java::access_flags_to_java(f.access_flags, false);
-                    for fl in &fflags {
-                        write!(&mut out, "    {} ", fl).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    write!(&mut out, "    ").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    if !fflags.is_empty() {
+                        write!(&mut out, "{} ", fflags.join(" "))
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     }
                     writeln!(&mut out, "{} {};", typ, name).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 }
             }
             for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                if let Ok(info) = self.dex.get_method_info(m.method_idx) {
+                    if accessors::should_skip_method_emit(&info.name, m.access_flags) {
+                        continue;
+                    }
+                }
                 let method_java = self.decompile_method(m, Some(&simple_class_name), Some(&class_name))?;
                 write!(&mut out, "{}", method_java).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            }
+            self.const_field_reps.borrow_mut().clear();
+            self.accessor_reps.borrow_mut().clear();
+        }
+
+        // Nest direct named inner classes (Outer$Foo, not Outer$1).
+        for nested_def in self.direct_named_inner_defs(&class_name)? {
+            let nested_java = self.decompile_class_ex(&nested_def, true)?;
+            for line in nested_java.lines() {
+                writeln!(&mut out, "    {}", line)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
         }
 
         writeln!(&mut out, "}}").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+
+        // Apply user renames (package, class, method, field) via identifier-safe replacement.
+        if let Some(ref r) = self.rename_map {
+            let method_names: Vec<String> = class_data
+                .as_ref()
+                .map(|cd| {
+                    cd.direct_methods
+                        .iter()
+                        .chain(cd.virtual_methods.iter())
+                        .filter_map(|m| self.dex.get_method_info(m.method_idx).ok())
+                        .map(|info| {
+                            if info.name == "<init>" {
+                                simple_class_name.clone()
+                            } else {
+                                info.name.to_string()
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let field_names: Vec<String> = class_data
+                .as_ref()
+                .map(|cd| {
+                    cd.static_fields
+                        .iter()
+                        .chain(cd.instance_fields.iter())
+                        .filter_map(|f| self.dex.get_field_info(f.field_idx).ok())
+                        .map(|fi| fi.name.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let replacements = r.replacements_for_class(&class_name, &method_names, &field_names);
+            out = r.apply_to_java(&out, &replacements);
+        }
         Ok(out)
     }
 
@@ -348,12 +1029,36 @@ impl<'a> Decompiler<'a> {
         class_name: Option<&str>,
     ) -> Result<String> {
         let info = self.dex.get_method_info(encoded.method_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-        let return_type = java::descriptor_to_java(&info.return_type);
-        let params: Vec<String> = info.params.iter().map(|p| java::descriptor_to_java(p)).collect();
-        let flags = java::access_flags_to_java(encoded.access_flags, false);
+        let mut return_type = java::descriptor_to_java(&info.return_type);
+        let mut params: Vec<String> = info.params.iter().map(|p| java::descriptor_to_java(p)).collect();
+        let mut type_params = String::new();
+        if let Some(cname) = class_name {
+            if let Some(class_def) = self.find_class_def(cname) {
+                if let Some(sig) = annotations::method_generic_signature(
+                    self.dex.data.as_ref(),
+                    &class_def,
+                    encoded.method_idx,
+                    &|idx| self.dex.get_string(idx).ok(),
+                    &|idx| self.dex.get_type(idx).ok(),
+                ) {
+                    if let Some(msig) = annotations::signature_method_to_java(&sig) {
+                        if let Some(tp) = msig.type_params {
+                            type_params = tp;
+                        }
+                        if msig.params.len() == params.len() {
+                            params = msig.params;
+                        }
+                        return_type = msig.return_type;
+                    }
+                }
+            }
+        }
+        let flags = java::access_flags_to_java_kind(encoded.access_flags, java::MemberKind::Method);
         let mut out = String::new();
-        for f in &flags {
-            write!(&mut out, "    {} ", f).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        write!(&mut out, "    ").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        if !flags.is_empty() {
+            write!(&mut out, "{} ", flags.join(" "))
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
         let is_constructor = info.name == "<init>";
         let name = if is_constructor && class_simple_name.is_some() {
@@ -361,12 +1066,26 @@ impl<'a> Decompiler<'a> {
         } else {
             &info.name
         };
-        let params_str = params.iter().enumerate().map(|(i, t)| format!("{} p{}", t, i)).collect::<Vec<_>>().join(", ");
+        let params_str = params
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let pname = type_infer::param_display_name(i, t);
+                format!("{} {}", t, pname)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         if is_constructor && class_simple_name.is_some() {
             write!(&mut out, "{}({}) ", name, params_str)
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         } else {
-            write!(&mut out, "{} {}({}) ", return_type, name, params_str)
+            // Java: `<T> ReturnType name(params)` — type params before return type.
+            let tp = if type_params.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", type_params)
+            };
+            write!(&mut out, "{}{} {}({}) ", tp, return_type, name, params_str)
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
         if flags.contains(&"abstract") || flags.contains(&"native") {
@@ -472,20 +1191,189 @@ impl<'a> Decompiler<'a> {
         Ok((rows, nodes, edges))
     }
 
-    /// Find the first ClassDef in the DEX for the given class name (Java FQN, e.g. "androguard.test.TestSynthetic$1").
-    fn find_class_def(&self, class_name: &str) -> Option<ClassDef> {
+    /// Find the first ClassDef (and owning DEX slot) for the given class name.
+    fn find_class_def_slot(&self, class_name: &str) -> Option<(usize, ClassDef)> {
         let _ = self.ensure_class_def_index();
-        self.class_def_index.borrow().as_ref()?.get(class_name).cloned()
+        self.class_def_index
+            .borrow()
+            .as_ref()?
+            .get(class_name)
+            .cloned()
+    }
+
+    /// Find the first ClassDef in the primary/extra DEX set for the given class name.
+    fn find_class_def(&self, class_name: &str) -> Option<ClassDef> {
+        self.find_class_def_slot(class_name).map(|(_, cd)| cd)
+    }
+
+    /// Find EncodedMethod by method_ids index (any class) on the primary DEX.
+    pub fn find_method_by_idx(&self, method_idx: u32) -> Option<EncodedMethod> {
+        let info = self.dex.get_method_info(method_idx).ok()?;
+        let class_name = java::descriptor_to_java(&info.class);
+        let (slot, class_def) = self.find_class_def_slot(&class_name)?;
+        let dex = self.dex_at(slot);
+        let class_data_opt = dex.get_class_data(&class_def).ok()?;
+        let class_data = class_data_opt.as_ref()?;
+        for encoded in class_data.direct_methods.iter().chain(class_data.virtual_methods.iter()) {
+            if encoded.method_idx == method_idx {
+                return Some(encoded.clone());
+            }
+        }
+        None
+    }
+
+    /// Build `(params) -> { body }` / expression lambda from invoke-custom operands.
+    fn format_lambda_expression(&self, raw_ops: &str) -> String {
+        let captures = extract_brace_regs(raw_ops);
+        let Some(idx) = extract_callsite_idx(raw_ops) else {
+            return format_invoke_custom_stmt(self.dex, raw_ops);
+        };
+        let Ok(info) = self.dex.get_call_site(idx) else {
+            return format_invoke_custom_stmt(self.dex, raw_ops);
+        };
+        let Some(mid) = dex_parser::DexCallSites::impl_method_id(&info) else {
+            return format_invoke_custom_stmt(self.dex, raw_ops);
+        };
+        {
+            let mut depth = self.lambda_inline_depth.borrow_mut();
+            if *depth >= 4 {
+                return format_invoke_custom_stmt(self.dex, raw_ops);
+            }
+            *depth += 1;
+        }
+        let out = self
+            .try_format_lambda_with_body(mid as u32, &info.method_name, &captures)
+            .unwrap_or_else(|| format_invoke_custom_stmt(self.dex, raw_ops));
+        *self.lambda_inline_depth.borrow_mut() -= 1;
+        out
+    }
+
+    fn try_format_lambda_with_body(
+        &self,
+        method_idx: u32,
+        sam_name: &str,
+        captures: &[String],
+    ) -> Option<String> {
+        let encoded = self.find_method_by_idx(method_idx)?;
+        let info = self.dex.get_method_info(method_idx).ok()?;
+        let class = java::descriptor_to_java(&info.class);
+        let is_static = (encoded.access_flags & 0x8) != 0;
+        let param_start = if is_static { 0 } else { 1 };
+
+        // Method reference: named method (not lambda$/access$), prefer `Type::name` / `recv::name`.
+        let is_lambda_synth = info.name.contains("lambda$")
+            || info.name.starts_with("access$")
+            || info.name == "<init>";
+        if !is_lambda_synth {
+            if is_static && captures.is_empty() {
+                return Some(format!("{}::{}", shorten_java_names(&class), info.name));
+            }
+            if !is_static && captures.len() == 1 {
+                return Some(format!("{}::{}", captures[0], info.name));
+            }
+            if is_static && captures.len() == 1 {
+                // Bound static / capturing — fall through to body inline.
+            } else if captures.is_empty() {
+                return Some(format!("{}::{}", shorten_java_names(&class), info.name));
+            }
+        }
+
+        if encoded.code_off == 0 {
+            return None;
+        }
+        let cache_key = format!("lambda@{}", method_idx);
+        let mut body = {
+            let mut cache = self.inner_run_body_cache.borrow_mut();
+            if let Some(cached) = cache.get(&cache_key) {
+                cached.clone()
+            } else {
+                let code = self.dex.get_code_item(encoded.code_off).ok()?;
+                let b = self.decompile_method_body(&code, &encoded, None).ok()?;
+                cache.insert(cache_key, b.clone());
+                b
+            }
+        };
+        // Substitute capture params with outer register names.
+        for (i, cap) in captures.iter().enumerate() {
+            let from = format!("p{}", param_start + i);
+            // Also try type-based names after rename.
+            body = replace_ident_in_body(&body, &from, cap);
+            let t = info
+                .params
+                .get(param_start + i)
+                .map(|p| java::descriptor_to_java(p))
+                .unwrap_or_default();
+            let typed = type_infer::param_display_name(i, &t);
+            if typed != from {
+                body = replace_ident_in_body(&body, &typed, cap);
+            }
+        }
+        let lambda_types: Vec<String> = info
+            .params
+            .iter()
+            .skip(param_start + captures.len())
+            .map(|p| java::descriptor_to_java(p))
+            .collect();
+        let lambda_params: Vec<String> = lambda_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let pname = type_infer::param_display_name(i, t);
+                let short_t = shorten_java_names(t);
+                // Rewrite body pN → pname if needed.
+                let old = format!("p{}", param_start + captures.len() + i);
+                if old != pname {
+                    body = replace_ident_in_body(&body, &old, &pname);
+                }
+                if short_t == "int"
+                    || short_t == "long"
+                    || short_t == "boolean"
+                    || short_t == "double"
+                    || short_t == "float"
+                    || short_t == "byte"
+                    || short_t == "short"
+                    || short_t == "char"
+                    || short_t == "String"
+                    || short_t.contains('.')
+                {
+                    format!("{} {}", short_t, pname)
+                } else {
+                    pname
+                }
+            })
+            .collect();
+
+        let header = match lambda_params.len() {
+            0 => "()".to_string(),
+            1 => lambda_params[0].clone(),
+            _ => format!("({})", lambda_params.join(", ")),
+        };
+
+        if let Some(expr) = try_lambda_expression_body(&body) {
+            return Some(format!("/* {} */ {} -> {}", sam_name, header, expr));
+        }
+
+        let mut out = format!("/* {} */ {} -> {{\n", sam_name, header);
+        for line in body.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            out.push_str("    ");
+            out.push_str(line.trim_start());
+            out.push('\n');
+        }
+        out.push('}');
+        Some(out)
     }
 
     /// Find the first EncodedMethod in the DEX for the given class and method name.
     pub fn find_method(&self, class_name: &str, method_name: &str) -> Option<EncodedMethod> {
-        let _ = self.ensure_class_def_index();
-        let class_def = self.class_def_index.borrow().as_ref()?.get(class_name)?.clone();
-        let class_data_opt = self.dex.get_class_data(&class_def).ok()?;
+        let (slot, class_def) = self.find_class_def_slot(class_name)?;
+        let dex = self.dex_at(slot);
+        let class_data_opt = dex.get_class_data(&class_def).ok()?;
         let class_data = class_data_opt.as_ref()?;
         for encoded in class_data.direct_methods.iter().chain(class_data.virtual_methods.iter()) {
-            let info = self.dex.get_method_info(encoded.method_idx).ok()?;
+            let info = dex.get_method_info(encoded.method_idx).ok()?;
             if info.name == method_name {
                 return Some(encoded.clone());
             }
@@ -515,11 +1403,13 @@ impl<'a> Decompiler<'a> {
         let rw_map = build_instruction_rw_map(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
         let api_return_sources = build_api_return_sources(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
         let invoke_method_map = build_invoke_method_map(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
+        let insn_at = build_insn_labels(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
         Ok(ValueFlowAnalysisOwned {
             cfg,
             rw_map,
             api_return_sources,
             invoke_method_map,
+            insn_at,
         })
     }
 
@@ -588,6 +1478,17 @@ impl<'a> Decompiler<'a> {
             return Ok("        // (no instructions)\n".to_string());
         }
 
+        if self.mode == DecompilationMode::Fallback {
+            return self.decompile_method_body_linear(
+                &instructions,
+                code.insns_off,
+                encoded,
+                code,
+                insns_bytes,
+                class_name,
+            );
+        }
+
         let condition_for = |ins: &Instruction| {
             let ops = ins.operands();
             let resolved = self.resolve_operands(ops);
@@ -595,10 +1496,38 @@ impl<'a> Decompiler<'a> {
         };
         let mut cfg = MethodCfg::build(&instructions, insns_bytes, base_offset, &condition_for);
         Self::fold_constants_into_conditions(&mut cfg, &instructions);
+        self.prepare_method_reg_types(
+            &instructions,
+            code.insns_off,
+            encoded,
+            code,
+            insns_bytes,
+            class_name,
+        );
         self.rename_condition_registers(&mut cfg, &instructions, encoded, code);
         if cfg.block_count() == 0 {
-            return self.decompile_method_body_linear(&instructions, code.insns_off, encoded, code, insns_bytes, class_name);
+            return self.decompile_method_body_linear(
+                &instructions,
+                code.insns_off,
+                encoded,
+                code,
+                insns_bytes,
+                class_name,
+            );
         }
+
+        if self.mode == DecompilationMode::Simple {
+            return self.decompile_method_body_simple(
+                &cfg,
+                &instructions,
+                code,
+                encoded,
+                class_name,
+            );
+        }
+
+        // Method-level φ analysis for shared naming across branches (restructure path).
+        self.refresh_phi_regs(&cfg, &instructions, code, encoded);
 
         let global_used_regs = self.method_used_regs(&cfg, &instructions, code.insns_off, insns_bytes);
         let is_constructor = self
@@ -608,124 +1537,16 @@ impl<'a> Decompiler<'a> {
             .unwrap_or(false);
 
         let mut out = if code.tries_size > 0 {
-            let data = self.dex.data.as_ref();
-            let pairs = try_handler_pairs(data, encoded.code_off, code);
-            let mut try_catch_out = String::new();
-            if let Some(ref pairs) = pairs {
-                if let Some((try_item, handler)) = pairs.first() {
-                    let (try_start_byte, try_end_byte, handler_ranges) =
-                        try_and_handler_byte_ranges(try_item, handler, code.insns_size);
-                    let code_end_byte = (code.insns_size as u32) * 2;
-
-                    let blocks_overlapping = |lo: u32, hi: u32| -> HashSet<BlockId> {
-                        cfg.blocks.iter().enumerate()
-                            .filter(|(_, b)| {
-                                let be = if b.end_offset == u32::MAX { code_end_byte } else { b.end_offset };
-                                b.start_offset < hi && be > lo
-                            })
-                            .map(|(i, _)| i)
-                            .collect()
-                    };
-
-                    let try_blocks = blocks_overlapping(try_start_byte, try_end_byte);
-                    let try_entry_block = cfg.block_id_at_offset(try_start_byte)
-                        .filter(|bid| try_blocks.contains(bid));
-
-                    if let Some(try_entry) = try_entry_block {
-                        let mut full = String::new();
-                        let mut declared = HashSet::new();
-
-                        if try_start_byte > 0 {
-                            self.emit_block_instructions(
-                                &cfg, &instructions, code.insns_off, cfg.entry,
-                                None, None, encoded, code, &mut full, 2,
-                                &mut declared, Some(&global_used_regs), false,
-                                Some((0, try_start_byte)),
-                            )?;
-                        }
-
-                        let mut try_body = String::new();
-                        if let Some(try_region) = build_regions_filtered(&cfg, try_entry, &try_blocks) {
-                            self.emit_region(
-                                &try_region, &cfg, &instructions, code.insns_off,
-                                encoded, code, &mut try_body, 2,
-                                None, None, &mut declared, Some(&global_used_regs),
-                                Some((try_start_byte, try_end_byte)),
-                            )?;
-                        }
-                        if !try_body.is_empty() {
-                            writeln!(full, "        try {{").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                            full.push_str(&try_body);
-                            if !try_body.ends_with('\n') {
-                                full.push('\n');
-                            }
-                            for (type_idx, start_byte, end_byte) in handler_ranges.iter() {
-                                let type_name = self
-                                    .dex
-                                    .get_type(*type_idx)
-                                    .map_err(|e| DexDecompilerError::Parse(e.to_string()))
-                                    .map(|d| shorten_java_names(&java::descriptor_to_java(&d)))?;
-                                let handler_blocks = blocks_overlapping(*start_byte, *end_byte);
-                                if let Some(handler_entry) = cfg.block_id_at_offset(*start_byte) {
-                                    if handler_blocks.contains(&handler_entry) {
-                                        let mut handler_body = String::new();
-                                        if let Some(handler_region) =
-                                            build_regions_filtered(&cfg, handler_entry, &handler_blocks)
-                                        {
-                                            self.emit_region(
-                                                &handler_region, &cfg, &instructions, code.insns_off,
-                                                encoded, code, &mut handler_body, 2,
-                                                None, None, &mut declared, Some(&global_used_regs),
-                                                Some((*start_byte, *end_byte)),
-                                            )?;
-                                        }
-                                        writeln!(full, "        }} catch ({} e) {{", type_name)
-                                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                                        full.push_str(&handler_body);
-                                        if !handler_body.ends_with('\n') {
-                                            full.push('\n');
-                                        }
-                                        writeln!(full, "        }}")
-                                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                                    }
-                                }
-                            }
-                            if let Some(addr) = handler.catch_all_addr {
-                                let ca_start = addr * 2;
-                                let handler_blocks = blocks_overlapping(ca_start, code_end_byte);
-                                if let Some(handler_entry) = cfg.block_id_at_offset(ca_start) {
-                                    if handler_blocks.contains(&handler_entry) {
-                                        let mut handler_body = String::new();
-                                        if let Some(handler_region) =
-                                            build_regions_filtered(&cfg, handler_entry, &handler_blocks)
-                                        {
-                                            self.emit_region(
-                                                &handler_region, &cfg, &instructions, code.insns_off,
-                                                encoded, code, &mut handler_body, 2,
-                                                None, None, &mut declared, Some(&global_used_regs),
-                                                Some((ca_start, code_end_byte)),
-                                            )?;
-                                        }
-                                        writeln!(full, "        }} catch (Throwable e) {{")
-                                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                                        full.push_str(&handler_body);
-                                        if !handler_body.ends_with('\n') {
-                                            full.push('\n');
-                                        }
-                                        writeln!(full, "        }}")
-                                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                                    }
-                                }
-                            }
-                            try_catch_out = full;
-                        }
-                    }
-                }
-            }
-            if try_catch_out.is_empty() {
-                None
-            } else {
-                Some(try_catch_out)
+            match self.emit_all_try_catch(
+                &cfg,
+                &instructions,
+                code,
+                encoded,
+                &global_used_regs,
+                class_name,
+            ) {
+                Ok(s) if !s.trim().is_empty() => Some(s),
+                _ => None,
             }
         } else {
             None
@@ -735,7 +1556,7 @@ impl<'a> Decompiler<'a> {
             let mut fallback = String::new();
             let mut declared = HashSet::new();
             if let Some(root) = build_regions(&cfg, cfg.entry) {
-                self.emit_region(&root, &cfg, &instructions, code.insns_off, encoded, code, &mut fallback, 2, None, None, &mut declared, Some(&global_used_regs), None)?;
+                self.emit_region(&root, &cfg, &instructions, code.insns_off, encoded, code, &mut fallback, 2, None, None, &mut declared, Some(&global_used_regs), None, class_name)?;
             }
             out = Some(fallback);
         }
@@ -743,21 +1564,45 @@ impl<'a> Decompiler<'a> {
         let mut out = out.unwrap_or_else(|| "        // (no instructions)\n".to_string());
         if !out.trim().is_empty() && out != "        // (no instructions)\n" {
             out = simplify::simplify_method_body(&out, is_constructor);
+            out = simplify::restore_string_switch(&out);
             if let Some(enclosing) = class_name {
-                out = self.inline_anonymous_threads(&out, enclosing)?;
+                out = self.inline_anonymous_classes(&out, enclosing)?;
             }
+            let reps = self.const_field_reps.borrow();
+            if !reps.is_empty() {
+                out = const_fields::apply_const_field_replacements(&out, &reps);
+            }
+            if !self.resource_reps.is_empty() {
+                out = resource_consts::apply_resource_replacements(&out, &self.resource_reps);
+            }
+            {
+                let acc = self.accessor_reps.borrow();
+                if !acc.is_empty() {
+                    out = accessors::apply_accessor_replacements(&out, &acc);
+                }
+            }
+            out = accessors::polish_field_accessor_calls(&out);
+            let method_name = self
+                .dex
+                .get_method_info(encoded.method_idx)
+                .map(|i| i.name.to_string())
+                .unwrap_or_default();
+            if method_name == "invokeSuspend" {
+                out = kotlin::restore_coroutine_invoke_suspend(&out);
+            }
+            out = kotlin::restore_kotlin_idioms(&out);
         }
         const CATCH_BLOCK_MARKER: &str = "} catch (";
-        if code.tries_size > 0 && !out.contains(CATCH_BLOCK_MARKER) {
+        const FINALLY_MARKER: &str = "} finally {";
+        if code.tries_size > 0 && !out.contains(CATCH_BLOCK_MARKER) && !out.contains(FINALLY_MARKER) {
             out = self.wrap_body_with_try_catch(&out, encoded.code_off, code)?;
         }
         out = simplify::simplify_synchronized_blocks(&out);
         Ok(out)
     }
 
-    /// Inline anonymous Thread: replace "X.<init>(args);" + "X.start();" with
-    /// "new Thread() { public void run() { <inner run body> } }.start();"
-    fn inline_anonymous_threads(&self, body: &str, enclosing_class: &str) -> Result<String> {
+    /// Inline anonymous inner classes (Thread, Runnable, and other `Outer$N` synthetics).
+    fn inline_anonymous_classes(&self, body: &str, enclosing_class: &str) -> Result<String> {
         let lines: Vec<&str> = body.lines().collect();
         let mut out = String::new();
         let mut i = 0;
@@ -784,13 +1629,28 @@ impl<'a> Decompiler<'a> {
                 }).unwrap_or("");
                 if !receiver.is_empty()
                     && receiver.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    && next_line == format!("{}.start();", receiver)
                 {
-                    if let Some((replacement, skip)) = self.build_anonymous_thread_inline(
-                        enclosing_class,
-                        &args,
-                        line,
-                    )? {
+                    // Thread: <init>; start();
+                    if next_line == format!("{}.start();", receiver) {
+                        if let Some((replacement, skip)) = self.build_anonymous_thread_inline(
+                            enclosing_class,
+                            &args,
+                            line,
+                        )? {
+                            out.push_str(&replacement);
+                            if !replacement.ends_with('\n') {
+                                out.push('\n');
+                            }
+                            i += skip;
+                            continue;
+                        }
+                    }
+                    // General SAM / anonymous: <init>; then any use — try Runnable-style inline.
+                    if let Some((replacement, skip)) =
+                        self.build_anonymous_sam_inline(enclosing_class, &args, line, receiver)?
+                    {
+                        // Only replace the <init> line; leave subsequent uses (they still
+                        // reference the receiver variable — best-effort readability).
                         out.push_str(&replacement);
                         if !replacement.ends_with('\n') {
                             out.push('\n');
@@ -800,6 +1660,7 @@ impl<'a> Decompiler<'a> {
                     }
                 }
             }
+            // invoke-custom / lambda stub already appears as comments from resolve_one.
             out.push_str(line);
             if i < lines.len().saturating_sub(1) {
                 out.push('\n');
@@ -807,6 +1668,191 @@ impl<'a> Decompiler<'a> {
             i += 1;
         }
         Ok(out)
+    }
+
+    /// Build `new SuperType() { public void sam() { ... } };` for non-Thread anonymous classes.
+    fn build_anonymous_sam_inline(
+        &self,
+        enclosing_class: &str,
+        args: &[String],
+        first_line: &str,
+        _receiver: &str,
+    ) -> Result<Option<(String, usize)>> {
+        self.ensure_inner_anon_index()?;
+        let index = self.inner_anon_index.borrow();
+        let Some(list) = index.as_ref().and_then(|m| m.get(enclosing_class)) else {
+            return Ok(None);
+        };
+        let Some((inner_class_name, _nparams, super_name)) =
+            list.iter().find(|(_, n, _)| *n == args.len())
+        else {
+            return Ok(None);
+        };
+        // Prefer known SAM method names.
+        const SAM_NAMES: &[&str] = &[
+            "run", "onClick", "accept", "apply", "test", "call", "compare", "onReceive",
+        ];
+        let mut sam_method = None;
+        for &name in SAM_NAMES {
+            if self.find_method(inner_class_name, name).is_some() {
+                sam_method = Some(name.to_string());
+                break;
+            }
+        }
+        if sam_method.is_none() {
+            // Fall back to the first non-init virtual/direct method with code.
+            if let Some((slot, class_def)) = self.find_class_def_slot(inner_class_name) {
+                let dex = self.dex_at(slot);
+                if let Ok(Some(cd)) = dex.get_class_data(&class_def) {
+                    for enc in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                        if enc.code_off == 0 {
+                            continue;
+                        }
+                        if let Ok(info) = dex.get_method_info(enc.method_idx) {
+                            if info.name != "<init>" && info.name != "<clinit>" {
+                                sam_method = Some(info.name.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let Some(sam_name) = sam_method else {
+            return Ok(None);
+        };
+        let Some(run_encoded) = self.find_method(inner_class_name, &sam_name) else {
+            return Ok(None);
+        };
+        if run_encoded.code_off == 0 {
+            return Ok(None);
+        }
+        let indent = first_line.len() - first_line.trim_start().len();
+        let indent_str: String = first_line.chars().take(indent).collect();
+        let mut body = {
+            let mut cache = self.inner_run_body_cache.borrow_mut();
+            let cache_key = format!("{inner_class_name}#{sam_name}");
+            if let Some(cached) = cache.get(&cache_key) {
+                cached.clone()
+            } else {
+                let code = self
+                    .dex
+                    .get_code_item(run_encoded.code_off)
+                    .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                let b = self.decompile_method_body(&code, &run_encoded, None)?;
+                cache.insert(cache_key, b.clone());
+                b
+            }
+        };
+        let val_replacements = self.inner_class_capture_map(inner_class_name, args)?;
+        for (field_name, arg) in &val_replacements {
+            body = replace_capture_in_body(&body, field_name, arg);
+        }
+        body = replace_capture_assignees_in_body(&body, &val_replacements);
+        let sam_info = self
+            .dex
+            .get_method_info(run_encoded.method_idx)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let ret = java::descriptor_to_java(&sam_info.return_type);
+        let ret_short = shorten_java_names(&ret);
+        let params: Vec<String> = sam_info
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let t = shorten_java_names(&java::descriptor_to_java(p));
+                let n = type_infer::param_display_name(i, &java::descriptor_to_java(p));
+                format!("{t} {n}")
+            })
+            .collect();
+        let param_list = params.join(", ");
+        let super_short = shorten_java_names(super_name);
+        let mut replacement = format!("{indent_str}new {}() {{\n", super_short);
+        replacement.push_str(&format!(
+            "{indent_str}    public {ret_short} {sam_name}({param_list}) {{\n"
+        ));
+        for line in body.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            replacement.push_str(&indent_str);
+            replacement.push_str("        ");
+            replacement.push_str(line.trim_start());
+            replacement.push('\n');
+        }
+        replacement.push_str(&format!("{indent_str}    }}\n"));
+        replacement.push_str(&format!("{indent_str}}};"));
+        Ok(Some((replacement, 1)))
+    }
+
+    fn ensure_inner_anon_index(&self) -> Result<()> {
+        if self.inner_anon_index.borrow().is_some() {
+            return Ok(());
+        }
+        let mut map: HashMap<String, Vec<(String, usize, String)>> = HashMap::new();
+        let mut ingest = |dex: &DexFile| -> Result<()> {
+            for class_def_result in dex.class_defs() {
+                let class_def =
+                    class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                let class_type = dex
+                    .get_type(class_def.class_idx)
+                    .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                let name = java::descriptor_to_java(&class_type);
+                let Some((enclosing, suffix)) = name.rsplit_once('$') else {
+                    continue;
+                };
+                if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                let super_name = if class_def.superclass_idx != NO_INDEX {
+                    let s = dex
+                        .get_type(class_def.superclass_idx)
+                        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                    java::descriptor_to_java(&s)
+                } else {
+                    "Object".into()
+                };
+                if super_name == "java.lang.Thread" || super_name == "Thread" {
+                    continue;
+                }
+                let class_data_opt = dex
+                    .get_class_data(&class_def)
+                    .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                let Some(ref class_data) = class_data_opt.as_ref() else {
+                    continue;
+                };
+                let mut ctor_params = 0usize;
+                for enc in &class_data.direct_methods {
+                    let info = dex
+                        .get_method_info(enc.method_idx)
+                        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                    if info.name == "<init>" {
+                        ctor_params = info.params.len();
+                        break;
+                    }
+                }
+                map.entry(enclosing.to_string()).or_default().push((
+                    name,
+                    ctor_params,
+                    super_name,
+                ));
+            }
+            Ok(())
+        };
+        ingest(self.dex)?;
+        for d in &self.extra_dexes {
+            ingest(d)?;
+        }
+        *self.inner_anon_index.borrow_mut() = Some(map);
+        Ok(())
+    }
+
+    /// Inline anonymous Thread: replace "X.<init>(args);" + "X.start();" with
+    /// "new Thread() { public void run() { <inner run body> } }.start();"
+    #[allow(dead_code)]
+    fn inline_anonymous_threads(&self, body: &str, enclosing_class: &str) -> Result<String> {
+        // Kept for compatibility; prefer [`inline_anonymous_classes`].
+        self.inline_anonymous_classes(body, enclosing_class)
     }
 
     /// Build replacement for anonymous Thread and number of lines to skip (2 or 3 if assignment line included).
@@ -890,31 +1936,312 @@ impl<'a> Decompiler<'a> {
         Ok(inner)
     }
 
-    /// Map val$* field names to outer arg names for inlining.
+    /// Map this$0 / val$* field names to outer arg names for inlining.
     fn inner_class_capture_map(&self, inner_class_name: &str, args: &[String]) -> Result<Vec<(String, String)>> {
-        let class_def = match self.find_class_def(inner_class_name) {
-            Some(cd) => cd,
-            None => return Ok(vec![]),
+        let Some((slot, class_def)) = self.find_class_def_slot(inner_class_name) else {
+            return Ok(vec![]);
         };
-        let class_data_opt = self.dex.get_class_data(&class_def).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let dex = self.dex_at(slot);
+        let class_data_opt = dex.get_class_data(&class_def).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
         let class_data = class_data_opt.as_ref();
         let Some(cd) = class_data else {
             return Ok(vec![]);
         };
-        let fields: Vec<String> = cd
+        let fields: Vec<(String, bool)> = cd
             .instance_fields
             .iter()
-            .filter_map(|f| self.dex.get_field_info(f.field_idx).ok())
-            .filter(|fi| fi.name.starts_with("val$"))
-            .map(|fi| fi.name.clone())
+            .filter_map(|f| dex.get_field_info(f.field_idx).ok())
+            .filter(|fi| fi.name == "this$0" || fi.name.starts_with("val$"))
+            .map(|fi| (fi.name.clone(), fi.name == "this$0"))
             .collect();
         let mut out = Vec::with_capacity(fields.len());
-        for (i, name) in fields.into_iter().enumerate() {
-            if let Some(arg) = args.get(i) {
+        let mut arg_i = 0usize;
+        for (name, is_outer) in fields {
+            let Some(arg) = args.get(arg_i) else {
+                break;
+            };
+            arg_i += 1;
+            if is_outer {
+                let replacement = if let Some((outer, _)) = inner_class_name.rsplit_once('$') {
+                    let short = shorten_java_names(outer);
+                    let simple = short.rsplit('.').next().unwrap_or(short.as_str());
+                    if arg == "this" || arg == simple {
+                        format!("{}.this", simple)
+                    } else {
+                        arg.clone()
+                    }
+                } else {
+                    arg.clone()
+                };
+                out.push((name, replacement));
+            } else {
                 out.push((name, arg.clone()));
             }
         }
         Ok(out)
+    }
+
+    /// Emit all try/catch/finally regions in a method (sorted by try start).
+    fn emit_all_try_catch(
+        &self,
+        cfg: &MethodCfg,
+        instructions: &[Instruction],
+        code: &CodeItem,
+        encoded: &EncodedMethod,
+        global_used_regs: &HashSet<u32>,
+        class_name: Option<&str>,
+    ) -> Result<String> {
+        let data = self.dex.data.as_ref();
+        let Some(mut pairs) = try_handler_pairs(data, encoded.code_off, code) else {
+            return Ok(String::new());
+        };
+        if pairs.is_empty() {
+            return Ok(String::new());
+        }
+        pairs.sort_by_key(|(t, _)| t.start_addr);
+        let code_end_byte = (code.insns_size as u32) * 2;
+
+        let blocks_overlapping = |lo: u32, hi: u32| -> HashSet<BlockId> {
+            cfg.blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| {
+                    let be = if b.end_offset == u32::MAX {
+                        code_end_byte
+                    } else {
+                        b.end_offset
+                    };
+                    b.start_offset < hi && be > lo
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+
+        let mut full = String::new();
+        let mut declared = HashSet::new();
+        let mut cursor: u32 = 0;
+
+        for (idx, (try_item, handler)) in pairs.iter().enumerate() {
+            let next_try_start = pairs
+                .get(idx + 1)
+                .map(|(t, _)| t.start_addr * 2);
+            let post_end = next_try_start.or(Some(code_end_byte));
+            let (try_start_byte, try_end_byte, handler_ranges) =
+                try_and_handler_byte_ranges_with_end(
+                    try_item,
+                    handler,
+                    code.insns_size,
+                    post_end,
+                );
+
+            // Code before this try (from cursor).
+            if try_start_byte > cursor {
+                if let Some(entry) = cfg.block_id_at_offset(cursor.max(0)) {
+                    let pre_blocks = blocks_overlapping(cursor, try_start_byte);
+                    if let Some(pre_region) = build_regions_filtered(cfg, entry, &pre_blocks) {
+                        self.emit_region(
+                            &pre_region,
+                            cfg,
+                            instructions,
+                            code.insns_off,
+                            encoded,
+                            code,
+                            &mut full,
+                            2,
+                            None,
+                            None,
+                            &mut declared,
+                            Some(global_used_regs),
+                            Some((cursor, try_start_byte)),
+                            class_name,
+                        )?;
+                    } else {
+                        self.emit_block_instructions(
+                            cfg,
+                            instructions,
+                            code.insns_off,
+                            entry,
+                            None,
+                            None,
+                            encoded,
+                            code,
+                            &mut full,
+                            2,
+                            &mut declared,
+                            Some(global_used_regs),
+                            false,
+                            Some((cursor, try_start_byte)),
+                            class_name,
+                        )?;
+                    }
+                }
+            }
+
+            let try_blocks = blocks_overlapping(try_start_byte, try_end_byte);
+            let Some(try_entry) = cfg
+                .block_id_at_offset(try_start_byte)
+                .filter(|bid| try_blocks.contains(bid))
+            else {
+                cursor = try_end_byte;
+                continue;
+            };
+
+            let mut try_body = String::new();
+            if let Some(try_region) = build_regions_filtered(cfg, try_entry, &try_blocks) {
+                self.emit_region(
+                    &try_region,
+                    cfg,
+                    instructions,
+                    code.insns_off,
+                    encoded,
+                    code,
+                    &mut try_body,
+                    2,
+                    None,
+                    None,
+                    &mut declared,
+                    Some(global_used_regs),
+                    Some((try_start_byte, try_end_byte)),
+                    class_name,
+                )?;
+            }
+            if try_body.is_empty() {
+                cursor = try_end_byte;
+                continue;
+            }
+
+            writeln!(full, "        try {{")
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            full.push_str(&try_body);
+            if !try_body.ends_with('\n') {
+                full.push('\n');
+            }
+
+            for (type_idx, start_byte, end_byte) in &handler_ranges {
+                let type_name = self
+                    .dex
+                    .get_type(*type_idx)
+                    .map_err(|e| DexDecompilerError::Parse(e.to_string()))
+                    .map(|d| shorten_java_names(&java::descriptor_to_java(&d)))?;
+                let handler_blocks = blocks_overlapping(*start_byte, *end_byte);
+                if let Some(handler_entry) = cfg.block_id_at_offset(*start_byte) {
+                    if handler_blocks.contains(&handler_entry) {
+                        let mut handler_body = String::new();
+                        if let Some(handler_region) =
+                            build_regions_filtered(cfg, handler_entry, &handler_blocks)
+                        {
+                            self.emit_region(
+                                &handler_region,
+                                cfg,
+                                instructions,
+                                code.insns_off,
+                                encoded,
+                                code,
+                                &mut handler_body,
+                                2,
+                                None,
+                                None,
+                                &mut declared,
+                                Some(global_used_regs),
+                                Some((*start_byte, *end_byte)),
+                                class_name,
+                            )?;
+                        }
+                        writeln!(full, "        }} catch ({} e) {{", type_name)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        full.push_str(&handler_body);
+                        if !handler_body.ends_with('\n') {
+                            full.push('\n');
+                        }
+                    }
+                }
+            }
+
+            if let Some((ca_start, ca_end)) =
+                catch_all_byte_range(handler, &handler_ranges, code.insns_size, post_end)
+            {
+                let handler_blocks = blocks_overlapping(ca_start, ca_end);
+                if let Some(handler_entry) = cfg.block_id_at_offset(ca_start) {
+                    if handler_blocks.contains(&handler_entry) {
+                        let mut handler_body = String::new();
+                        if let Some(handler_region) =
+                            build_regions_filtered(cfg, handler_entry, &handler_blocks)
+                        {
+                            self.emit_region(
+                                &handler_region,
+                                cfg,
+                                instructions,
+                                code.insns_off,
+                                encoded,
+                                code,
+                                &mut handler_body,
+                                2,
+                                None,
+                                None,
+                                &mut declared,
+                                Some(global_used_regs),
+                                Some((ca_start, ca_end)),
+                                class_name,
+                            )?;
+                        }
+                        let cleaned = strip_finally_exception_noise(&handler_body);
+                        let as_finally = !handler.handlers.is_empty()
+                            && (looks_like_finally(&cleaned) || cleaned.trim().is_empty());
+                        if as_finally {
+                            writeln!(full, "        }} finally {{")
+                                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        } else {
+                            writeln!(full, "        }} catch (Throwable e) {{")
+                                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        }
+                        full.push_str(&cleaned);
+                        if !cleaned.ends_with('\n') {
+                            full.push('\n');
+                        }
+                    }
+                }
+            }
+            writeln!(full, "        }}")
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+
+            // Advance cursor past try + all handlers.
+            let mut covered_end = try_end_byte;
+            for (_, _, e) in &handler_ranges {
+                covered_end = covered_end.max(*e);
+            }
+            if let Some((_, e)) =
+                catch_all_byte_range(handler, &handler_ranges, code.insns_size, post_end)
+            {
+                covered_end = covered_end.max(e);
+            }
+            cursor = covered_end;
+        }
+
+        // Trailing code after last try/handlers.
+        if cursor < code_end_byte {
+            if let Some(entry) = cfg.block_id_at_offset(cursor) {
+                let post_blocks = blocks_overlapping(cursor, code_end_byte);
+                if let Some(post_region) = build_regions_filtered(cfg, entry, &post_blocks) {
+                    self.emit_region(
+                        &post_region,
+                        cfg,
+                        instructions,
+                        code.insns_off,
+                        encoded,
+                        code,
+                        &mut full,
+                        2,
+                        None,
+                        None,
+                        &mut declared,
+                        Some(global_used_regs),
+                        Some((cursor, code_end_byte)),
+                        class_name,
+                    )?;
+                }
+            }
+        }
+        Ok(full)
     }
 
     /// Wrap method body in try { body } catch (Type e) { ... } when code has try items.
@@ -947,16 +2274,153 @@ impl<'a> Decompiler<'a> {
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             writeln!(out, "            // handler at code unit {}", type_addr.addr)
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-            writeln!(out, "        }}").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
+        let as_finally = !first_handler.handlers.is_empty() && first_handler.catch_all_addr.is_some();
         if let Some(addr) = first_handler.catch_all_addr {
-            writeln!(out, "        }} catch (Throwable e) {{")
-                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-            writeln!(out, "            // catch-all handler at code unit {}", addr)
-                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-            writeln!(out, "        }}").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            if as_finally {
+                writeln!(out, "        }} finally {{")
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(out, "            // finally (catch-all) at code unit {}", addr)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            } else {
+                writeln!(out, "        }} catch (Throwable e) {{")
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(out, "            // catch-all handler at code unit {}", addr)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            }
+        }
+        writeln!(out, "        }}").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        Ok(out)
+    }
+
+    /// Simple mode: emit CFG blocks in order with labels; uses full CFG SSA with φ-nodes.
+    fn decompile_method_body_simple(
+        &self,
+        cfg: &MethodCfg,
+        instructions: &[Instruction],
+        code: &CodeItem,
+        encoded: &EncodedMethod,
+        class_name: Option<&str>,
+    ) -> Result<String> {
+        let code_insns = code.insns_slice(&*self.dex.data);
+        let mut block_ir: HashMap<BlockId, Vec<IrStmt>> = HashMap::new();
+        for bid in 0..cfg.block_count() {
+            let seq = self.block_instruction_seq(cfg, instructions, bid, None, false, None);
+            let stmts = self.instructions_to_ir(&seq, code.insns_off, code_insns, Some(instructions))?;
+            let mut runner = PassRunner::new();
+            runner.add(InvokeChainPass);
+            runner.add(ConstructorMergePass);
+            runner.add(ExprSimplifyPass);
+            block_ir.insert(bid, runner.run(stmts));
+        }
+        construct_ssa(cfg, &mut block_ir);
+        let canonical = phi_canonical_map(&block_ir);
+        strip_phis(&mut block_ir);
+
+        let mut out = String::new();
+        let mut declared = HashSet::new();
+        let global_used_regs = self.method_used_regs(cfg, instructions, code.insns_off, code_insns);
+        for bid in 0..cfg.block_count() {
+            let block = &cfg.blocks[bid];
+            writeln!(
+                out,
+                "        // block_{} @ 0x{:x}",
+                bid, block.start_offset
+            )
+            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            let stmts = block_ir.remove(&bid).unwrap_or_default();
+            let stmts = run_dead_assign_with_used_regs(stmts, &global_used_regs);
+            let type_map = infer_types(self.dex, encoded, code, &stmts);
+            let registers_size = code.registers_size as u32;
+            let ins_size = code.ins_size as u32;
+            let is_static = (encoded.access_flags & 0x8) != 0;
+            let mut name_map =
+                build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
+            apply_canonical_names(&mut name_map, &canonical);
+            self.apply_debug_names_to_name_map(&mut name_map, &type_map, code, encoded);
+            self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
+            for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), &mut declared)
+            {
+                if !line.is_empty() {
+                    writeln!(out, "        {}", line)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                }
+            }
         }
         Ok(out)
+    }
+
+    /// Analyze the method CFG to find registers that need φ-nodes (for shared naming).
+    fn refresh_phi_regs(
+        &self,
+        cfg: &MethodCfg,
+        instructions: &[Instruction],
+        code: &CodeItem,
+        _encoded: &EncodedMethod,
+    ) {
+        let code_insns = code.insns_slice(&*self.dex.data);
+        let mut block_ir: HashMap<BlockId, Vec<IrStmt>> = HashMap::new();
+        for bid in 0..cfg.block_count() {
+            let seq = self.block_instruction_seq(cfg, instructions, bid, None, false, None);
+            let Ok(stmts) =
+                self.instructions_to_ir(&seq, code.insns_off, code_insns, Some(instructions))
+            else {
+                continue;
+            };
+            let mut runner = PassRunner::new();
+            runner.add(InvokeChainPass);
+            block_ir.insert(bid, runner.run(stmts));
+        }
+        construct_ssa(cfg, &mut block_ir);
+        *self.phi_regs.borrow_mut() = phi_registers(&block_ir);
+    }
+
+    /// Share one Java name across SSA versions of φ-web registers **only when types match**.
+    fn apply_phi_register_names(
+        &self,
+        name_map: &mut HashMap<VarId, String>,
+        type_map: &HashMap<VarId, String>,
+    ) {
+        let phi_regs = self.phi_regs.borrow();
+        if phi_regs.is_empty() {
+            return;
+        }
+        let vids: Vec<VarId> = name_map
+            .keys()
+            .copied()
+            .filter(|v| phi_regs.contains(&v.reg))
+            .collect();
+        for i in 0..vids.len() {
+            for j in (i + 1)..vids.len() {
+                let a = vids[i];
+                let b = vids[j];
+                if a.reg != b.reg {
+                    continue;
+                }
+                let ta = type_map.get(&a).map(|s| s.as_str());
+                let tb = type_map.get(&b).map(|s| s.as_str());
+                if !types_compatible_for_naming(ta, tb) {
+                    continue;
+                }
+                let na = name_map.get(&a).cloned().unwrap_or_default();
+                let nb = name_map.get(&b).cloned().unwrap_or_default();
+                let prefer = if na == "this" {
+                    na
+                } else if nb == "this" {
+                    nb
+                } else if is_synthetic_local_name(&na) {
+                    nb
+                } else {
+                    na
+                };
+                if let Some(n) = name_map.get_mut(&a) {
+                    *n = prefer.clone();
+                }
+                if let Some(n) = name_map.get_mut(&b) {
+                    *n = prefer;
+                }
+            }
+        }
     }
 
     /// Fallback: linear instruction list (no CFG structure).
@@ -976,7 +2440,9 @@ impl<'a> Decompiler<'a> {
         let registers_size = code.registers_size as u32;
         let ins_size = code.ins_size as u32;
         let is_static = (encoded.access_flags & 0x8) != 0;
-        let name_map = build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
+        let mut name_map = build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
+        self.apply_debug_names_to_name_map(&mut name_map, &type_map, code, encoded);
+        self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
         let mut declared = HashSet::new();
         for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), &mut declared) {
             if !line.is_empty() {
@@ -992,9 +2458,33 @@ impl<'a> Decompiler<'a> {
                 .map(|info| info.name == "<init>")
                 .unwrap_or(false);
             out = simplify::simplify_method_body(&out, is_constructor);
+            out = simplify::restore_string_switch(&out);
             if let Some(enclosing) = class_name {
-                out = self.inline_anonymous_threads(&out, enclosing)?;
+                out = self.inline_anonymous_classes(&out, enclosing)?;
             }
+            let reps = self.const_field_reps.borrow();
+            if !reps.is_empty() {
+                out = const_fields::apply_const_field_replacements(&out, &reps);
+            }
+            if !self.resource_reps.is_empty() {
+                out = resource_consts::apply_resource_replacements(&out, &self.resource_reps);
+            }
+            {
+                let acc = self.accessor_reps.borrow();
+                if !acc.is_empty() {
+                    out = accessors::apply_accessor_replacements(&out, &acc);
+                }
+            }
+            out = accessors::polish_field_accessor_calls(&out);
+            let method_name = self
+                .dex
+                .get_method_info(encoded.method_idx)
+                .map(|i| i.name.to_string())
+                .unwrap_or_default();
+            if method_name == "invokeSuspend" {
+                out = kotlin::restore_coroutine_invoke_suspend(&out);
+            }
+            out = kotlin::restore_kotlin_idioms(&out);
         }
         if code.tries_size > 0 {
             out = self.wrap_body_with_try_catch(&out, encoded.code_off, code)?;
@@ -1020,13 +2510,14 @@ impl<'a> Decompiler<'a> {
         declared: &mut HashSet<String>,
         global_used_regs: Option<&HashSet<u32>>,
         emit_range: Option<(u32, u32)>,
+        class_name: Option<&str>,
     ) -> Result<bool> {
-        let ind = "        ".repeat(indent);
+        let ind = "    ".repeat(indent);
         match region {
             Region::Block(block_id) => {
                 self.emit_block_instructions(
                     cfg, instructions, base_off, *block_id, skip_goto_to, break_target,
-                    encoded, code, out, indent, declared, global_used_regs, false, emit_range,
+                    encoded, code, out, indent, declared, global_used_regs, false, emit_range, class_name,
                 )
             }
             Region::Seq(children) => {
@@ -1039,7 +2530,7 @@ impl<'a> Decompiler<'a> {
                         let mut init_buf = String::new();
                         self.emit_block_instructions(
                             cfg, instructions, base_off, init_block, skip_goto_to, break_target,
-                            encoded, code, &mut init_buf, indent, declared, global_used_regs, false, emit_range,
+                            encoded, code, &mut init_buf, indent, declared, global_used_regs, false, emit_range, class_name,
                         )?;
                         let init_str = init_buf
                             .trim()
@@ -1052,7 +2543,7 @@ impl<'a> Decompiler<'a> {
                         let mut update_buf = String::new();
                         self.emit_block_instructions(
                             cfg, instructions, base_off, update_block, Some(header), break_target,
-                            encoded, code, &mut update_buf, indent, declared, global_used_regs, false, emit_range,
+                            encoded, code, &mut update_buf, indent, declared, global_used_regs, false, emit_range, class_name,
                         )?;
                         let update_str = update_buf
                             .trim()
@@ -1074,7 +2565,7 @@ impl<'a> Decompiler<'a> {
                             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                             let _ = self.emit_block_instructions(
                                 cfg, instructions, base_off, header, Some(header), None,
-                                encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range,
+                                encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range, class_name,
                             )?;
                             let _ = self.emit_region(
                                 &body_without_update,
@@ -1090,6 +2581,7 @@ impl<'a> Decompiler<'a> {
                                 declared,
                                 global_used_regs,
                                 emit_range,
+                                class_name,
                             )?;
                             writeln!(out, "{}}}", ind)
                                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
@@ -1108,6 +2600,7 @@ impl<'a> Decompiler<'a> {
                                     declared,
                                     global_used_regs,
                                     emit_range,
+                                    class_name,
                                 )?;
                             }
                             return Ok(false);
@@ -1125,13 +2618,13 @@ impl<'a> Decompiler<'a> {
                         if let Region::Block(block_id) = r {
                             self.emit_block_instructions(
                                 cfg, instructions, base_off, *block_id, skip_goto_to, break_target,
-                                encoded, code, out, indent, declared, global_used_regs, true, emit_range,
+                                encoded, code, out, indent, declared, global_used_regs, true, emit_range, class_name,
                             )?
                         } else {
-                            self.emit_region(r, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range)?
+                            self.emit_region(r, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?
                         }
                     } else {
-                        self.emit_region(r, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range)?
+                        self.emit_region(r, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?
                     };
                     if emitted_break {
                         return Ok(true);
@@ -1164,32 +2657,100 @@ impl<'a> Decompiler<'a> {
                 if then_empty_after && !else_empty_after {
                     let neg = negate_condition(&condition);
                     writeln!(out, "{}if ({}) {{", ind, shorten_java_names(&neg)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range)?;
+                    let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
+                    writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 } else {
                     writeln!(out, "{}if ({}) {{", ind, shorten_java_names(&condition)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range)?;
+                    let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
                     if !else_empty_after {
-                        writeln!(out, "{}}} else {{", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                        let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range)?;
+                        // Emit-time else-if: `} else { if (c)` → `} else if (c)`
+                        self.emit_else_chain(
+                            else_branch,
+                            cfg,
+                            instructions,
+                            base_off,
+                            encoded,
+                            code,
+                            out,
+                            indent,
+                            skip_goto_to,
+                            break_target,
+                            declared,
+                            global_used_regs,
+                            emit_range,
+                            class_name,
+                        )?;
+                    } else {
+                        writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     }
                 }
-                writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 Ok(false)
             }
             Region::Loop { header, body } => {
-                if let Some((condition, else_branch, then_branch)) = region::loop_body_break_pattern(body, *header) {
+                // Prefer do-while when body has work before a trailing exit-if.
+                if let Some((exit_cond, do_body, then_branch)) =
+                    region::loop_body_do_while_loose(body, *header)
+                        .or_else(|| loop_body_do_while_pattern(body, *header))
+                {
+                    let while_cond = negate_condition(exit_cond);
+                    writeln!(out, "{}do {{", ind)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    let _ = self.emit_region(
+                        &do_body,
+                        cfg,
+                        instructions,
+                        base_off,
+                        encoded,
+                        code,
+                        out,
+                        indent + 1,
+                        Some(*header),
+                        region::first_block(then_branch),
+                        declared,
+                        global_used_regs,
+                        emit_range,
+                        class_name,
+                    )?;
+                    writeln!(
+                        out,
+                        "{}}} while ({});",
+                        ind,
+                        shorten_java_names(&while_cond)
+                    )
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    if !region_is_empty_with_cfg(then_branch, cfg) {
+                        let _ = self.emit_region(
+                            then_branch,
+                            cfg,
+                            instructions,
+                            base_off,
+                            encoded,
+                            code,
+                            out,
+                            indent,
+                            skip_goto_to,
+                            break_target,
+                            declared,
+                            global_used_regs,
+                            emit_range,
+                            class_name,
+                        )?;
+                    }
+                } else if let Some((condition, else_branch, then_branch)) =
+                    region::loop_body_break_pattern(body, *header)
+                {
                     let exit_block = region::first_block(then_branch);
                     let while_cond = negate_condition(&condition);
                     writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&while_cond)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    let _ = self.emit_block_instructions(cfg, instructions, base_off, *header, Some(*header), None, encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range)?;
-                    let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), exit_block, declared, global_used_regs, emit_range)?;
+                    let _ = self.emit_block_instructions(cfg, instructions, base_off, *header, Some(*header), None, encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range, class_name)?;
+                    let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), exit_block, declared, global_used_regs, emit_range, class_name)?;
                     writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     if !region_is_empty_with_cfg(then_branch, cfg) {
-                        let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range)?;
+                        let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
                     }
                 } else {
                     writeln!(out, "{}while (true) {{", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    let _ = self.emit_region(body, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), None, declared, global_used_regs, emit_range)?;
+                    let _ = self.emit_region(body, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), None, declared, global_used_regs, emit_range, class_name)?;
                     writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 }
                 Ok(false)
@@ -1199,14 +2760,54 @@ impl<'a> Decompiler<'a> {
                 cases,
                 default,
             } => {
-                writeln!(out, "{}switch ({}) {{", ind, condition).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                // Switch exit ≈ default block when cases break to it; use as break target.
+                let switch_break = region::first_block(default);
+                writeln!(out, "{}switch ({}) {{", ind, condition)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 for (value, body) in cases {
-                    writeln!(out, "{}case {}:", ind, value).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    let _ = self.emit_region(body, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range)?;
+                    writeln!(out, "{}case {}:", ind, value)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    let emitted_break = self.emit_region(
+                        body,
+                        cfg,
+                        instructions,
+                        base_off,
+                        encoded,
+                        code,
+                        out,
+                        indent + 1,
+                        skip_goto_to,
+                        switch_break.or(break_target),
+                        declared,
+                        global_used_regs,
+                        emit_range,
+                        class_name,
+                    )?;
+                    if !emitted_break && !body_ends_with_exit(out) {
+                        writeln!(out, "{}    break;", ind)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    }
                 }
-                writeln!(out, "{}default:", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                let _ = self.emit_region(default, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range)?;
-                writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(out, "{}default:", ind)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                let _ = self.emit_region(
+                    default,
+                    cfg,
+                    instructions,
+                    base_off,
+                    encoded,
+                    code,
+                    out,
+                    indent + 1,
+                    skip_goto_to,
+                    break_target,
+                    declared,
+                    global_used_regs,
+                    emit_range,
+                    class_name,
+                )?;
+                writeln!(out, "{}}}", ind)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 Ok(false)
             }
         }
@@ -1236,10 +2837,88 @@ impl<'a> Decompiler<'a> {
         }
     }
 
-    /// Rename raw register references (vN) in condition strings using per-block SSA naming.
-    /// Uses the same IR pipeline as block emission to ensure condition names are consistent
-    /// with the surrounding code. Only renames registers defined in the block itself or
-    /// that are method parameters (always in scope).
+    /// Emit `} else if (…) { … }` chains when the else region is a single nested If;
+    /// otherwise emit a plain `} else { … }`. Always closes with `}` at `indent`.
+    fn emit_else_chain(
+        &self,
+        else_branch: &Region,
+        cfg: &MethodCfg,
+        instructions: &[Instruction],
+        base_off: usize,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+        out: &mut String,
+        indent: usize,
+        skip_goto_to: Option<BlockId>,
+        break_target: Option<BlockId>,
+        declared: &mut HashSet<String>,
+        global_used_regs: Option<&HashSet<u32>>,
+        emit_range: Option<(u32, u32)>,
+        class_name: Option<&str>,
+    ) -> Result<()> {
+        let ind = "    ".repeat(indent);
+        let mut current = else_branch;
+        loop {
+            if let Some((cond, then_b, else_b)) = as_single_if(current) {
+                writeln!(
+                    out,
+                    "{}}} else if ({}) {{",
+                    ind,
+                    shorten_java_names(cond)
+                )
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                let _ = self.emit_region(
+                    then_b,
+                    cfg,
+                    instructions,
+                    base_off,
+                    encoded,
+                    code,
+                    out,
+                    indent + 1,
+                    skip_goto_to,
+                    break_target,
+                    declared,
+                    global_used_regs,
+                    emit_range,
+                    class_name,
+                )?;
+                if region_is_empty_with_cfg(else_b, cfg) {
+                    writeln!(out, "{}}}", ind)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    return Ok(());
+                }
+                current = else_b;
+                continue;
+            }
+            writeln!(out, "{}}} else {{", ind)
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            let _ = self.emit_region(
+                current,
+                cfg,
+                instructions,
+                base_off,
+                encoded,
+                code,
+                out,
+                indent + 1,
+                skip_goto_to,
+                break_target,
+                declared,
+                global_used_regs,
+                emit_range,
+                class_name,
+            )?;
+            writeln!(out, "{}}}", ind)
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            return Ok(());
+        }
+    }
+
+    /// Rename raw register references (vN) in condition strings.
+    /// Prefer the name of the SSA value that reaches the branch in *this* block
+    /// (so a reused register does not pick up a later View name like `view0`
+    /// when the condition actually tests a boolean `z0`).
     fn rename_condition_registers(
         &self,
         cfg: &mut MethodCfg,
@@ -1247,68 +2926,199 @@ impl<'a> Decompiler<'a> {
         encoded: &EncodedMethod,
         code: &CodeItem,
     ) {
+        let method_names = self.method_reg_names.borrow().clone().unwrap_or_default();
         let code_insns = code.insns_slice(&*self.dex.data);
+        let base_off = code.insns_off;
+        let registers_size = code.registers_size as u32;
         let ins_size = code.ins_size as u32;
         let is_static = (encoded.access_flags & 0x8) != 0;
-        let registers_size = code.registers_size as u32;
-        let param_base = registers_size.saturating_sub(ins_size);
 
-        let mut block_maps: Vec<(usize, HashMap<u32, String>)> = Vec::new();
-
-        for (idx, block) in cfg.blocks.iter().enumerate() {
-            if !matches!(&block.end, BlockEnd::Conditional { .. }) { continue; }
-
-            let seq = self.block_instruction_seq(cfg, instructions, idx, None, true, None);
-            let stmts = match self.instructions_to_ir(&seq, code.insns_off as usize, code_insns, Some(instructions)) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let mut runner = PassRunner::new();
-            runner.add(InvokeChainPass);
-            runner.add(SsaRenamePass);
-            let stmts = runner.run(stmts);
-            let type_map = infer_types(self.dex, encoded, code, &stmts);
-            let name_map = build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
-
-            let mut reg_to_name: HashMap<u32, String> = HashMap::new();
-            for (var_id, name) in &name_map {
-                let cur = reg_to_name.get(&var_id.reg);
-                if cur.is_none() || var_id.ver > 0 {
-                    reg_to_name.insert(var_id.reg, name.clone());
-                }
+        for block_id in 0..cfg.blocks.len() {
+            let needs_rename = matches!(&cfg.blocks[block_id].end, BlockEnd::Conditional { .. });
+            if !needs_rename {
+                continue;
             }
 
-            for i in 0..ins_size {
-                let reg = param_base + i;
-                if !reg_to_name.contains_key(&reg) {
-                    if !is_static && i == 0 {
-                        reg_to_name.insert(reg, "this".into());
-                    } else {
-                        let pidx = if is_static { i } else { i - 1 };
-                        reg_to_name.insert(reg, format!("p{}", pidx));
+            // Instructions in this block excluding the terminating if-* (same as emit).
+            let seq = self.block_instruction_seq(cfg, instructions, block_id, None, true, None);
+            let mut local_names: HashMap<u32, String> = HashMap::new();
+            let mut local_types: HashMap<u32, String> = HashMap::new();
+            if !seq.is_empty() {
+                let stmts = self
+                    .instructions_to_ir(&seq, base_off, code_insns, Some(instructions))
+                    .unwrap_or_default();
+                let mut runner = PassRunner::new();
+                runner.add(InvokeChainPass);
+                runner.add(SsaRenamePass);
+                runner.add(ConstructorMergePass);
+                runner.add(ExprSimplifyPass);
+                let stmts = runner.run(stmts);
+                let types = infer_types(self.dex, encoded, code, &stmts);
+                let mut name_map =
+                    build_var_names_with_regs(&stmts, &types, registers_size, ins_size, is_static);
+                self.apply_debug_names_to_name_map(&mut name_map, &types, code, encoded);
+
+                // Highest SSA version per register in this block = value reaching the condition.
+                let mut best_ver: HashMap<u32, u32> = HashMap::new();
+                for (vid, name) in &name_map {
+                    let prev = best_ver.get(&vid.reg).copied().unwrap_or(0);
+                    if !local_names.contains_key(&vid.reg) || vid.ver >= prev {
+                        local_names.insert(vid.reg, name.clone());
+                        best_ver.insert(vid.reg, vid.ver);
+                        if let Some(ty) = types.get(vid) {
+                            local_types.insert(vid.reg, ty.clone());
+                        }
                     }
                 }
             }
 
-            block_maps.push((idx, reg_to_name));
-        }
+            // Prefer block-local names; fall back to method-wide only when types agree.
+            let mut merged = method_names.clone();
+            for (reg, name) in &local_names {
+                merged.insert(*reg, name.clone());
+            }
+            // Drop method-wide names that conflict with the local type at the branch
+            // (e.g. method-wide `view0` for a boolean condition).
+            if let Some(reg_types) = self.method_reg_types.borrow().as_ref() {
+                for (reg, local_ty) in &local_types {
+                    let method_ty = reg_types.get(reg).map(|s| s.as_str());
+                    if !types_compatible_for_naming(Some(local_ty.as_str()), method_ty)
+                        && method_ty.is_some()
+                    {
+                        if let Some(local_name) = local_names.get(reg) {
+                            merged.insert(*reg, local_name.clone());
+                        } else {
+                            merged.remove(reg);
+                        }
+                    }
+                }
+            }
 
-        for (idx, reg_to_name) in block_maps {
-            if let BlockEnd::Conditional { ref mut condition, .. } = cfg.blocks[idx].end {
-                *condition = replace_register_names(condition, &reg_to_name);
+            if let BlockEnd::Conditional { ref mut condition, .. } = cfg.blocks[block_id].end {
+                *condition = replace_register_names(condition, &merged);
+                *condition = polish_boolean_condition(condition, &local_names, &local_types);
             }
         }
     }
 
     /// Collect register numbers that are read (used) in any block, so dead-assign doesn't remove assigns used in other blocks.
     /// Runs the pipeline once over the full method instead of per-block for speed.
+    /// Also includes registers only referenced by branch/switch conditions (not present in IR stmts).
     fn method_used_regs(&self, _cfg: &MethodCfg, instructions: &[Instruction], base_off: usize, code_insns: &[u8]) -> HashSet<u32> {
         let mut runner = PassRunner::new();
         runner.add(InvokeChainPass);
         runner.add(SsaRenamePass);
         let stmts = self.instructions_to_ir(instructions, base_off, code_insns, None).unwrap_or_default();
         let stmts = runner.run(stmts);
-        used_regs(&stmts)
+        let mut regs = used_regs(&stmts);
+        for ins in instructions {
+            let m = ins.mnemonic();
+            if m.starts_with("if-") || m == "packed-switch" || m == "sparse-switch" {
+                for reg in regs_mentioned_in_operands(ins.operands()) {
+                    regs.insert(reg);
+                }
+            }
+        }
+        regs
+    }
+
+    /// Build whole-method register→type and register→name maps for cross-block consistency.
+    fn prepare_method_reg_types(
+        &self,
+        instructions: &[Instruction],
+        base_off: usize,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+        code_insns: &[u8],
+        class_name: Option<&str>,
+    ) {
+        let stmts = self
+            .instructions_to_ir(instructions, base_off, code_insns, None)
+            .unwrap_or_default();
+        // No DeadAssignPass: values only consumed by branch conditions would be dropped otherwise.
+        let mut runner = PassRunner::new();
+        runner.add(InvokeChainPass);
+        runner.add(SsaRenamePass);
+        runner.add(ConstructorMergePass);
+        runner.add(ExprSimplifyPass);
+        let stmts = runner.run(stmts);
+        let types = infer_types(self.dex, encoded, code, &stmts);
+        let mut by_reg: HashMap<u32, String> = HashMap::new();
+        let mut ver_seen: HashMap<u32, u32> = HashMap::new();
+        for (vid, ty) in &types {
+            let prev_ver = ver_seen.get(&vid.reg).copied().unwrap_or(0);
+            let replace = match by_reg.get(&vid.reg) {
+                None => true,
+                Some(existing) if !existing.ends_with("[]") && ty.ends_with("[]") => true,
+                Some(existing) if existing.ends_with("[]") && !ty.ends_with("[]") => false,
+                Some(_) if vid.ver >= prev_ver => true,
+                _ => false,
+            };
+            if replace {
+                by_reg.insert(vid.reg, ty.clone());
+                ver_seen.insert(vid.reg, vid.ver);
+            }
+        }
+        *self.method_reg_types.borrow_mut() = Some(by_reg.clone());
+
+        let registers_size = code.registers_size as u32;
+        let ins_size = code.ins_size as u32;
+        let is_static = (encoded.access_flags & 0x8) != 0;
+        let mut name_map =
+            build_var_names_with_regs(&stmts, &types, registers_size, ins_size, is_static);
+        self.apply_debug_names_to_name_map(&mut name_map, &types, code, encoded);
+        // Bake user variable renames into method-wide names (conditions / cross-block).
+        self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
+
+        // One stable display name per register, preferring names whose SSA type matches the
+        // method-level type (so `permissions` wins over a prior string temp on the same reg).
+        let mut names_by_reg: HashMap<u32, String> = HashMap::new();
+        let mut used_names: HashSet<String> = HashSet::new();
+        let mut regs: Vec<u32> = name_map.keys().map(|v| v.reg).collect();
+        regs.sort_unstable();
+        regs.dedup();
+        for reg in regs {
+            let method_ty = by_reg.get(&reg).map(|s| s.as_str());
+            let mut best: Option<(i32, String)> = None;
+            for (vid, name) in &name_map {
+                if vid.reg != reg {
+                    continue;
+                }
+                let ty = types.get(vid).map(|s| s.as_str());
+                if !types_compatible_for_naming(ty, method_ty) && method_ty.is_some() && ty.is_some()
+                {
+                    continue;
+                }
+                let score = if !is_synthetic_local_name(name) {
+                    100
+                } else {
+                    10
+                };
+                let score = score + vid.ver as i32;
+                match &best {
+                    None => best = Some((score, name.clone())),
+                    Some((s, _)) if score > *s => best = Some((score, name.clone())),
+                    _ => {}
+                }
+            }
+            if let Some((_, mut name)) = best {
+                if used_names.contains(&name) && name != "this" {
+                    let mut n = 0u32;
+                    let base = name.clone();
+                    loop {
+                        let candidate = format!("{}_{}", base, n);
+                        if !used_names.contains(&candidate) {
+                            name = candidate;
+                            break;
+                        }
+                        n += 1;
+                    }
+                }
+                used_names.insert(name.clone());
+                names_by_reg.insert(reg, name);
+            }
+        }
+        *self.method_reg_names.borrow_mut() = Some(names_by_reg);
     }
 
     /// Instruction list for a block (for method_used_regs or emit_block_instructions).
@@ -1406,6 +3216,105 @@ impl<'a> Decompiler<'a> {
         false
     }
 
+    /// Overlay DEX debug_info local/parameter names onto the variable name map.
+    /// Applies locals only to SSA versions whose type matches the last definition's type,
+    /// so `email` does not overwrite the Activity/`this` receiver used by `findViewById`.
+    fn apply_debug_names_to_name_map(
+        &self,
+        name_map: &mut HashMap<VarId, String>,
+        type_map: &HashMap<VarId, String>,
+        code: &CodeItem,
+        encoded: &EncodedMethod,
+    ) {
+        if !self.use_debug_names || code.debug_info_off == 0 {
+            return;
+        }
+        let Ok(dbg) = self.dex.debug_info_for_code(code) else {
+            return;
+        };
+        let registers_size = code.registers_size as u32;
+        let ins_size = code.ins_size as u32;
+        let is_static = (encoded.access_flags & 0x8) != 0;
+        let param_base = registers_size.saturating_sub(ins_size);
+        // Parameter names: skip `this` for instance methods.
+        let param_name_offset = if is_static { 0usize } else { 1usize };
+        for (i, pname) in dbg.parameter_names.iter().enumerate() {
+            let Some(name) = pname.as_ref() else { continue };
+            if !is_java_ident(name) {
+                continue;
+            }
+            let reg = param_base + param_name_offset as u32 + i as u32;
+            for (var, display) in name_map.iter_mut() {
+                if var.reg == reg && display.as_str() != "this" {
+                    *display = name.clone();
+                }
+            }
+        }
+
+        // Highest SSA version per register (latest definition).
+        let mut max_ver: HashMap<u32, u32> = HashMap::new();
+        for var in name_map.keys() {
+            let e = max_ver.entry(var.reg).or_insert(0);
+            if var.ver > *e {
+                *e = var.ver;
+            }
+        }
+
+        for (var, display) in name_map.iter_mut() {
+            if display.as_str() == "this" {
+                continue;
+            }
+            let Some(n) = dbg.name_for_reg(var.reg) else { continue };
+            if !is_java_ident(n) {
+                continue;
+            }
+            let Some(&max_v) = max_ver.get(&var.reg) else { continue };
+            // Type of the latest version is the debug local's intended type (e.g. String email).
+            let latest = VarId::new(var.reg, max_v);
+            let target_ty = type_map.get(&latest).map(|s| s.as_str());
+            let this_ty = type_map.get(var).map(|s| s.as_str());
+            // Only paint versions compatible with the final local type.
+            if types_compatible_for_naming(this_ty, target_ty) {
+                *display = n.to_string();
+            }
+        }
+    }
+
+  /// Apply user-defined variable renames to the name_map (key: ClassName#methodName).
+  /// For constructors, also accepts UI keys that use the simple class name instead of `<init>`.
+  fn apply_variable_renames_to_name_map(
+        &self,
+        name_map: &mut HashMap<VarId, String>,
+        class_name: Option<&str>,
+        encoded: &EncodedMethod,
+    ) {
+        let (Some(class_name), Some(ref rename_map)) = (class_name, self.rename_map.as_ref()) else {
+            return;
+        };
+        let Ok(info) = self.dex.get_method_info(encoded.method_idx) else {
+            return;
+        };
+        let method_key = format!("{}#{}", class_name, info.name);
+        let var_renames = rename_map.variable.get(&method_key).or_else(|| {
+            if info.name == "<init>" {
+                let simple = class_name.rsplit('.').next().unwrap_or(class_name);
+                rename_map
+                    .variable
+                    .get(&format!("{}#{}", class_name, simple))
+            } else {
+                None
+            }
+        });
+        let Some(var_renames) = var_renames else {
+            return;
+        };
+        for (_, name) in name_map.iter_mut() {
+            if let Some(new_name) = var_renames.get(name.as_str()) {
+                *name = new_name.clone();
+            }
+        }
+    }
+
     fn emit_block_instructions(
         &self,
         cfg: &MethodCfg,
@@ -1422,8 +3331,9 @@ impl<'a> Decompiler<'a> {
         global_used_regs: Option<&HashSet<u32>>,
         skip_last_instruction: bool,
         emit_range: Option<(u32, u32)>,
+        class_name: Option<&str>,
     ) -> Result<bool> {
-        let ind = "        ".repeat(indent);
+        let ind = "    ".repeat(indent);
         let block = &cfg.blocks[block_id];
         let seq = self.block_instruction_seq(
             cfg,
@@ -1445,11 +3355,41 @@ impl<'a> Decompiler<'a> {
         } else {
             self.default_pass_runner().run(stmts)
         };
-        let type_map = infer_types(self.dex, encoded, code, &stmts);
+        let mut type_map = infer_types(self.dex, encoded, code, &stmts);
+        if let Some(reg_types) = self.method_reg_types.borrow().as_ref() {
+            enrich_types_with_register_map(&mut type_map, reg_types, &stmts);
+        }
         let registers_size = code.registers_size as u32;
         let ins_size = code.ins_size as u32;
         let is_static = (encoded.access_flags & 0x8) != 0;
-        let name_map = build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
+        let mut name_map = build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
+        self.apply_phi_register_names(&mut name_map, &type_map);
+        self.apply_debug_names_to_name_map(&mut name_map, &type_map, code, encoded);
+        // Prefer method-wide names so loop index / length / temps stay consistent across blocks.
+        if let Some(reg_names) = self.method_reg_names.borrow().as_ref() {
+            let reg_types = self.method_reg_types.borrow();
+            for (vid, name) in name_map.iter_mut() {
+                let Some(method_name) = reg_names.get(&vid.reg) else {
+                    continue;
+                };
+                let ty = type_map.get(vid).map(|s| s.as_str());
+                let method_ty = reg_types
+                    .as_ref()
+                    .and_then(|t| t.get(&vid.reg))
+                    .map(|s| s.as_str());
+                // Only share method-wide names when types agree. Do not apply a
+                // method-wide String name onto a boolean SSA version (or vice versa).
+                if ty.is_some() && method_ty.is_some() {
+                    if types_compatible_for_naming(ty, method_ty) {
+                        *name = method_name.clone();
+                    }
+                } else if ty.is_none() && method_ty.is_none() {
+                    *name = method_name.clone();
+                }
+            }
+        }
+        // User renames must win over method-wide / debug names.
+        self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
         for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), declared) {
             if !line.is_empty() {
                 writeln!(out, "{}{}", ind, line).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
@@ -1561,20 +3501,47 @@ impl<'a> Decompiler<'a> {
             }
 
             if m.starts_with("invoke-") {
+                if m.starts_with("invoke-custom") {
+                    // Lambda / indy: prefer `(captures) -> { body }` when impl is available.
+                    let lambda_expr = self.format_lambda_expression(ops);
+                    pending_invoke = Some(PendingInvoke {
+                        call_expr: IrExpr::Raw(lambda_expr),
+                        comment,
+                    });
+                    continue;
+                }
+                let is_super = m.starts_with("invoke-super");
                 let is_instance = m.starts_with("invoke-virtual") || m.starts_with("invoke-interface")
-                    || m.starts_with("invoke-direct") || m.starts_with("invoke-super");
-                if let Some((target, args)) = parse_invoke_call_parts(&ops_resolved) {
-                    let (target, args) = if is_instance {
+                    || m.starts_with("invoke-direct") || is_super;
+                if let Some((target, args, param_types)) = parse_invoke_call_parts(&ops_resolved) {
+                    let (target, args) = if is_super {
+                        to_super_style(&target, &args)
+                    } else if is_instance {
                         to_receiver_style(&target, &args)
                     } else {
                         (target, args)
                     };
+                    // Dalvik passes long/double as two registers; only the low half is a Java arg.
+                    let args = drop_wide_high_half_args(&args, &param_types);
                     pending_invoke = Some(PendingInvoke {
                         call_expr: IrExpr::Call { target, args },
                         comment,
                     });
                 } else {
                     out.push(IrStmt::Raw(format!("{}({});", m, ops_resolved)));
+                }
+                continue;
+            }
+
+            // filled-new-array produces a result consumed by move-result-object (like invoke).
+            if m == "filled-new-array" || m == "filled-new-array/range" {
+                if let Some(expr) = format_filled_new_array_expr(&ops_resolved) {
+                    pending_invoke = Some(PendingInvoke {
+                        call_expr: IrExpr::Raw(expr),
+                        comment,
+                    });
+                } else {
+                    out.push(IrStmt::Raw(format!("{}; /* {} */", ops_resolved, m)));
                 }
                 continue;
             }
@@ -1611,6 +3578,29 @@ impl<'a> Decompiler<'a> {
                     });
                 } else {
                     let line = self.instruction_to_java(ins, base_off, code_insns, Some((idx, instructions, full_instructions)))?;
+                    out.push(IrStmt::Raw(line));
+                }
+                continue;
+            }
+
+            // fill-array-data: Assign so SSA / naming stay consistent with new-array
+            if m == "fill-array-data" {
+                flush_pending_invoke(&mut out, &mut pending_invoke);
+                if let Some((dst_reg, init)) =
+                    parse_fill_array_data_assign(ins, code_insns, &ops_resolved)
+                {
+                    out.push(IrStmt::Assign {
+                        dst: ir::VarId::new(dst_reg, 0),
+                        rhs: IrExpr::Raw(init),
+                        comment: Some(comment),
+                    });
+                } else {
+                    let line = self.instruction_to_java(
+                        ins,
+                        base_off,
+                        code_insns,
+                        Some((idx, instructions, full_instructions)),
+                    )?;
                     out.push(IrStmt::Raw(line));
                 }
                 continue;
@@ -1701,6 +3691,11 @@ impl<'a> Decompiler<'a> {
             "packed-switch" | "sparse-switch" => format_switch(ins, code_insns, &ops_resolved),
             "new-instance" => parse_new_instance(&ops_resolved).unwrap_or_default(),
             "new-array" => format_new_array(&ops_resolved).unwrap_or_default(),
+            "filled-new-array" | "filled-new-array/range" => {
+                format_filled_new_array_expr(&ops_resolved)
+                    .map(|e| format!("{};", e))
+                    .unwrap_or_else(|| format!("{}; /* {} */", ops_resolved, m))
+            }
             "iget" | "iget-wide" | "iget-object" | "iget-boolean" => format_iget(&ops_resolved),
             "iput" | "iput-wide" | "iput-object" | "iput-boolean" => format_iput(&ops_resolved),
             "sget" | "sget-wide" | "sget-object" => format_sget(&ops_resolved),
@@ -1802,7 +3797,7 @@ impl<'a> Decompiler<'a> {
             // monitor-enter/exit
             "monitor-enter" => parse_one_reg(&ops_resolved).map(|r| format!("/* monitor-enter(v{}) */", r)).unwrap_or_default(),
             "monitor-exit" => parse_one_reg(&ops_resolved).map(|r| format!("/* monitor-exit(v{}) */", r)).unwrap_or_default(),
-            // fill-array-data: parse payload and emit /* arr = { ... } */
+            // fill-array-data: parse payload and emit arr = new int[]{ ... };
             "fill-array-data" => format_fill_array_data(ins, code_insns, &ops_resolved),
             _ => format!("{}; /* {} */", ops_resolved, m),
         };
@@ -2046,6 +4041,22 @@ fn to_receiver_style(target: &str, args: &str) -> (String, String) {
     }
 }
 
+/// `invoke-super` → `super.method(args)` (drop the `this` receiver).
+fn to_super_style(target: &str, args: &str) -> (String, String) {
+    let method_name = target.rsplit('.').next().unwrap_or(target);
+    let args = args.trim();
+    if args.is_empty() {
+        return (format!("super.{}", method_name), String::new());
+    }
+    if let Some(comma_pos) = find_first_comma(args) {
+        let rest = args[comma_pos + 1..].trim();
+        (format!("super.{}", method_name), rest.to_string())
+    } else {
+        // Only the receiver — no remaining args
+        (format!("super.{}", method_name), String::new())
+    }
+}
+
 fn find_first_comma(s: &str) -> Option<usize> {
     let mut depth = 0u32;
     for (i, c) in s.chars().enumerate() {
@@ -2060,9 +4071,10 @@ fn find_first_comma(s: &str) -> Option<usize> {
 }
 
 /// Parse resolved invoke operands string into Java call parts.
-/// Input format: \"v0, v1, pkg.Clz.m(java.lang.String, int)\" (method ref last, may contain commas).
-/// Output: (\"pkg.Clz.m\", \"v0, v1\")
-fn parse_invoke_call_parts(ops_resolved: &str) -> Option<(String, String)> {
+/// Input format: \"v0, v1, pkg.Clz.m(java.lang.String, int)\" (method ref last, may contain commas),
+/// or just \"pkg.Clz.m()\" for static/direct calls with no register arguments.
+/// Output: (\"pkg.Clz.m\", \"v0, v1\", param_java_types) or (\"pkg.Clz.m\", \"\", []) for no-arg.
+fn parse_invoke_call_parts(ops_resolved: &str) -> Option<(String, String, Vec<String>)> {
     let inner = ops_resolved.trim();
     if inner.is_empty() {
         return None;
@@ -2078,11 +4090,111 @@ fn parse_invoke_call_parts(ops_resolved: &str) -> Option<(String, String)> {
             _ => {}
         }
     }
-    let split_at = last_comma_at?;
-    let args = inner[..split_at].trim();
-    let method_ref = inner[split_at + 1..].trim();
+    let (args, method_ref) = if let Some(split_at) = last_comma_at {
+        (inner[..split_at].trim(), inner[split_at + 1..].trim())
+    } else {
+        // No register args — entire operand is the method reference (e.g. Runtime.getRuntime()).
+        ("", inner)
+    };
+    if method_ref.is_empty() {
+        return None;
+    }
+    let param_types = parse_java_param_list(method_ref);
     let method_name = method_ref.split('(').next().unwrap_or(method_ref).trim();
-    Some((method_name.to_string(), args.to_string()))
+    if method_name.is_empty() {
+        return None;
+    }
+    Some((method_name.to_string(), args.to_string(), param_types))
+}
+
+/// Param types from a resolved method ref: `pkg.Clz.m(long, int)` → `["long", "int"]`.
+fn parse_java_param_list(method_ref: &str) -> Vec<String> {
+    let Some(start) = method_ref.find('(') else {
+        return Vec::new();
+    };
+    let Some(end) = method_ref.rfind(')') else {
+        return Vec::new();
+    };
+    if end <= start + 1 {
+        return Vec::new();
+    }
+    let inner = method_ref[start + 1..end].trim();
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    split_top_level_args(inner)
+}
+
+fn is_wide_java_param(ty: &str) -> bool {
+    matches!(ty.trim(), "long" | "double" | "J" | "D")
+}
+
+fn looks_like_dalvik_reg(s: &str) -> bool {
+    let s = s.trim();
+    let rest = if let Some(r) = s.strip_prefix('v') {
+        r
+    } else if let Some(r) = s.strip_prefix('p') {
+        r
+    } else {
+        return false;
+    };
+    // v0 / p1 / v3_0 (SSA)
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '_')
+}
+
+fn split_top_level_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0u32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '<' => depth = depth.saturating_add(1),
+            ')' | ']' | '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
+/// Drop the high half of long/double invoke args (Dalvik register pairs).
+/// `args` must already be Java-facing (receiver peeled for instance calls).
+fn drop_wide_high_half_args(args: &str, param_types: &[String]) -> String {
+    let args = args.trim();
+    if args.is_empty() || param_types.is_empty() {
+        return args.to_string();
+    }
+    let parts = split_top_level_args(args);
+    if parts.is_empty() {
+        return args.to_string();
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    for ty in param_types {
+        if i >= parts.len() {
+            break;
+        }
+        out.push(parts[i].clone());
+        i += 1;
+        if is_wide_java_param(ty) && i < parts.len() && looks_like_dalvik_reg(&parts[i]) {
+            i += 1;
+        }
+    }
+    while i < parts.len() {
+        out.push(parts[i].clone());
+        i += 1;
+    }
+    out.join(", ")
 }
 
 /// Format compound assign marker into proper Java (e.g. `i++` or `n0 += 3`).
@@ -2151,6 +4263,7 @@ fn split_package_and_class(fully_qualified: &str) -> (String, String) {
 }
 
 /// Annotation type to short name for @Override, @Nullable, etc. e.g. "android.annotation.Override" → "Override".
+#[allow(dead_code)]
 fn annotation_short_name(java_type: &str) -> &str {
     java_type.rsplit('.').next().unwrap_or(java_type)
 }
@@ -2287,20 +4400,109 @@ fn shorten_java_names(line: &str) -> String {
 }
 
 /// Negate a condition properly: `a != b` → `a == b`, `a >= 0` → `a < 0`, etc.
-/// Falls back to `!(cond)` for complex expressions.
+/// Also normalizes `!(a >= b)` → `a < b` (and similar).
 fn negate_condition(cond: &str) -> String {
+    normalize_condition(&raw_negate_condition(cond))
+}
+
+fn raw_negate_condition(cond: &str) -> String {
     let cond = cond.trim();
+    // !!x / !(!x) style: peel a single leading `!`
+    if let Some(rest) = strip_outer_not(cond) {
+        return rest.to_string();
+    }
     let ops: &[(&str, &str)] = &[
-        (" != ", " == "), (" == ", " != "),
-        (" >= ", " < "),  (" < ",  " >= "),
-        (" > ",  " <= "), (" <= ", " > "),
+        (" != ", " == "),
+        (" == ", " != "),
+        (" >= ", " < "),
+        (" < ", " >= "),
+        (" > ", " <= "),
+        (" <= ", " > "),
     ];
     for (op, neg) in ops {
         if let Some(pos) = cond.find(op) {
-            return format!("{}{}{}", &cond[..pos], neg, &cond[pos + op.len()..]);
+            // Only flip when this is a simple binary relational (no nested `&&` / `||`).
+            if !cond.contains("&&") && !cond.contains("||") {
+                return format!("{}{}{}", &cond[..pos], neg, &cond[pos + op.len()..]);
+            }
         }
     }
     format!("!({})", cond)
+}
+
+/// If `cond` is `!x` or `!(…)`, return the inner expression; otherwise None.
+fn strip_outer_not(cond: &str) -> Option<&str> {
+    let cond = cond.trim();
+    if let Some(rest) = cond.strip_prefix('!') {
+        let rest = rest.trim();
+        if let Some(inner) = rest.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+            return Some(inner.trim());
+        }
+        if is_java_ident(rest) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Normalize readable conditions: strip `!(a op b)` into the flipped relation,
+/// and collapse `!(!x)` / `!!x` into `x`.
+fn normalize_condition(cond: &str) -> String {
+    let mut cond = cond.trim().to_string();
+    // Collapse nested outer nots: !(!x) → x, !!!x → !x
+    for _ in 0..4 {
+        let next = if let Some(inner) = strip_outer_not(&cond) {
+            if let Some(inner2) = strip_outer_not(inner) {
+                inner2.to_string()
+            } else if let Some(inner) = cond.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
+                let inner = inner.trim();
+                if !inner.contains("&&") && !inner.contains("||") && !inner.contains('(') {
+                    raw_negate_condition(inner)
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        } else {
+            break;
+        };
+        if next == cond {
+            break;
+        }
+        cond = next;
+    }
+    let cond = cond.trim();
+    if let Some(inner) = cond.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
+        let inner = inner.trim();
+        if !inner.contains("&&") && !inner.contains("||") && !inner.contains('(') {
+            return raw_negate_condition(inner);
+        }
+    }
+    cond.to_string()
+}
+
+/// Remove move-exception / rethrow lines typical of DEX finally handlers.
+fn strip_finally_exception_noise(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Skip `Throwable e = …` / `throw e;` boilerplate often left in catch-all finally.
+        if t.starts_with("throw e") || t.contains("move-exception") {
+            continue;
+        }
+        if (t.starts_with("Throwable ") || t.starts_with("Exception "))
+            && (t.contains(" = e") || t.ends_with("= e;"))
+        {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// For 2-byte goto (format 10t), the offset is 8-bit signed in code units. The decoder often
@@ -2367,6 +4569,93 @@ fn replace_register_names(condition: &str, reg_to_name: &HashMap<u32, String>) -
         i += 1;
     }
     result
+}
+
+/// Turn `z0 == 0` / `z0 != 0` into `!z0` / `z0` when the operand is a boolean.
+/// Turn `obj == 0` / `obj != 0` into `obj == null` / `obj != null` for reference types.
+fn polish_boolean_condition(
+    condition: &str,
+    local_names: &HashMap<u32, String>,
+    local_types: &HashMap<u32, String>,
+) -> String {
+    let cond = condition.trim();
+    let (name, is_eq) = if let Some(n) = cond.strip_suffix(" == 0") {
+        (n.trim(), true)
+    } else if let Some(n) = cond.strip_suffix(" != 0") {
+        (n.trim(), false)
+    } else {
+        return condition.to_string();
+    };
+    if !is_java_ident(name) {
+        return condition.to_string();
+    }
+    let ty = local_names.iter().find_map(|(reg, n)| {
+        (n == name).then(|| local_types.get(reg).map(|t| t.as_str())).flatten()
+    });
+    let is_bool = ty == Some("boolean") || looks_like_boolean_temp(name);
+    if is_bool {
+        return if is_eq {
+            format!("!{}", name)
+        } else {
+            name.to_string()
+        };
+    }
+    let is_primitive_temp = looks_like_primitive_temp(name);
+    let is_ref = match ty {
+        Some(t) => is_reference_java_type(t),
+        None => !is_primitive_temp,
+    };
+    if is_ref {
+        return if is_eq {
+            format!("{} == null", name)
+        } else {
+            format!("{} != null", name)
+        };
+    }
+    condition.to_string()
+}
+
+fn looks_like_boolean_temp(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() >= 2 && b[0] == b'z' && b[1..].iter().all(|c| c.is_ascii_digit())
+}
+
+fn looks_like_primitive_temp(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() >= 2
+        && matches!(b[0], b'i' | b'j' | b'f' | b'd' | b'c' | b'b')
+        && b[1..].iter().all(|c| c.is_ascii_digit())
+}
+
+fn is_reference_java_type(ty: &str) -> bool {
+    !matches!(
+        ty.trim(),
+        "boolean" | "byte" | "short" | "int" | "long" | "float" | "double" | "char" | "void"
+    ) && !ty.trim().is_empty()
+}
+
+/// Register numbers mentioned as `vN` / `vN_k` in an operands string.
+fn regs_mentioned_in_operands(ops: &str) -> Vec<u32> {
+    let bytes = ops.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'v' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if before_ok {
+                i += 1;
+                let mut reg: u32 = 0;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    reg = reg * 10 + (bytes[i] - b'0') as u32;
+                    i += 1;
+                }
+                out.push(reg);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Format Dalvik conditional branch as a Java boolean expression for if/while.
@@ -2521,7 +4810,148 @@ fn resolve_one(dex: &DexFile, part: &str) -> String {
             }
         }
     }
+    if let Some(idx_str) = part.strip_prefix("callsite@") {
+        if let Ok(idx) = idx_str.parse::<u32>() {
+            if let Ok(info) = dex.get_call_site(idx) {
+                return format_call_site_java(dex, &info);
+            }
+        }
+        return format!("/* invoke-custom/lambda callsite@{} */", idx_str);
+    }
+    if let Some(idx_str) = part.strip_prefix("proto@") {
+        if let Ok(idx) = idx_str.parse::<u32>() {
+            if let Ok((ret, params)) =
+                dex.protos
+                    .get_proto(&*dex.data, &dex.types, &dex.strings, idx)
+            {
+                let params_j = params
+                    .iter()
+                    .map(|p| java::descriptor_to_java(p))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return format!(
+                    "/* proto {}({}) */",
+                    java::descriptor_to_java(&ret),
+                    params_j
+                );
+            }
+        }
+        return format!("/* proto@{} */", idx_str);
+    }
     part.to_string()
+}
+
+/// Readable stub for a resolved call site (prefer lambda → impl method).
+fn format_call_site_java(dex: &dex_parser::DexFile, info: &dex_parser::CallSiteInfo) -> String {
+    if let Some(mid) = dex_parser::DexCallSites::impl_method_id(info) {
+        if let Ok(mi) = dex.get_method_info(mid as u32) {
+            let class = java::descriptor_to_java(&mi.class);
+            return format!(
+                "/* lambda {} → {}.{} */",
+                info.method_name, class, mi.name
+            );
+        }
+    }
+    format!(
+        "/* invoke-custom {} (bootstrap mh@{}) */",
+        info.method_name, info.bootstrap_handle_idx
+    )
+}
+
+/// Emit a Java-ish statement for `invoke-custom` / lambdas (no body inline).
+fn format_invoke_custom_stmt(dex: &dex_parser::DexFile, raw_ops: &str) -> String {
+    let captures = extract_brace_regs(raw_ops);
+    let args = captures.join(", ");
+    if let Some(idx) = extract_callsite_idx(raw_ops) {
+        if let Ok(info) = dex.get_call_site(idx) {
+            if let Some(mid) = dex_parser::DexCallSites::impl_method_id(&info) {
+                if let Ok(mi) = dex.get_method_info(mid as u32) {
+                    let class = java::descriptor_to_java(&mi.class);
+                    return format!(
+                        "/* lambda {}.{} */ {}.{}({})",
+                        info.method_name,
+                        mi.name,
+                        class,
+                        mi.name,
+                        args
+                    );
+                }
+            }
+            return format!("/* invoke-custom {} */ ({})", info.method_name, args);
+        }
+    }
+    format!("/* invoke-custom */ {}", raw_ops)
+}
+
+fn extract_callsite_idx(ops: &str) -> Option<u32> {
+    let idx = ops.find("callsite@")?;
+    let rest = &ops[idx + "callsite@".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn extract_brace_regs(ops: &str) -> Vec<String> {
+    let start = match ops.find('{') {
+        Some(i) => i + 1,
+        None => return vec![],
+    };
+    let end = match ops[start..].find('}') {
+        Some(i) => start + i,
+        None => return vec![],
+    };
+    let inner = ops[start..end].trim();
+    if inner.is_empty() {
+        return vec![];
+    }
+    inner
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn try_lambda_expression_body(body: &str) -> Option<String> {
+    let lines: Vec<&str> = body
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .collect();
+    if lines.len() != 1 {
+        return None;
+    }
+    let l = lines[0];
+    if let Some(rest) = l.strip_prefix("return ") {
+        return Some(rest.trim_end_matches(';').trim().to_string());
+    }
+    None
+}
+
+fn replace_ident_in_body(body: &str, from: &str, to: &str) -> String {
+    if from == to || from.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if body[i..].starts_with(from) {
+            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            let after = i + from.len();
+            let after_ok = after >= bytes.len() || !is_ident_char(bytes[after]);
+            if before_ok && after_ok {
+                out.push_str(to);
+                i = after;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
 /// Escape string for use inside a Java string literal (for tests and reuse).
@@ -2809,6 +5239,80 @@ fn format_new_array(ops: &str) -> Option<String> {
     Some(format!("{} = new {}[{}];", dst, element_type, size))
 }
 
+/// filled-new-array vA, vB, …, type[] → `new ElementType[]{ vA, vB, … }` (no destination;
+/// result is taken by a following move-result-object).
+fn format_filled_new_array_expr(ops: &str) -> Option<String> {
+    let parts: Vec<&str> = ops.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let type_str = parts.last()?;
+    // Last operand is the array type (e.g. java.lang.String[] or [Ljava/lang/String; already resolved).
+    let element_type = type_str.strip_suffix("[]").unwrap_or(type_str);
+    if element_type.is_empty() || element_type.starts_with('v') || element_type.starts_with('p') {
+        return None;
+    }
+    let elems = &parts[..parts.len() - 1];
+    // `filled-new-array/range` arrives as `v0 ... v5` — expand to every register.
+    let expanded = expand_filled_array_elem_list(elems);
+    Some(format!("new {}[]{{ {} }}", element_type, expanded))
+}
+
+/// Expand Dalvik register-range tokens (`v0 ... v3`) into `v0, v1, v2, v3`.
+fn expand_filled_array_elem_list(elems: &[&str]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for e in elems {
+        if let Some(regs) = expand_reg_range_ellipsis(e) {
+            out.extend(regs);
+        } else {
+            out.push((*e).to_string());
+        }
+    }
+    out.join(", ")
+}
+
+/// Parse `v0 ... v5` / `v0 .. v5` / `p1...p4` into individual registers.
+fn expand_reg_range_ellipsis(s: &str) -> Option<Vec<String>> {
+    let s = s.trim();
+    let (left, right) = if let Some(i) = s.find(" ... ") {
+        (&s[..i], &s[i + 5..])
+    } else if let Some(i) = s.find(" .. ") {
+        (&s[..i], &s[i + 4..])
+    } else if let Some(i) = s.find("...") {
+        (&s[..i], &s[i + 3..])
+    } else if let Some(i) = s.find("..") {
+        (&s[..i], &s[i + 2..])
+    } else {
+        return None;
+    };
+    let left = left.trim();
+    let right = right.trim();
+    let (pref_l, n_l) = parse_vp_reg(left)?;
+    let (pref_r, n_r) = parse_vp_reg(right)?;
+    if pref_l != pref_r {
+        return None;
+    }
+    let (lo, hi) = if n_l <= n_r { (n_l, n_r) } else { (n_r, n_l) };
+    // Guard against absurd ranges from corrupt operands.
+    if hi - lo > 4096 {
+        return None;
+    }
+    Some((lo..=hi).map(|n| format!("{}{}", pref_l, n)).collect())
+}
+
+fn parse_vp_reg(s: &str) -> Option<(char, u32)> {
+    let s = s.trim();
+    let pref = s.chars().next()?;
+    if pref != 'v' && pref != 'p' {
+        return None;
+    }
+    let rest = &s[pref.len_utf8()..];
+    // Allow SSA `v0_1` → treat as base reg for range (unlikely in range form).
+    let num = rest.split('_').next()?;
+    let n: u32 = num.parse().ok()?;
+    Some((pref, n))
+}
+
 /// Format *-int/2addr or *-long/2addr: vA, vB → "vA = vA op vB;"
 fn format_binop_2addr(ops: &str, op: &str) -> String {
     parse_two_regs(ops)
@@ -3006,13 +5510,37 @@ fn format_switch(ins: &Instruction, code_insns: &[u8], ops_resolved: &str) -> St
     format!("switch ({}) {{ {} default: break; }}", var, case_str.join(" "))
 }
 
-/// Parse fill-array-data payload and return a comment like "/* arr = { 1, 2, 3 } */".
-/// Payload: ident 0x0300 (u16), element_width (u16), size (u32), then size*element_width bytes (LE).
+/// Parse fill-array-data payload and return an initializer like "arr = new int[]{ 1, 2, 3 };".
 fn format_fill_array_data(ins: &Instruction, code_insns: &[u8], ops_resolved: &str) -> String {
-    let arr_reg = ops_resolved.split(',').next().map(str::trim).unwrap_or("v0");
+    match parse_fill_array_data_assign(ins, code_insns, ops_resolved) {
+        Some((reg, init)) => format!("v{} = {};", reg, init),
+        None => format!("/* fill-array-data {} */", ops_resolved),
+    }
+}
+
+/// Element type name for fill-array-data based on payload element width.
+fn fill_array_elem_type(elem_width: u16) -> &'static str {
+    match elem_width {
+        1 => "byte",
+        2 => "short",
+        4 => "int",
+        8 => "long",
+        _ => "Object",
+    }
+}
+
+/// Parse fill-array-data into `(reg, "new int[]{ 1, 2, 3 }")` for IR Assign.
+/// Payload: ident 0x0300 (u16), element_width (u16), size (u32), then size*element_width bytes (LE).
+fn parse_fill_array_data_assign(
+    ins: &Instruction,
+    code_insns: &[u8],
+    ops_resolved: &str,
+) -> Option<(u32, String)> {
+    let arr_tok = ops_resolved.split(',').next().map(str::trim).unwrap_or("v0");
+    let reg: u32 = arr_tok.strip_prefix('v')?.parse().ok()?;
     let ins_off = ins.offset as usize;
     if ins_off + 6 > code_insns.len() {
-        return format!("/* fill-array-data {} */", ops_resolved);
+        return None;
     }
     let rel_units = i32::from_le_bytes(
         code_insns[ins_off + 2..ins_off + 6]
@@ -3036,18 +5564,14 @@ fn format_fill_array_data(ins: &Instruction, code_insns: &[u8], ops_resolved: &s
     };
     let cand_a = (ins_off as i32 + rel_units * 2) as usize;
     let cand_b = (ins_off as i32 + 2 + rel_units * 2) as usize;
-    let (payload_off, elem_width, size) = match [cand_a, cand_b]
+    let (payload_off, elem_width, size) = [cand_a, cand_b]
         .iter()
-        .find_map(|&off| try_payload(off).map(|(w, s)| (off, w, s)))
-    {
-        Some(t) => t,
-        None => return format!("/* fill-array-data {} */", ops_resolved),
-    };
+        .find_map(|&off| try_payload(off).map(|(w, s)| (off, w, s)))?;
 
     let data_start = payload_off + 8;
     let data_len = (size as usize).saturating_mul(elem_width as usize);
     if data_start + data_len > code_insns.len() {
-        return format!("/* fill-array-data {} */", ops_resolved);
+        return None;
     }
 
     let mut values: Vec<String> = Vec::new();
@@ -3069,22 +5593,31 @@ fn format_fill_array_data(ins: &Instruction, code_insns: &[u8], ops_resolved: &s
                 if el_off + 4 > code_insns.len() {
                     break;
                 }
-                let n = i32::from_le_bytes(code_insns[el_off..el_off + 4].try_into().unwrap_or([0, 0, 0, 0]));
+                let n = i32::from_le_bytes(
+                    code_insns[el_off..el_off + 4]
+                        .try_into()
+                        .unwrap_or([0, 0, 0, 0]),
+                );
                 n.to_string()
             }
             8 => {
                 if el_off + 8 > code_insns.len() {
                     break;
                 }
-                let n = i64::from_le_bytes(code_insns[el_off..el_off + 8].try_into().unwrap_or([0; 8]));
+                let n = i64::from_le_bytes(
+                    code_insns[el_off..el_off + 8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                );
                 n.to_string()
             }
             _ => break,
         };
         values.push(val);
     }
-    let init = values.join(", ");
-    format!("/* {} = {{ {} }} */", arr_reg, init)
+    let ty = fill_array_elem_type(elem_width);
+    let init = format!("new {}[]{{ {} }}", ty, values.join(", "));
+    Some((reg, init))
 }
 
 /// Format cmp (F23x): vA, vB, vC → vA = -1/0/1 comparison result.
@@ -3233,6 +5766,34 @@ mod tests {
     }
 
     #[test]
+    fn format_filled_new_array_expr_strings() {
+        assert_eq!(
+            super::format_filled_new_array_expr("v0, v1, java.lang.String[]"),
+            Some("new java.lang.String[]{ v0, v1 }".into())
+        );
+        assert_eq!(
+            super::format_filled_new_array_expr("\"a\", \"b\", String[]"),
+            Some("new String[]{ \"a\", \"b\" }".into())
+        );
+    }
+
+    #[test]
+    fn format_filled_new_array_expr_expands_range() {
+        assert_eq!(
+            super::format_filled_new_array_expr("v0 ... v3, java.lang.String[]"),
+            Some("new java.lang.String[]{ v0, v1, v2, v3 }".into())
+        );
+        assert_eq!(
+            super::format_filled_new_array_expr("v10 .. v12, int[]"),
+            Some("new int[]{ v10, v11, v12 }".into())
+        );
+        assert_eq!(
+            super::expand_reg_range_ellipsis("v2 ... v2"),
+            Some(vec!["v2".into()])
+        );
+    }
+
+    #[test]
     fn format_iget_iput_sget_sput() {
         assert_eq!(
             super::format_iget("v2, v5, android.support.v4.widget.SimpleCursorAdapter.mCursor"),
@@ -3344,6 +5905,53 @@ mod tests {
     }
 
     #[test]
+    fn to_super_style_drops_receiver() {
+        assert_eq!(
+            to_super_style("android.app.Activity.onCreate", "this, bundle"),
+            ("super.onCreate".into(), "bundle".into())
+        );
+        assert_eq!(
+            to_super_style("pkg.Clz.foo", "this"),
+            ("super.foo".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn polish_boolean_condition_z_temp() {
+        let names = HashMap::new();
+        let types = HashMap::new();
+        assert_eq!(
+            polish_boolean_condition("z0 == 0", &names, &types),
+            "!z0"
+        );
+        assert_eq!(
+            polish_boolean_condition("z0 != 0", &names, &types),
+            "z0"
+        );
+        // Non-boolean temps stay as comparisons
+        assert_eq!(
+            polish_boolean_condition("i0 == 0", &names, &types),
+            "i0 == 0"
+        );
+        assert_eq!(
+            polish_boolean_condition("view0 == 0", &names, &types),
+            "view0 == null"
+        );
+    }
+
+    #[test]
+    fn polish_boolean_condition_typed_local() {
+        let mut names = HashMap::new();
+        names.insert(0u32, "loggedIn".into());
+        let mut types = HashMap::new();
+        types.insert(0u32, "boolean".into());
+        assert_eq!(
+            polish_boolean_condition("loggedIn == 0", &names, &types),
+            "!loggedIn"
+        );
+    }
+
+    #[test]
     fn class_name_to_path_default_package() {
         let (dir, file) = super::class_name_to_path("Test");
         assert_eq!(dir, std::path::PathBuf::new());
@@ -3388,5 +5996,47 @@ mod tests {
         ];
         let r = super::enum_constants_from_static_fields("test.Color", "Enum", &static_fields);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn parse_invoke_keeps_param_types() {
+        let (target, args, params) = super::parse_invoke_call_parts(
+            "v1, v3, v4, java.lang.StringBuilder.append(long)",
+        )
+        .unwrap();
+        assert_eq!(target, "java.lang.StringBuilder.append");
+        assert_eq!(args, "v1, v3, v4");
+        assert_eq!(params, vec!["long"]);
+    }
+
+    #[test]
+    fn drop_wide_high_half_for_append_long() {
+        let (_, args, params) = super::parse_invoke_call_parts(
+            "v1, v3, v4, java.lang.StringBuilder.append(long)",
+        )
+        .unwrap();
+        let (target, args) = super::to_receiver_style("java.lang.StringBuilder.append", &args);
+        assert_eq!(target, "v1.append");
+        assert_eq!(super::drop_wide_high_half_args(&args, &params), "v3");
+    }
+
+    #[test]
+    fn drop_wide_high_half_mixed_params() {
+        let args = super::drop_wide_high_half_args(
+            "v0, v1, v2, v3",
+            &["int".into(), "long".into(), "java.lang.String".into()],
+        );
+        // v0=int, v1+v2=long (drop v2), v3=String
+        assert_eq!(args, "v0, v1, v3");
+    }
+
+    #[test]
+    fn drop_wide_leaves_non_reg_second_arg() {
+        // Don't drop a real expression that happens to follow a long-typed slot mismatch.
+        let args = super::drop_wide_high_half_args(
+            "System.currentTimeMillis(), \"x\"",
+            &["long".into()],
+        );
+        assert_eq!(args, "System.currentTimeMillis(), \"x\"");
     }
 }

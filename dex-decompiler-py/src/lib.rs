@@ -1,13 +1,67 @@
 //! Python bindings for dex-decompiler (DEX to Java decompiler).
 
 use ::dex_decompiler::{
-    parse_dex, Decompiler, DecompilerOptions, DexFile, EncodedMethod,
+    default_config, parse_dex, scan_dex_parallel, solve_dexes, Decompiler, DecompilerOptions,
+    DexFile, EncodedMethod, RenameMap, SolveOptions,
 };
 use ::dex_decompiler::java;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyModule;
+use pyo3::types::{PyDict, PyModule};
+use std::collections::HashMap;
 use std::path::Path;
+
+/// Build RenameMap from optional Python dicts. Keys/values must be str.
+fn renames_from_py(
+    py: Python<'_>,
+    package: Option<&Bound<'_, PyAny>>,
+    class: Option<&Bound<'_, PyAny>>,
+    method: Option<&Bound<'_, PyAny>>,
+    field: Option<&Bound<'_, PyAny>>,
+    variable: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<RenameMap>> {
+    fn str_map(d: &Bound<'_, PyAny>) -> PyResult<HashMap<String, String>> {
+        let dict = d.downcast::<PyDict>().map_err(|_| PyValueError::new_err("expected dict of str -> str"))?;
+        let mut out = HashMap::new();
+        for (k, v) in dict.iter() {
+            let k: String = k.extract()?;
+            let v: String = v.extract()?;
+            out.insert(k, v);
+        }
+        Ok(out)
+    }
+    fn var_map(d: &Bound<'_, PyAny>) -> PyResult<HashMap<String, HashMap<String, String>>> {
+        let dict = d.downcast::<PyDict>().map_err(|_| PyValueError::new_err("variable_renames: expected dict of str -> dict"))?;
+        let mut out = HashMap::new();
+        for (k, v) in dict.iter() {
+            let k: String = k.extract()?;
+            let inner = str_map(&v)?;
+            out.insert(k, inner);
+        }
+        Ok(out)
+    }
+    let has_any = package.is_some() || class.is_some() || method.is_some() || field.is_some() || variable.is_some();
+    if !has_any {
+        return Ok(None);
+    }
+    let mut r = RenameMap::default();
+    if let Some(d) = package {
+        r.package = str_map(d)?;
+    }
+    if let Some(d) = class {
+        r.class = str_map(d)?;
+    }
+    if let Some(d) = method {
+        r.method = str_map(d)?;
+    }
+    if let Some(d) = field {
+        r.field = str_map(d)?;
+    }
+    if let Some(d) = variable {
+        r.variable = var_map(d)?;
+    }
+    Ok(Some(r))
+}
 
 /// Find the first EncodedMethod in the DEX that belongs to the given class and method name.
 fn find_method(dex: &DexFile, class_name: &str, method_name: &str) -> Option<EncodedMethod> {
@@ -75,6 +129,42 @@ impl DexFileWrapper {
                 .collect(),
             ..Default::default()
         };
+        let decompiler = Decompiler::with_options(&dex, options);
+        decompiler.decompile().map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Decompile with optional filters and renames. Rename dicts map old name -> new name.
+    /// Method/field keys use "ClassName#memberName" (e.g. "com.example.Main#onCreate").
+    /// variable_renames: dict of "ClassName#methodName" -> dict of old_var_name -> new_var_name.
+    #[pyo3(signature = (only_package=None, exclude=None, package_renames=None, class_renames=None, method_renames=None, field_renames=None, variable_renames=None))]
+    fn decompile_with_renames(
+        &self,
+        only_package: Option<&str>,
+        exclude: Option<Vec<String>>,
+        package_renames: Option<&Bound<'_, PyAny>>,
+        class_renames: Option<&Bound<'_, PyAny>>,
+        method_renames: Option<&Bound<'_, PyAny>>,
+        field_renames: Option<&Bound<'_, PyAny>>,
+        variable_renames: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<String> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let rename_map = Python::with_gil(|py| {
+            renames_from_py(
+                py,
+                package_renames,
+                class_renames,
+                method_renames,
+                field_renames,
+                variable_renames,
+            )
+        })?;
+        let options = DecompilerOptions {
+            only_package: only_package.map(String::from),
+            exclude: exclude.unwrap_or_default(),
+            show_bytecode: false,
+            rename_map,
+                ..Default::default()
+    };
         let decompiler = Decompiler::with_options(&dex, options);
         decompiler.decompile().map_err(|e| PyValueError::new_err(e.to_string()))
     }
@@ -174,6 +264,116 @@ impl DexFileWrapper {
                 })
                 .collect();
             Ok((rows_py, nodes_py, edges_py))
+        })
+    }
+
+    /// Run all vulnerability detectors; returns list of finding dicts.
+    fn scan_vulns(&self) -> PyResult<Vec<PyObject>> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let findings = scan_dex_parallel(&dex, None);
+        Python::with_gil(|py| {
+            findings
+                .into_iter()
+                .map(|f| {
+                    let dict = PyDict::new(py);
+                    dict.set_item("category", f.category)?;
+                    dict.set_item("title", f.title)?;
+                    dict.set_item("severity", f.severity)?;
+                    dict.set_item("message", f.message)?;
+                    dict.set_item("problem", f.problem)?;
+                    dict.set_item("recommendation", f.recommendation)?;
+                    dict.set_item("cwe", f.cwe)?;
+                    dict.set_item("class_name", f.class_name)?;
+                    dict.set_item("method_name", f.method_name)?;
+                    dict.set_item("source_offset", f.source_offset)?;
+                    dict.set_item("source_reg", f.source_reg)?;
+                    dict.set_item("source_desc", f.source_desc)?;
+                    dict.set_item("sink_offset", f.sink_offset)?;
+                    dict.set_item("sink_reg", f.sink_reg)?;
+                    dict.set_item("sink_desc", f.sink_desc)?;
+                    dict.set_item("evidence_offsets", f.evidence_offsets)?;
+                    let trace_list = pyo3::types::PyList::empty(py);
+                    for step in f.trace {
+                        let s = PyDict::new(py);
+                        s.set_item("offset", step.offset)?;
+                        s.set_item("reg", step.reg)?;
+                        s.set_item("kind", step.kind)?;
+                        s.set_item("description", step.description)?;
+                        trace_list.append(s)?;
+                    }
+                    dict.set_item("trace", trace_list)?;
+                    Ok(dict.into_py(py))
+                })
+                .collect()
+        })
+    }
+
+    /// Run Mariana-Trench–style taint solver; returns JSON string of issues.
+    #[pyo3(signature = (config_json=None, max_iterations=None))]
+    fn taint_solve(
+        &self,
+        config_json: Option<&str>,
+        max_iterations: Option<usize>,
+    ) -> PyResult<String> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let config = if let Some(s) = config_json {
+            serde_json::from_str(s).map_err(|e| PyValueError::new_err(e.to_string()))?
+        } else {
+            default_config()
+        };
+        let opts = SolveOptions {
+            max_iterations: max_iterations.unwrap_or(8),
+            exclude_prefixes: SolveOptions::default_android().exclude_prefixes,
+        };
+        let result =
+            solve_dexes(&[&dex], &config, &opts).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        serde_json::to_string_pretty(&result.report)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Export class inventory as JSON (optionally with method bodies).
+    #[pyo3(signature = (include_bodies=false))]
+    fn export_json(&self, include_bodies: bool) -> PyResult<String> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let decompiler = Decompiler::new(&dex);
+        decompiler
+            .export_json(include_bodies)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Emulate a method; returns final register snapshot as a dict.
+    #[pyo3(signature = (class_name, method_name, max_steps=None))]
+    fn emulate(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        max_steps: Option<usize>,
+    ) -> PyResult<PyObject> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let encoded = find_method(&dex, class_name, method_name)
+            .ok_or_else(|| PyValueError::new_err("method not found"))?;
+        let decompiler = Decompiler::new(&dex);
+        let mut emu = decompiler
+            .build_emulator(&encoded, vec![], vec![])
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        if let Some(n) = max_steps {
+            emu.max_steps = n;
+        }
+        while !emu.finished && emu.step_count < emu.max_steps {
+            if emu.step().is_err() {
+                break;
+            }
+        }
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("steps", emu.step_count)?;
+            dict.set_item("finished", emu.finished)?;
+            let regs = PyDict::new(py);
+            for (i, v) in emu.registers.iter().enumerate() {
+                regs.set_item(i, v.display_short_hex())?;
+            }
+            dict.set_item("registers", regs)?;
+            Ok(dict.into_py(py))
         })
     }
 }

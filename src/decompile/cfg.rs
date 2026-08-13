@@ -1,7 +1,7 @@
 //! Control-flow graph for method body: basic blocks, loop detection, if/else structure.
 //! Used to emit structured Java (if/else, while/for).
 
-use dex_bytecode::{basic_blocks, Instruction};
+use dex_bytecode::{basic_blocks, explicit_successors, Instruction};
 use std::collections::{HashMap, HashSet};
 
 /// Parse packed/sparse-switch payload at expected offset; return (case_value, target_byte_offset) for each case.
@@ -196,11 +196,26 @@ impl MethodCfg {
                 instructions.iter().find(|ins| (ins.offset as usize) + base_offset == off as usize)
             });
 
-            let fall_through_id = block_by_start.get(&end).copied();
+            // Prefer BasicBlock.fallthrough_to (absent for goto / exit).
+            let fall_through_id = rb
+                .fallthrough_to
+                .and_then(|off| block_by_start.get(&off).copied());
             let branch_target_ids: Vec<BlockId> = rb
                 .successors
                 .iter()
-                .filter_map(|&off| block_by_start.get(&off).copied())
+                .filter_map(|&off| {
+                    block_by_start.get(&off).copied().or_else(|| {
+                        // Target may land mid-block if data is odd; map to containing block.
+                        raw_blocks.iter().position(|b| {
+                            let b_end = if b.end_offset == u32::MAX {
+                                usize::MAX
+                            } else {
+                                b.end_offset as usize
+                            };
+                            (b.start_offset as usize..b_end).contains(&(off as usize))
+                        })
+                    })
+                })
                 .collect();
 
             let end_final = if let Some(ins) = last_ins {
@@ -275,7 +290,26 @@ impl MethodCfg {
                 match m {
                     "return-void" | "return" | "return-wide" | "return-object" | "throw" => BlockEnd::Exit,
                     "goto" | "goto/16" | "goto/32" => {
-                        if let Some(&tid) = branch_target_ids.first() {
+                        // Prefer the last instruction's own target (not other branches in the block).
+                        let goto_tid = last_ins.and_then(|gi| {
+                            let off = (gi.offset as usize) + base_offset;
+                            explicit_successors(data, off)
+                                .into_iter()
+                                .next()
+                                .and_then(|toff| {
+                                    block_by_start.get(&toff).copied().or_else(|| {
+                                        raw_blocks.iter().position(|b| {
+                                            let b_end = if b.end_offset == u32::MAX {
+                                                usize::MAX
+                                            } else {
+                                                b.end_offset as usize
+                                            };
+                                            (b.start_offset as usize..b_end).contains(&(toff as usize))
+                                        })
+                                    })
+                                })
+                        });
+                        if let Some(tid) = goto_tid.or_else(|| branch_target_ids.first().copied()) {
                             BlockEnd::Goto(tid)
                         } else {
                             fall_through_id.map(|_| BlockEnd::FallThrough).unwrap_or(BlockEnd::Exit)
@@ -500,15 +534,15 @@ mod tests {
         assert!(cfg.loop_headers.is_empty());
     }
 
-    /// if-eqz v0, +3; goto +2; return-void; return-void
+    /// if-eqz v0, +4; goto +2; return-void; return-void
     /// Blocks: [0-4) if-eqz, [4-6) goto, [6-8) return-void, [8-10) return-void.
-    /// Then-branch target = 6 (offset 6), else fall-through = 4.
+    /// Then-branch target = 8, else fall-through = 4.
     #[test]
     fn cfg_if_else_two_branches() {
-        // if-eqz v0, +3 (21t: target = 0+2+3*2 = 8); goto +2 (target 4+2+2*2 = 8); return-void at 6; return-void at 8
+        // if-eqz v0, +4 (21t: target = 0+4*2 = 8); goto +2 (target 4+2*2 = 8); return-void at 6; return-void at 8
         let bytecode: &[u8] = &[
-            0x38, 0x00, 0x03, 0x00, // if-eqz v0, +3 -> target byte 8
-            0x28, 0x02,             // goto +2 -> target byte 4+4=8
+            0x38, 0x00, 0x04, 0x00, // if-eqz v0, +4 -> target byte 8
+            0x28, 0x02,             // goto +2 -> target byte 8
             0x0e, 0x00,             // return-void at 6
             0x0e, 0x00,             // return-void at 8
         ];
@@ -522,11 +556,11 @@ mod tests {
     /// Loop: const/4; if-eqz (exit); goto back to if-eqz block. Back edge target is loop header.
     #[test]
     fn cfg_loop_back_edge() {
-        // const/4 v0,0 (0..2); if-eqz v0,+4 (2..6) target 12; goto -3 (6..8) target 2; nop nop (8..12); return-void (12..14)
+        // const/4 v0,0 (0..2); if-eqz v0,+5 (2..6) target 12; goto -2 (6..8) target 2; nop nop (8..12); return-void (12..14)
         let bytecode: &[u8] = &[
             0x12, 0x00,             // const/4 v0, 0
-            0x38, 0x00, 0x04, 0x00, // if-eqz v0, +4 -> target byte 12
-            0x28, 0xfd,             // goto -3 -> target byte 2
+            0x38, 0x00, 0x05, 0x00, // if-eqz v0, +5 -> target byte 12
+            0x28, 0xfe,             // goto -2 -> target byte 2
             0x00, 0x00, 0x00, 0x00, // nop, nop
             0x0e, 0x00,             // return-void at 12
         ];

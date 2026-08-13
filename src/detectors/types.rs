@@ -1,23 +1,506 @@
 //! Shared types and helpers for source→sink and invoke-only detectors.
 
-use crate::decompile::value_flow::ValueFlowAnalysisOwned;
+use crate::decompile::value_flow::{ValueFlowAnalysis, ValueFlowAnalysisOwned};
+use std::collections::BTreeSet;
+
+/// One step on an intra-method value-flow / execution evidence path.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct VulnTraceStep {
+    /// Bytecode offset within the method.
+    pub offset: u32,
+    /// Register holding / using the tainted value at this step, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reg: Option<u32>,
+    /// `source` | `propagate` | `use` | `sink` | `invoke`.
+    pub kind: String,
+    /// Human description (API name, insn text, etc.).
+    pub description: String,
+}
 
 /// One finding: tainted value from a source reaches a dangerous sink (or a dangerous invoke is present).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct VulnFinding {
     pub category: String,
+    /// Short human title (e.g. "Intent spoofing").
+    pub title: String,
+    /// `high` | `medium` | `low` | `info`.
+    pub severity: String,
+    /// Longer explanation of why this is flagged and what to check.
+    pub message: String,
+    /// One-line exact problem statement for analysts.
+    pub problem: String,
+    /// Concrete remediation / next-step guidance.
+    pub recommendation: String,
+    /// Optional CWE identifier (e.g. "CWE-926").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwe: Option<String>,
     pub class_name: String,
     pub method_name: String,
     /// Optional: offset where the tainted value is produced (move-result after source API).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source_offset: Option<u32>,
+    /// Register that receives the tainted value at the source, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_reg: Option<u32>,
+    /// Source API / origin description (concrete method when known).
     pub source_desc: String,
     /// Offset of the sink invoke (or dangerous API).
     pub sink_offset: u32,
+    /// Register used at the sink (argument carrying taint), when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink_reg: Option<u32>,
+    /// Sink API method reference.
     pub sink_desc: String,
+    /// Ordered intra-method evidence path (source → propagations/uses → sink).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace: Vec<VulnTraceStep>,
+    /// All related bytecode offsets (source, copies, uses, sink), sorted unique.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_offsets: Vec<u32>,
 }
 
-pub(crate) fn method_matches_any(method_ref: &str, patterns: &[&str]) -> bool {
+/// Static metadata for a detector category.
+#[derive(Debug, Clone, Copy)]
+pub struct CategoryMeta {
+    pub title: &'static str,
+    pub severity: &'static str,
+    pub message: &'static str,
+    pub recommendation: &'static str,
+    pub cwe: Option<&'static str>,
+}
+
+/// Human-readable metadata for known vuln detector categories.
+pub fn category_meta(category: &str) -> CategoryMeta {
+    match category {
+        "intent_spoofing" => CategoryMeta {
+            title: "Intent spoofing / redirect",
+            severity: "high",
+            message: "Untrusted Intent data (extras, URI, or getIntent) flows into an IPC launch API. An attacker-controlled Intent may redirect the app to an unexpected component or URI.",
+            recommendation: "Validate action, package, component, and data URI before startActivity/sendBroadcast/startService. Prefer explicit Intents with a fixed ComponentName.",
+            cwe: Some("CWE-926"),
+        },
+        "ipc_intent_validation" => CategoryMeta {
+            title: "IPC Intent without validation",
+            severity: "high",
+            message: "Intent-derived data reaches startActivity/setResult/sendBroadcast/startService without apparent validation of the target component or URI. Validate package, action, and data before forwarding.",
+            recommendation: "Check Intent.getPackage()/getComponent() against an allow-list; never forward untrusted extras into launch APIs.",
+            cwe: Some("CWE-926"),
+        },
+        "rce_dynamic_loading" => CategoryMeta {
+            title: "Dynamic code loading",
+            severity: "high",
+            message: "The method loads code or reflects into classes at runtime (DexClassLoader, PathClassLoader, Class.forName, Runtime.exec, etc.). Untrusted input controlling the path or class name can lead to remote code execution.",
+            recommendation: "Avoid loading DEX/native code from writable or network paths. If required, verify signatures and use a fixed allow-list of class names.",
+            cwe: Some("CWE-94"),
+        },
+        "insecure_logging" => CategoryMeta {
+            title: "Sensitive data in logs",
+            severity: "medium",
+            message: "Data that may be sensitive (location, identifiers, credentials, clipboard, extras) reaches a logging API. Logs can be read by other apps on older Android or leak via bugreports.",
+            recommendation: "Strip or redact PII/secrets before Log.*; never log tokens, passwords, or full Intent extras in production builds.",
+            cwe: Some("CWE-532"),
+        },
+        "sql_injection" => CategoryMeta {
+            title: "SQL injection risk",
+            severity: "high",
+            message: "A value flows into a SQL/query API in a way that may allow injection. Prefer parameterized queries (SelectionArgs / ? placeholders) instead of string concatenation.",
+            recommendation: "Use selectionArgs / bindArgs with `?` placeholders. Never concatenate untrusted strings into rawQuery/execSQL.",
+            cwe: Some("CWE-89"),
+        },
+        "webview_unsafe" | "webview_unsafe_url" | "webview_javascript_interface" | "webview_file_access" => {
+            CategoryMeta {
+                title: "Unsafe WebView configuration",
+                severity: "high",
+                message: "WebView settings or load APIs enable JavaScript bridges, file access, or load untrusted content. Combined with attacker-controlled URLs this can lead to XSS or local file theft.",
+                recommendation: "Disable file access and setJavaScriptEnabled unless required; never addJavascriptInterface with untrusted pages; load only HTTPS URLs you control.",
+                cwe: Some("CWE-79"),
+            }
+        }
+        "hardcoded_secrets_review" => CategoryMeta {
+            title: "Possible secret / credential write",
+            severity: "medium",
+            message: "A write/persist API commonly used for secrets or tokens was found. Review whether hardcoded credentials, API keys, or tokens are stored or transmitted.",
+            recommendation: "Store secrets in Android Keystore / EncryptedSharedPreferences; rotate any keys found in the binary.",
+            cwe: Some("CWE-798"),
+        },
+        "path_traversal" => CategoryMeta {
+            title: "Path traversal risk",
+            severity: "high",
+            message: "User- or Intent-influenced data reaches a file path API. Without sanitization (`../` rejection, canonical path checks) this can read/write outside the intended directory.",
+            recommendation: "Resolve canonical paths and ensure they stay under the intended base directory; reject `..` segments from untrusted input.",
+            cwe: Some("CWE-22"),
+        },
+        "weak_crypto" => CategoryMeta {
+            title: "Weak cryptography",
+            severity: "medium",
+            message: "A cryptographic API associated with weak algorithms or modes (e.g. DES, ECB, MD5 used for security) was detected. Prefer modern algorithms (AES-GCM, SHA-256+) and platform Keystore.",
+            recommendation: "Replace DES/3DES/ECB/MD5 (for security) with AES-GCM or ChaCha20-Poly1305 via AndroidKeyStore.",
+            cwe: Some("CWE-327"),
+        },
+        "unsafe_deserialization" => CategoryMeta {
+            title: "Unsafe deserialization",
+            severity: "high",
+            message: "Object deserialization or similar reconstruction from untrusted input was found. Gadget chains can lead to remote code execution; prefer safe formats (JSON) with explicit types.",
+            recommendation: "Avoid Java ObjectInputStream / Parcelable from untrusted sources; prefer JSON with an explicit schema.",
+            cwe: Some("CWE-502"),
+        },
+        "pending_intent" => CategoryMeta {
+            title: "Mutable / empty PendingIntent",
+            severity: "high",
+            message: "A PendingIntent is created in a way that may be hijacked (empty base Intent and/or mutable flags with a dangerous destination). Attackers can fill in the Intent and abuse your app's privileges.",
+            recommendation: "Use FLAG_IMMUTABLE (API 31+) and always set an explicit component on the base Intent.",
+            cwe: Some("CWE-927"),
+        },
+        other if other.starts_with("semgrep:") => CategoryMeta {
+            title: "Semgrep rule match",
+            severity: "medium",
+            message: "A Semgrep-style Android rule matched this method. Review the rule message and sink for context.",
+            recommendation: "Open the matched rule message and confirm whether the sink is reachable with attacker-controlled data.",
+            cwe: None,
+        },
+        _ => CategoryMeta {
+            title: "Security finding",
+            severity: "medium",
+            message: "A security detector flagged this method. Review the source and sink for untrusted data reaching a sensitive API.",
+            recommendation: "Trace the highlighted offsets in bytecode/CFG and confirm whether untrusted input reaches the sink.",
+            cwe: None,
+        },
+    }
+}
+
+impl VulnFinding {
+    /// Build a finding with category metadata filled in (no flow path yet).
+    pub fn new(
+        category: &str,
+        class_name: &str,
+        method_name: &str,
+        source_offset: Option<u32>,
+        source_desc: impl Into<String>,
+        sink_offset: u32,
+        sink_desc: impl Into<String>,
+    ) -> Self {
+        Self::with_flow(
+            category,
+            class_name,
+            method_name,
+            source_offset,
+            None,
+            source_desc,
+            sink_offset,
+            None,
+            sink_desc,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Build a finding including registers, evidence path, and analysis fields.
+    pub fn with_flow(
+        category: &str,
+        class_name: &str,
+        method_name: &str,
+        source_offset: Option<u32>,
+        source_reg: Option<u32>,
+        source_desc: impl Into<String>,
+        sink_offset: u32,
+        sink_reg: Option<u32>,
+        sink_desc: impl Into<String>,
+        trace: Vec<VulnTraceStep>,
+        evidence_offsets: Vec<u32>,
+    ) -> Self {
+        let meta = category_meta(category);
+        let source_desc = source_desc.into();
+        let sink_desc = sink_desc.into();
+        let message = format_finding_message(meta, class_name, method_name, &source_desc, &sink_desc);
+        let problem = format_problem(
+            class_name,
+            method_name,
+            source_offset,
+            source_reg,
+            &source_desc,
+            sink_offset,
+            sink_reg,
+            &sink_desc,
+        );
+        Self {
+            category: category.to_string(),
+            title: meta.title.to_string(),
+            severity: meta.severity.to_string(),
+            message,
+            problem,
+            recommendation: meta.recommendation.to_string(),
+            cwe: meta.cwe.map(|s| s.to_string()),
+            class_name: class_name.to_string(),
+            method_name: method_name.to_string(),
+            source_offset,
+            source_reg,
+            source_desc,
+            sink_offset,
+            sink_reg,
+            sink_desc,
+            trace,
+            evidence_offsets,
+        }
+    }
+
+    /// Re-apply title/severity/message/cwe/recommendation/problem after changing `category`.
+    pub fn refresh_category_meta(&mut self) {
+        let meta = category_meta(&self.category);
+        self.title = meta.title.to_string();
+        self.severity = meta.severity.to_string();
+        self.cwe = meta.cwe.map(|s| s.to_string());
+        self.recommendation = meta.recommendation.to_string();
+        self.message = format_finding_message(
+            meta,
+            &self.class_name,
+            &self.method_name,
+            &self.source_desc,
+            &self.sink_desc,
+        );
+        self.problem = format_problem(
+            &self.class_name,
+            &self.method_name,
+            self.source_offset,
+            self.source_reg,
+            &self.source_desc,
+            self.sink_offset,
+            self.sink_reg,
+            &self.sink_desc,
+        );
+    }
+}
+
+fn format_finding_message(
+    meta: CategoryMeta,
+    class_name: &str,
+    method_name: &str,
+    source_desc: &str,
+    sink_desc: &str,
+) -> String {
+    let loc = format!("{class_name}#{method_name}");
+    let mut msg = meta.message.to_string();
+    if !source_desc.is_empty() && !sink_desc.is_empty() {
+        msg.push_str(&format!(
+            " Flow: `{source}` → `{sink}` in `{loc}`.",
+            source = short_method_ref(source_desc),
+            sink = short_method_ref(sink_desc),
+            loc = loc,
+        ));
+    } else if !sink_desc.is_empty() {
+        msg.push_str(&format!(
+            " Sink: `{sink}` in `{loc}`.",
+            sink = short_method_ref(sink_desc),
+            loc = loc,
+        ));
+    } else {
+        msg.push_str(&format!(" Location: `{loc}`."));
+    }
+    msg
+}
+
+fn format_problem(
+    class_name: &str,
+    method_name: &str,
+    source_offset: Option<u32>,
+    source_reg: Option<u32>,
+    source_desc: &str,
+    sink_offset: u32,
+    sink_reg: Option<u32>,
+    sink_desc: &str,
+) -> String {
+    let loc = format!("{class_name}#{method_name}");
+    let sink_bit = match sink_reg {
+        Some(r) => format!(
+            "`{}` (v{} @ 0x{:x})",
+            short_method_ref(sink_desc),
+            r,
+            sink_offset
+        ),
+        None => format!("`{}` (@ 0x{:x})", short_method_ref(sink_desc), sink_offset),
+    };
+    if let (Some(soff), Some(sreg)) = (source_offset, source_reg) {
+        if !source_desc.is_empty() {
+            return format!(
+                "In `{loc}`, untrusted value from `{src}` (v{sreg} @ 0x{soff:x}) reaches sink {sink}.",
+                src = short_method_ref(source_desc),
+                sink = sink_bit,
+            );
+        }
+    }
+    if !source_desc.is_empty() {
+        return format!(
+            "In `{loc}`, data from `{src}` reaches sink {sink}.",
+            src = short_method_ref(source_desc),
+            sink = sink_bit,
+        );
+    }
+    format!("In `{loc}`, dangerous API {sink} is invoked.", sink = sink_bit)
+}
+
+/// Shorten `pkg.Class.method` / `Lpkg/Class;.method` style refs for display.
+fn short_method_ref(method_ref: &str) -> String {
+    let s = method_ref.trim();
+    if s.is_empty() {
+        return s.to_string();
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() >= 2 {
+        format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        s.to_string()
+    }
+}
+
+pub fn method_matches_any(method_ref: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|p| method_ref.contains(p))
+}
+
+fn fmt_hex(off: u32) -> String {
+    format!("0x{off:x}")
+}
+
+fn insn_desc(owned: &ValueFlowAnalysisOwned, offset: u32) -> String {
+    let label = owned.insn_label(offset);
+    if label.is_empty() {
+        fmt_hex(offset)
+    } else {
+        format!("{} · {label}", fmt_hex(offset))
+    }
+}
+
+/// Reconstruct an ordered evidence path from seed → sink using value-flow writes/reads.
+pub fn build_flow_trace(
+    owned: &ValueFlowAnalysisOwned,
+    analysis: &ValueFlowAnalysis<'_>,
+    seed_offset: u32,
+    seed_reg: u32,
+    sink_offset: u32,
+    source_desc: &str,
+    sink_desc: &str,
+) -> (Vec<VulnTraceStep>, Option<u32>, Vec<u32>) {
+    let flow = analysis.value_flow_from_seed(seed_offset, seed_reg);
+    let sink_reg = flow
+        .reads
+        .iter()
+        .find(|(o, _)| *o == sink_offset)
+        .map(|(_, r)| *r);
+
+    let mut evidence: BTreeSet<u32> = BTreeSet::new();
+    evidence.insert(seed_offset);
+    evidence.insert(sink_offset);
+    for (o, _) in &flow.writes {
+        if *o >= seed_offset && *o <= sink_offset {
+            evidence.insert(*o);
+        }
+    }
+    for (o, _) in &flow.reads {
+        if *o >= seed_offset && *o <= sink_offset {
+            evidence.insert(*o);
+        }
+    }
+
+    let mut steps: Vec<VulnTraceStep> = Vec::new();
+    steps.push(VulnTraceStep {
+        offset: seed_offset,
+        reg: Some(seed_reg),
+        kind: "source".into(),
+        description: format!(
+            "Source `{}` defines v{seed_reg} — {}",
+            short_method_ref(source_desc),
+            insn_desc(owned, seed_offset)
+        ),
+    });
+
+    // Intermediate writes (propagations / copies), then intermediate uses at invokes.
+    let mut mids: Vec<(u32, Option<u32>, &'static str, String)> = Vec::new();
+    for &(off, reg) in &flow.writes {
+        if off == seed_offset || off > sink_offset || off < seed_offset {
+            continue;
+        }
+        let kind = if owned.invoke_method_map.contains_key(&off) {
+            "invoke"
+        } else {
+            "propagate"
+        };
+        let desc = if let Some(api) = owned.invoke_method_map.get(&off) {
+            format!(
+                "Value copied/defined in v{reg} around `{}` — {}",
+                short_method_ref(api),
+                insn_desc(owned, off)
+            )
+        } else {
+            format!("Propagate into v{reg} — {}", insn_desc(owned, off))
+        };
+        mids.push((off, Some(reg), kind, desc));
+    }
+    for &(off, reg) in &flow.reads {
+        if off == sink_offset || off == seed_offset || off > sink_offset || off < seed_offset {
+            continue;
+        }
+        if let Some(api) = owned.invoke_method_map.get(&off) {
+            mids.push((
+                off,
+                Some(reg),
+                "use",
+                format!(
+                    "Tainted v{reg} used as argument to `{}` — {}",
+                    short_method_ref(api),
+                    insn_desc(owned, off)
+                ),
+            ));
+        }
+    }
+    mids.sort_by_key(|(o, _, _, _)| *o);
+    let mut seen_off = BTreeSet::from([seed_offset]);
+    for (off, reg, kind, description) in mids {
+        if !seen_off.insert(off) {
+            continue;
+        }
+        steps.push(VulnTraceStep {
+            offset: off,
+            reg,
+            kind: kind.into(),
+            description,
+        });
+    }
+
+    steps.push(VulnTraceStep {
+        offset: sink_offset,
+        reg: sink_reg,
+        kind: "sink".into(),
+        description: match sink_reg {
+            Some(r) => format!(
+                "Sink `{}` uses tainted v{r} — {}",
+                short_method_ref(sink_desc),
+                insn_desc(owned, sink_offset)
+            ),
+            None => format!(
+                "Sink `{}` — {}",
+                short_method_ref(sink_desc),
+                insn_desc(owned, sink_offset)
+            ),
+        },
+    });
+
+    (steps, sink_reg, evidence.into_iter().collect())
+}
+
+fn invoke_only_trace(
+    owned: &ValueFlowAnalysisOwned,
+    sink_offset: u32,
+    sink_desc: &str,
+) -> (Vec<VulnTraceStep>, Vec<u32>) {
+    let step = VulnTraceStep {
+        offset: sink_offset,
+        reg: None,
+        kind: "invoke".into(),
+        description: format!(
+            "Dangerous API `{}` — {}",
+            short_method_ref(sink_desc),
+            insn_desc(owned, sink_offset)
+        ),
+    };
+    (vec![step], vec![sink_offset])
 }
 
 /// Generic source→sink scan: seeds from api_return_sources matching source_patterns;
@@ -30,28 +513,41 @@ pub fn source_sink_scan(
     source_patterns: &[&str],
     sink_patterns: &[&str],
 ) -> Vec<VulnFinding> {
-    let seeds: Vec<(u32, u32)> = owned
+    let seeds: Vec<(u32, u32, String)> = owned
         .api_return_sources
         .iter()
         .filter(|(_, method_ref)| method_matches_any(method_ref, source_patterns))
-        .map(|&((offset, reg), _)| (offset, reg))
+        .map(|&((offset, reg), ref method_ref)| (offset, reg, method_ref.clone()))
         .collect();
     let mut findings = Vec::new();
     let analysis = owned.analysis();
-    for (seed_offset, seed_reg) in seeds {
+    for (seed_offset, seed_reg, source_api) in seeds {
         let flow = analysis.value_flow_from_seed(seed_offset, seed_reg);
         for (read_offset, _reg) in &flow.reads {
             if let Some(sink_ref) = owned.invoke_method_map.get(read_offset) {
                 if method_matches_any(sink_ref, sink_patterns) {
-                    findings.push(VulnFinding {
-                        category: category.to_string(),
-                        class_name: class_name.to_string(),
-                        method_name: method_name.to_string(),
-                        source_offset: Some(seed_offset),
-                        source_desc: "tainted from API".to_string(),
-                        sink_offset: *read_offset,
-                        sink_desc: sink_ref.clone(),
-                    });
+                    let (trace, sink_reg, evidence) = build_flow_trace(
+                        owned,
+                        &analysis,
+                        seed_offset,
+                        seed_reg,
+                        *read_offset,
+                        &source_api,
+                        sink_ref,
+                    );
+                    findings.push(VulnFinding::with_flow(
+                        category,
+                        class_name,
+                        method_name,
+                        Some(seed_offset),
+                        Some(seed_reg),
+                        source_api.clone(),
+                        *read_offset,
+                        sink_reg,
+                        sink_ref.clone(),
+                        trace,
+                        evidence,
+                    ));
                 }
             }
         }
@@ -70,16 +566,87 @@ pub fn invoke_scan(
     let mut findings = Vec::new();
     for (offset, method_ref) in &owned.invoke_method_map {
         if method_matches_any(method_ref, patterns) {
-            findings.push(VulnFinding {
-                category: category.to_string(),
-                class_name: class_name.to_string(),
-                method_name: method_name.to_string(),
-                source_offset: None,
-                source_desc: String::new(),
-                sink_offset: *offset,
-                sink_desc: method_ref.clone(),
-            });
+            let (trace, evidence) = invoke_only_trace(owned, *offset, method_ref);
+            findings.push(VulnFinding::with_flow(
+                category,
+                class_name,
+                method_name,
+                None,
+                None,
+                "",
+                *offset,
+                None,
+                method_ref.clone(),
+                trace,
+                evidence,
+            ));
         }
     }
     findings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decompile::cfg::{BlockEnd, CfgBlock, MethodCfg};
+    use crate::decompile::value_flow::ValueFlowAnalysisOwned;
+    use std::collections::{HashMap, HashSet};
+
+    fn make_cfg(instruction_offsets: Vec<u32>) -> MethodCfg {
+        let block = CfgBlock {
+            start_offset: *instruction_offsets.first().unwrap_or(&0),
+            end_offset: instruction_offsets.last().copied().unwrap_or(0) + 2,
+            end: BlockEnd::Exit,
+            instruction_offsets: instruction_offsets.clone(),
+        };
+        let mut block_by_start = HashMap::new();
+        block_by_start.insert(block.start_offset, 0);
+        MethodCfg {
+            blocks: vec![block],
+            block_by_start,
+            loop_headers: HashSet::new(),
+            entry: 0,
+            folded_const_offsets: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn source_sink_finding_includes_trace_and_problem() {
+        let mut rw_map = HashMap::new();
+        rw_map.insert(0, (vec![], vec![0]));
+        rw_map.insert(2, (vec![0], vec![1]));
+        rw_map.insert(4, (vec![1], vec![]));
+        let mut invoke_method_map = HashMap::new();
+        invoke_method_map.insert(4, "android.app.Activity.startActivity".to_string());
+        let mut insn_at = HashMap::new();
+        insn_at.insert(0, "move-result-object v0".into());
+        insn_at.insert(2, "move-object v1, v0".into());
+        insn_at.insert(4, "invoke-virtual {v1}, startActivity".into());
+        let owned = ValueFlowAnalysisOwned {
+            cfg: make_cfg(vec![0, 2, 4]),
+            rw_map,
+            api_return_sources: vec![((0, 0), "android.content.Intent.getParcelableExtra".into())],
+            invoke_method_map,
+            insn_at,
+        };
+        let findings = source_sink_scan(
+            &owned,
+            "com.example.Main",
+            "onCreate",
+            "intent_spoofing",
+            &["getParcelableExtra"],
+            &["startActivity"],
+        );
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert!(!f.problem.is_empty(), "problem: {}", f.problem);
+        assert!(!f.recommendation.is_empty());
+        assert_eq!(f.source_reg, Some(0));
+        assert_eq!(f.sink_reg, Some(1));
+        assert!(f.trace.len() >= 2);
+        assert_eq!(f.trace.first().unwrap().kind, "source");
+        assert_eq!(f.trace.last().unwrap().kind, "sink");
+        assert!(f.evidence_offsets.contains(&0));
+        assert!(f.evidence_offsets.contains(&4));
+    }
 }

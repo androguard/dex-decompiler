@@ -1,0 +1,100 @@
+# General Android Semgrep rules for dex-decompiler native scanning.
+#
+# Patterns are Semgrep-style Java. The native engine also uses `native:` hints
+# (source_sink / invoke / method_invoke) so matching works on DEX via SSA/value-flow
+# without requiring a full Java AST.
+
+rules:
+  - id: android.webview.loadurl-from-intent
+    message: >-
+      WebView.loadUrl() receives a URL derived from an Intent extra or Uri.
+      If the host Activity is exported or deep-linked, an attacker controls
+      the URL loaded into an authenticated WebView.
+    severity: WARNING
+    languages: [java]
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $WV.loadUrl((String) $INTENT.getStringExtra(...));
+          - pattern: |
+              $WV.loadUrl($INTENT.getData().toString());
+          - pattern: |
+              $WV.loadUrl($INTENT.getData().getQueryParameter(...));
+    metadata:
+      vuln_class: webview
+      chain_tag: deeplink_to_webview
+    native:
+      kind: source_sink
+      sources:
+        - getStringExtra
+        - getData
+        - getDataString
+        - getQueryParameter
+        - getIntent
+      sinks:
+        - loadUrl
+
+  - id: android.webview.js-interface-added
+    message: >-
+      addJavascriptInterface is called. If the WebView later loads attacker
+      controlled URLs (deep link, redirect, untrusted HTML), this is RCE.
+    severity: WARNING
+    languages: [java]
+    pattern: $WV.addJavascriptInterface($OBJ, $NAME);
+    metadata:
+      vuln_class: webview
+      chain_tag: js_bridge
+    native:
+      kind: invoke
+      methods:
+        - addJavascriptInterface
+
+  - id: android.intent.redirect
+    message: >-
+      Activity extracts a Parcelable/Intent from an incoming Intent and starts
+      it. Classic intent redirection; attacker reaches non-exported components.
+    severity: ERROR
+    languages: [java]
+    pattern-either:
+      - pattern: |
+          $I = (Intent) getIntent().getParcelableExtra(...);
+          ...
+          startActivity($I);
+      - pattern: |
+          $I = getIntent().getParcelableExtra(..., Intent.class);
+          ...
+          startActivity($I);
+    metadata:
+      vuln_class: ipc
+    native:
+      kind: source_sink
+      sources:
+        - getParcelableExtra
+        - getParcelableArrayExtra
+        - getParcelableArrayListExtra
+      sinks:
+        - startActivity
+        - startActivityForResult
+        - startService
+        - bindService
+        - sendBroadcast
+
+  - id: android.ssl.bypass-handler-proceed
+    message: >-
+      WebViewClient.onReceivedSslError calls handler.proceed() unconditionally.
+      Silently accepts invalid TLS certs; network traffic can be MITMed.
+    severity: ERROR
+    languages: [java]
+    pattern: |
+      public void onReceivedSslError(WebView $V, SslErrorHandler $H, SslError $E) {
+        ...
+        $H.proceed();
+        ...
+      }
+    metadata:
+      vuln_class: network
+    native:
+      kind: method_invoke
+      method_name: onReceivedSslError
+      methods:
+        - proceed

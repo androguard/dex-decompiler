@@ -2,20 +2,21 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::thread;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
 use dex_decompiler::{
-    class_name_to_path, parse_dex, run_all_detectors, scan_pending_intents, Decompiler,
-    DecompilerOptions, DexFile, EncodedMethod,
+    build_deobf_rename_map, default_config, extract_android_manifest_from_apk, load_android_rules,
+    load_dexes_from_path, load_dexes_from_paths, load_mapping_file, looks_like_text_xml,
+    mapping_format_from_path, save_mapping_file,
+    merge_rename_maps, parse_dex, scan_dex_parallel, scan_dex_semgrep_with_progress, scan_xml_semgrep,
+    scan_pending_intents_dex_parallel, solve_dexes, write_issues_json, DecompilationMode, Decompiler,
+    DecompilerOptions, DeobfuscateOptions, DexFile, EncodedMethod, RenameMap, SolveOptions,
+    TaintConfig,
 };
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
 
 /// Parse offset as decimal or 0x-prefixed hex.
 fn parse_offset(s: &str) -> Result<u32, std::num::ParseIntError> {
@@ -30,6 +31,85 @@ fn parse_offset(s: &str) -> Result<u32, std::num::ParseIntError> {
 /// Simple name: last component after the final dot (e.g. "TestExceptions" from "tests.androguard.TestExceptions").
 fn simple_class_name(full: &str) -> &str {
     full.rsplit('.').next().unwrap_or(full)
+}
+
+/// Build RenameMap from CLI --rename-*, optional --deobf, and optional --mapping.
+fn build_rename_map(args: &Args, dexes: &[&DexFile]) -> Option<RenameMap> {
+    let mut map = RenameMap::default();
+    let mut any = false;
+    if let Some(ref path) = args.mapping {
+        match load_mapping_file(std::path::Path::new(path)) {
+            Ok(m) => {
+                map = merge_rename_maps(map, m);
+                any = true;
+            }
+            Err(e) => {
+                eprintln!("warning: failed to load mapping {}: {e}", path);
+            }
+        }
+    }
+    if args.deobf {
+        let mut opts = DeobfuscateOptions::default();
+        if let Some(n) = args.deobf_min {
+            opts.min_len = n;
+        }
+        if let Some(n) = args.deobf_max {
+            opts.max_len = n;
+        }
+        map = merge_rename_maps(map, build_deobf_rename_map(dexes, &opts));
+        any = true;
+    }
+    for s in &args.rename_package {
+        if let Some((k, v)) = s.split_once('=') {
+            map.package.insert(k.trim().to_string(), v.trim().to_string());
+            any = true;
+        }
+    }
+    for s in &args.rename_class {
+        if let Some((k, v)) = s.split_once('=') {
+            map.class.insert(k.trim().to_string(), v.trim().to_string());
+            any = true;
+        }
+    }
+    for s in &args.rename_method {
+        if let Some((k, v)) = s.split_once('=') {
+            map.method.insert(k.trim().to_string(), v.trim().to_string());
+            any = true;
+        }
+    }
+    for s in &args.rename_field {
+        if let Some((k, v)) = s.split_once('=') {
+            map.field.insert(k.trim().to_string(), v.trim().to_string());
+            any = true;
+        }
+    }
+    for s in &args.rename_variable {
+        if let Some((key, rest)) = s.split_once(':') {
+            if let Some((old_var, new_var)) = rest.split_once('=') {
+                map.variable
+                    .entry(key.trim().to_string())
+                    .or_default()
+                    .insert(old_var.trim().to_string(), new_var.trim().to_string());
+                any = true;
+            }
+        }
+    }
+    if any {
+        Some(map)
+    } else {
+        None
+    }
+}
+
+fn parse_decompilation_mode(s: &str) -> std::result::Result<DecompilationMode, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" | "restructure" => Ok(DecompilationMode::Restructure),
+        "simple" => Ok(DecompilationMode::Simple),
+        "fallback" => Ok(DecompilationMode::Fallback),
+        other => Err(format!(
+            "unknown decompilation mode '{other}' (expected restructure|simple|fallback)"
+        )),
+    }
 }
 
 /// Find the first EncodedMethod in the DEX for the given class and method name.
@@ -461,48 +541,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // PendingIntent vulnerability scan: iterate all methods in all DEX files.
+    // PendingIntent vulnerability scan: parallel over methods in all DEX files.
     if args.scan_pending_intent {
         let mut all_findings = Vec::new();
         for path in &args.input {
             let data = fs::read(path).with_context(|| format!("read {}", path))?;
             let dex = parse_dex(&data).context("parse DEX")?;
-            let decompiler = Decompiler::new(&dex);
-            for class_def_result in dex.class_defs() {
-                let class_def = match class_def_result {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let class_type = match dex.get_type(class_def.class_idx) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                let class_name = dex_decompiler::java::descriptor_to_java(&class_type);
-                let class_data = match dex.get_class_data(&class_def) {
-                    Ok(Some(cd)) => cd,
-                    _ => continue,
-                };
-                for encoded in class_data
-                    .direct_methods
-                    .iter()
-                    .chain(class_data.virtual_methods.iter())
-                {
-                    if encoded.code_off == 0 {
-                        continue;
-                    }
-                    let method_info = match dex.get_method_info(encoded.method_idx) {
-                        Ok(mi) => mi,
-                        Err(_) => continue,
-                    };
-                    let method_name = method_info.name.to_string();
-                    let owned = match decompiler.value_flow_analysis(encoded) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let findings = scan_pending_intents(&owned, &class_name, &method_name);
-                    all_findings.extend(findings);
-                }
-            }
+            all_findings.extend(scan_pending_intents_dex_parallel(&dex));
         }
         println!("PendingIntent scan: {} finding(s)", all_findings.len());
         for f in &all_findings {
@@ -526,82 +571,360 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Vulnerability scan: run all detectors (intent spoofing, RCE, logging, SQL, WebView, secrets, IPC) on every method.
-    if args.scan_vulns {
-        let mut all_findings = Vec::new();
+    // Mariana-Trench–style global taint solver (models + rules + interprocedural traces).
+    if args.taint_solve {
+        let mut config = if let Some(path) = &args.taint_config {
+            TaintConfig::from_path(Path::new(path)).context("load taint config")?
+        } else {
+            default_config()
+        };
+        if let Some(extra) = &args.taint_config_extra {
+            let more = TaintConfig::from_path(Path::new(extra)).context("load extra taint config")?;
+            config.merge(more);
+        }
+        let mut opts = SolveOptions::default_android();
+        if let Some(n) = args.taint_max_iterations {
+            opts.max_iterations = n;
+        }
+        if args.taint_include_framework {
+            opts.exclude_prefixes.clear();
+        }
+
+        let mut owned_dexes = Vec::new();
         for path in &args.input {
             let data = fs::read(path).with_context(|| format!("read {}", path))?;
             let dex = parse_dex(&data).context("parse DEX")?;
-            let decompiler = Decompiler::new(&dex);
-            for class_def_result in dex.class_defs() {
-                let class_def = match class_def_result {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let class_type = match dex.get_type(class_def.class_idx) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                let class_name = dex_decompiler::java::descriptor_to_java(&class_type);
-                let class_data = match dex.get_class_data(&class_def) {
-                    Ok(Some(cd)) => cd,
-                    _ => continue,
-                };
-                for encoded in class_data
-                    .direct_methods
-                    .iter()
-                    .chain(class_data.virtual_methods.iter())
-                {
-                    if encoded.code_off == 0 {
-                        continue;
-                    }
-                    let method_info = match dex.get_method_info(encoded.method_idx) {
-                        Ok(mi) => mi,
-                        Err(_) => continue,
-                    };
-                    let method_name = method_info.name.to_string();
-                    let owned = match decompiler.value_flow_analysis(encoded) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let findings = run_all_detectors(
-                        &owned,
-                        &class_name,
-                        &method_name,
-                        if args.taint_api.is_empty() {
-                            None
-                        } else {
-                            Some(&args.taint_api)
-                        },
-                    );
-                    all_findings.extend(findings);
-                }
+            owned_dexes.push(dex);
+        }
+        let refs: Vec<&DexFile> = owned_dexes.iter().collect();
+        let result = solve_dexes(&refs, &config, &opts).context("taint solve")?;
+        println!(
+            "Taint solve: {} issue(s) (methods={}, edges={}, iterations={})",
+            result.report.stats.issues,
+            result.report.stats.methods_analyzed,
+            result.report.stats.call_edges,
+            result.report.stats.iterations
+        );
+        for issue in &result.issues {
+            println!(
+                "  [rule {}] {} | {} -> {} @ {}",
+                issue.rule_code,
+                issue.rule_name,
+                issue.source_kind,
+                issue.sink_kind,
+                issue.callable
+            );
+            for frame in &issue.trace {
+                let off = frame
+                    .offset
+                    .map(|o| format!(" @ 0x{o:x}"))
+                    .unwrap_or_default();
+                println!(
+                    "    - {}#{}{}  [{}] {}",
+                    frame.class_name, frame.method_name, off, frame.kind, frame.description
+                );
             }
         }
-        println!("Vulnerability scan: {} finding(s)", all_findings.len());
-        for f in &all_findings {
-            println!(
-                "  [{}] {}#{}  sink @ 0x{:x}  {}",
-                f.category,
-                f.class_name,
-                f.method_name,
-                f.sink_offset,
-                f.sink_desc
-            );
+        if let Some(out) = &args.taint_output {
+            write_issues_json(&result.report, Path::new(out)).context("write taint output")?;
+            println!("wrote {}", out);
         }
         return Ok(());
     }
 
-    // Decompile: use first DEX file (multi-DEX is supported for taint mode above).
-    let path = &args.input[0];
-    let data = fs::read(path).with_context(|| format!("read {}", path))?;
-    let dex = parse_dex(&data).context("parse DEX")?;
+    // Vulnerability scan: parallel detectors on every method.
+    if args.scan_vulns {
+        let mut all_findings = Vec::new();
+        let logging = if args.taint_api.is_empty() {
+            None
+        } else {
+            Some(args.taint_api.as_slice())
+        };
+        for path in &args.input {
+            let data = fs::read(path).with_context(|| format!("read {}", path))?;
+            let dex = parse_dex(&data).context("parse DEX")?;
+            all_findings.extend(scan_dex_parallel(&dex, logging));
+        }
+        println!("Vulnerability scan: {} finding(s)", all_findings.len());
+        for f in &all_findings {
+            let cwe = f
+                .cwe
+                .as_ref()
+                .map(|c| format!("  {}", c))
+                .unwrap_or_default();
+            println!(
+                "  [{}] {} — {}{}  {}#{}  sink @ 0x{:x}",
+                f.severity,
+                f.category,
+                f.title,
+                cwe,
+                f.class_name,
+                f.method_name,
+                f.sink_offset
+            );
+            if !f.message.is_empty() {
+                println!("      {}", f.message.lines().next().unwrap_or(""));
+            }
+            if !f.source_desc.is_empty() || !f.sink_desc.is_empty() {
+                println!("      source: {}  →  sink: {}", f.source_desc, f.sink_desc);
+            }
+        }
+        return Ok(());
+    }
+
+    // Native Semgrep-style Android rules (general + OWASP MASTG + optional custom YAML/dir).
+    if args.scan_semgrep {
+        eprintln!("Semgrep (native): loading rules…");
+        let rules_path = args.semgrep_rules.as_ref().map(Path::new);
+        let rules = load_android_rules(rules_path).map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!(
+            "Semgrep (native): {} rule(s) loaded{}",
+            rules.len(),
+            match rules_path {
+                Some(p) => format!(" from {}", p.display()),
+                None => " (general Android + OWASP MASTG)".to_string(),
+            }
+        );
+        let mut all = Vec::new();
+        for path in &args.input {
+            let p = Path::new(path);
+            eprintln!("Semgrep (native): reading {}…", path);
+            let data = fs::read(p).with_context(|| format!("read {}", path))?;
+
+            // Plaintext XML / decoded AndroidManifest.xml input.
+            if looks_like_text_xml(&data)
+                || p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("xml"))
+            {
+                eprintln!("Semgrep (native): scanning XML {} ({} rule{})…", path, rules.len(), if rules.len() == 1 { "" } else { "s" });
+                if let Ok(text) = std::str::from_utf8(&data) {
+                    all.extend(scan_xml_semgrep(text, path, &rules));
+                }
+                continue;
+            }
+
+            eprintln!("Semgrep (native): loading DEX from {}…", path);
+            let dexes = load_dexes_from_path(p).with_context(|| format!("load DEX/APK {}", path))?;
+            eprintln!(
+                "Semgrep (native): {} DEX file(s) in {}",
+                dexes.len(),
+                path
+            );
+            for (dex_i, dex) in dexes.iter().enumerate() {
+                let label = if dexes.len() == 1 {
+                    path.to_string()
+                } else {
+                    format!("{}[{}]", path, dex_i)
+                };
+                let n_rules = rules.len();
+                let use_bar = std::io::IsTerminal::is_terminal(&std::io::stderr());
+                let pb = if use_bar {
+                    let pb = ProgressBar::new(0);
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template(&format!(
+                                "{{spinner:.green}} Semgrep ({n_rules} rules) [{{bar:40.cyan/blue}}] {{pos}}/{{len}} {{msg}}"
+                            ))?
+                            .progress_chars("=>-"),
+                    );
+                    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+                    Some(Arc::new(pb))
+                } else {
+                    None
+                };
+                let last_pct = std::sync::atomic::AtomicUsize::new(0);
+                let progress = {
+                    let pb = pb.clone();
+                    let label = label.clone();
+                    move |done: usize, total: usize, method: &str| {
+                        if done == 0 {
+                            eprintln!(
+                                "Semgrep (native): scanning {} with {} rule{} ({} method{})…",
+                                label,
+                                n_rules,
+                                if n_rules == 1 { "" } else { "s" },
+                                total,
+                                if total == 1 { "" } else { "s" }
+                            );
+                        }
+                        if let Some(ref pb) = pb {
+                            pb.set_length(total as u64);
+                            pb.set_position(done as u64);
+                            pb.set_message(method.to_string());
+                        } else if total > 0 {
+                            let pct = done.saturating_mul(100) / total;
+                            let prev = last_pct.load(std::sync::atomic::Ordering::Relaxed);
+                            if pct >= prev + 10 || done == total {
+                                if last_pct
+                                    .compare_exchange(
+                                        prev,
+                                        pct,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                                {
+                                    eprintln!(
+                                        "Semgrep (native): {} ({} rules)… {}/{} ({}%)",
+                                        label, n_rules, done, total, pct
+                                    );
+                                }
+                            }
+                        }
+                    }
+                };
+                all.extend(scan_dex_semgrep_with_progress(
+                    dex,
+                    &rules,
+                    Some(progress),
+                ));
+                if let Some(pb) = pb {
+                    pb.finish_with_message(format!("done ({label})"));
+                } else {
+                    eprintln!("Semgrep (native): finished {}", label);
+                }
+            }
+
+            // XML/MASTG manifest rules need decoded text XML (APK stores binary AXML).
+            if let Ok(manifest) = extract_android_manifest_from_apk(&data) {
+                if looks_like_text_xml(&manifest) {
+                    eprintln!(
+                        "Semgrep (native): scanning {}!AndroidManifest.xml…",
+                        path
+                    );
+                    if let Ok(text) = std::str::from_utf8(&manifest) {
+                        all.extend(scan_xml_semgrep(
+                            text,
+                            &format!("{path}!AndroidManifest.xml"),
+                            &rules,
+                        ));
+                    }
+                } else {
+                    eprintln!(
+                        "Semgrep (native): {} embeds binary AndroidManifest.xml (AXML); XML/MASTG manifest rules need a decoded text manifest",
+                        path
+                    );
+                }
+            }
+            // Sibling decoded manifest (e.g. apktool / unpacked APK tree).
+            if let Some(parent) = p.parent() {
+                let sibling = parent.join("AndroidManifest.xml");
+                if sibling.is_file() && sibling != p {
+                    if let Ok(bytes) = fs::read(&sibling) {
+                        if looks_like_text_xml(&bytes) {
+                            eprintln!(
+                                "Semgrep (native): scanning sibling {}…",
+                                sibling.display()
+                            );
+                            if let Ok(text) = std::str::from_utf8(&bytes) {
+                                all.extend(scan_xml_semgrep(
+                                    text,
+                                    &sibling.display().to_string(),
+                                    &rules,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "Semgrep (native) scan: {} rule(s), {} finding(s)",
+            rules.len(),
+            all.len()
+        );
+        for f in &all {
+            let off = f
+                .sink_offset
+                .map(|o| format!(" @ 0x{:x}", o))
+                .unwrap_or_default();
+            println!(
+                "  [{}] {}  {}#{}{}  {}  ({})",
+                f.severity,
+                f.rule_id,
+                f.class_name,
+                f.method_name,
+                off,
+                f.sink_desc,
+                f.match_kind
+            );
+            if !f.message.is_empty() {
+                println!("      {}", f.message.lines().next().unwrap_or(""));
+            }
+        }
+        return Ok(());
+    }
+
+    // Decompile: DEX and/or APK inputs; multi-DEX merged into one output tree.
+    let owned_dexes = load_dexes_from_paths(
+        &args
+            .input
+            .iter()
+            .map(Path::new)
+            .collect::<Vec<_>>(),
+    )
+    .context("load DEX/APK inputs")?;
+    let dex_refs: Vec<&DexFile> = owned_dexes.iter().collect();
+    let mode = parse_decompilation_mode(&args.decompilation_mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let rename_map = build_rename_map(&args, &dex_refs);
+    if let Some(ref save_path) = args.save_mapping {
+        if let Some(ref map) = rename_map {
+            let path = Path::new(save_path);
+            let fmt = mapping_format_from_path(path);
+            save_mapping_file(path, map, fmt)
+                .map_err(|e| anyhow::anyhow!("{}", e))
+                .with_context(|| format!("write mapping {}", save_path))?;
+        } else {
+            eprintln!("warning: --save-mapping ignored (no rename map; use --mapping / --deobf / --rename-*)");
+        }
+    }
     let options = DecompilerOptions {
-        only_package: args.only_package,
+        only_package: args.only_package.clone(),
         exclude: args.exclude.clone(),
         show_bytecode: args.show_bytecode,
+        rename_map,
+        mode,
+        use_debug_names: !args.no_debug_info,
     };
-    let decompiler = Decompiler::with_options(&dex, options.clone());
+    let primary = dex_refs[0];
+    let _ = primary;
+
+    if let Some(ref json_path) = args.export_json {
+        let mut combined = String::from("{\"classes\":[");
+        let mut first = true;
+        for dex in &dex_refs {
+            let d = Decompiler::with_options(dex, options.clone());
+            let part = d
+                .export_json(args.json_bodies)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // Merge class arrays from each DEX.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&part) {
+                if let Some(arr) = v.get("classes").and_then(|c| c.as_array()) {
+                    for c in arr {
+                        if !first {
+                            combined.push(',');
+                        }
+                        first = false;
+                        combined.push_str(&c.to_string());
+                    }
+                }
+            }
+        }
+        combined.push_str("]}");
+        // Pretty-print if possible
+        let pretty = serde_json::from_str::<serde_json::Value>(&combined)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or(combined);
+        fs::write(Path::new(json_path), pretty)
+            .with_context(|| format!("write {}", json_path))?;
+        if args.output_dir.is_none() && args.output.is_none() {
+            return Ok(());
+        }
+    }
 
     if let Some(ref out_dir) = args.output_dir {
         let base_path = Path::new(out_dir);
@@ -611,90 +934,41 @@ fn main() -> Result<()> {
                 .template("[{bar:40.cyan/blue}] {pos}/{len} {msg}")?
                 .progress_chars("=>-"),
         );
-        let included = decompiler
-            .collect_included_classes()
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let total = included.len();
+        let mut total = 0usize;
+        for d in &dex_refs {
+            total += Decompiler::with_options(d, options.clone())
+                .collect_included_classes()
+                .map_err(|e| anyhow::anyhow!("{}", e))?
+                .len();
+        }
         if total == 0 {
             pb.finish_with_message("no classes to decompile");
             return Ok(());
         }
         pb.set_length(total as u64);
         pb.set_message("starting…");
-        // DexFile is not Send (uses Rc), so we share raw bytes and parse once per worker.
-        let data = Arc::new(data);
-        let options = options.clone();
-        let pb_shared = Arc::new(pb);
-        // Writer thread: write files on the fly as they are decompiled.
-        let (tx, rx) = mpsc::channel::<(std::path::PathBuf, String, String)>();
-        let write_error: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
-        let write_error_clone = Arc::clone(&write_error);
-        let pb_writer = Arc::clone(&pb_shared);
-        let writer_handle = thread::spawn(move || {
-            while let Ok((full_dir, file_name, class_java)) = rx.recv() {
-                if write_error_clone.lock().unwrap().is_some() {
-                    continue;
-                }
-                if let Err(e) = fs::create_dir_all(&full_dir)
-                    .with_context(|| format!("create dir {}", full_dir.display()))
-                {
-                    *write_error_clone.lock().unwrap() = Some(e);
-                    continue;
-                }
-                let file_path = full_dir.join(&file_name);
-                if let Err(e) =
-                    fs::write(&file_path, class_java).with_context(|| format!("write {}", file_path.display()))
-                {
-                    *write_error_clone.lock().unwrap() = Some(e);
-                    continue;
-                }
-                pb_writer.inc(1);
+        let pb = Arc::new(pb);
+        let progress = {
+            let pb = Arc::clone(&pb);
+            move |current: usize, total: usize, class_name: &str| {
+                pb.set_length(total as u64);
+                pb.set_position(current as u64);
+                pb.set_message(class_name.to_string());
             }
-        });
-        let tx = Arc::new(tx);
-        // Use more chunks than workers for better load balance (slow classes don't leave others idle).
-        let num_workers = rayon::current_num_threads().max(1);
-        let num_chunks = (num_workers * 4).max(1);
-        let chunk_size = (total + num_chunks - 1) / num_chunks;
-        let chunked: Vec<Vec<(_, String)>> = included
-            .chunks(chunk_size.max(1))
-            .map(|c| c.to_vec())
-            .collect();
-        let results: Vec<Result<()>> = chunked
-            .par_iter()
-            .flat_map(|chunk| {
-                let dex = parse_dex(data.as_ref()).expect("DEX already parsed");
-                let d = Decompiler::with_options(&dex, options.clone());
-                let tx = Arc::clone(&tx);
-                let pb = Arc::clone(&pb_shared);
-                chunk
-                    .iter()
-                    .map(|(class_def, class_name)| {
-                        pb.set_message(class_name.clone());
-                        let java =
-                            d.decompile_class(class_def).map_err(|e| anyhow::anyhow!("{}", e))?;
-                        let (rel_dir, file_name) = class_name_to_path(class_name);
-                        let full_dir = base_path.join(rel_dir);
-                        tx.send((full_dir, file_name, java))
-                            .map_err(|e| anyhow::anyhow!("writer thread dropped: {}", e))?;
-                        Ok(())
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        drop(tx);
-        writer_handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
-        if let Some(e) = write_error.lock().unwrap().take() {
-            return Err(e);
-        }
-        for r in results {
-            r?;
-        }
-        pb_shared.finish_with_message("done");
+        };
+        Decompiler::decompile_dexes_to_dir_parallel(&dex_refs, options, base_path, Some(&progress))
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        pb.finish_with_message(format!("done ({} DEX)", dex_refs.len()));
     } else {
-        let java = decompiler.decompile().context("decompile")?;
+        let mut java = String::new();
+        for (i, dex) in dex_refs.iter().enumerate() {
+            let d = Decompiler::with_options(dex, options.clone());
+            let part = d.decompile().context("decompile")?;
+            if i > 0 && !java.is_empty() && !part.is_empty() {
+                java.push('\n');
+            }
+            java.push_str(&part);
+        }
         if let Some(ref out_path) = args.output {
             fs::write(Path::new(out_path), java).with_context(|| format!("write {}", out_path))?;
         } else {
@@ -707,8 +981,7 @@ fn main() -> Result<()> {
 #[derive(Parser, Debug)]
 #[command(name = "dex-decompile", version, about = "DEX to Java decompiler (pure Rust)")]
 struct Args {
-    /// Input DEX file path(s). May be repeated for multi-DEX apps (e.g. classes.dex, classes2.dex).
-    /// Taint mode searches for CLASS#METHOD in each file in order; decompile uses the first file.
+    /// Input DEX and/or APK/ZIP path(s). APK entries yield all classes*.dex. May be repeated.
     #[arg(short, long, required = true, num_args = 1..)]
     input: Vec<String>,
 
@@ -719,6 +992,43 @@ struct Args {
     /// Output directory: dump all classes with package structure (e.g. out/com/example/MyClass.java)
     #[arg(short = 'd', long = "output-dir")]
     output_dir: Option<String>,
+
+    /// Decompilation mode: restructure (default), simple, or fallback (jadx-like).
+    #[arg(short = 'm', long = "decompilation-mode", default_value = "restructure")]
+    decompilation_mode: String,
+
+    /// Disable use of DEX debug_info for local/parameter names.
+    #[arg(long = "no-debug-info")]
+    no_debug_info: bool,
+
+    /// Auto-rename short / invalid / non-printable class, method, and field names.
+    #[arg(long = "deobf")]
+    deobf: bool,
+
+    /// Min identifier length for --deobf (default 3).
+    #[arg(long = "deobf-min", value_name = "N")]
+    deobf_min: Option<usize>,
+
+    /// Max identifier length for --deobf (default 64).
+    #[arg(long = "deobf-max", value_name = "N")]
+    deobf_max: Option<usize>,
+
+    /// Load a ProGuard/R8, Tiny, or Enigma mapping file (applied before heuristic --deobf).
+    #[arg(long = "mapping", value_name = "FILE")]
+    mapping: Option<String>,
+
+    /// Write the effective rename map (mapping + --deobf + --rename-*) to a mapping file.
+    /// Format is sniffed from the path (`.tiny`, `enigma`, else ProGuard).
+    #[arg(long = "save-mapping", value_name = "FILE")]
+    save_mapping: Option<String>,
+
+    /// Export class/method inventory as JSON to this path (use with --json-bodies for method Java).
+    #[arg(long = "export-json", value_name = "FILE")]
+    export_json: Option<String>,
+
+    /// Include decompiled method bodies in --export-json output.
+    #[arg(long = "json-bodies")]
+    json_bodies: bool,
 
     /// Only decompile classes in this package (e.g. com.example). Classes in subpackages are included.
     #[arg(long = "only-package")]
@@ -758,6 +1068,38 @@ struct Args {
     #[arg(long = "scan-vulns")]
     scan_vulns: bool,
 
+    /// Run native Semgrep-style Android rules (general Android + OWASP MASTG by default; SSA/value-flow + Java/XML patterns).
+    #[arg(long = "scan-semgrep")]
+    scan_semgrep: bool,
+
+    /// Semgrep YAML rules file or directory (default: general.yml + rules/semgrep/android/mastg/).
+    #[arg(long = "semgrep-rules", value_name = "PATH")]
+    semgrep_rules: Option<String>,
+
+    /// Run the Mariana-Trench–style global taint solver (models, sanitizers, propagations, rules, interprocedural traces).
+    #[arg(long = "taint-solve")]
+    taint_solve: bool,
+
+    /// JSON taint config (sources/sinks/propagations/sanitizers/rules). Default: embedded Android models.
+    #[arg(long = "taint-config", value_name = "PATH")]
+    taint_config: Option<String>,
+
+    /// Extra JSON config merged on top of --taint-config / defaults.
+    #[arg(long = "taint-config-extra", value_name = "PATH")]
+    taint_config_extra: Option<String>,
+
+    /// Write taint IssueReport JSON (SAPP-friendly) to this path.
+    #[arg(long = "taint-output", value_name = "PATH")]
+    taint_output: Option<String>,
+
+    /// Max interprocedural fixpoint iterations (default 8).
+    #[arg(long = "taint-max-iterations", value_name = "N")]
+    taint_max_iterations: Option<usize>,
+
+    /// Do not skip android/androidx/kotlin/java framework packages during taint solve.
+    #[arg(long = "taint-include-framework")]
+    taint_include_framework: bool,
+
     /// Emulate method CLASS#METHOD with optional params; print console output and return value to stdout.
     #[arg(long = "emulate", value_name = "CLASS#METHOD")]
     emulate: Option<String>,
@@ -781,4 +1123,24 @@ struct Args {
     /// Emulation step-by-step: after each instruction, print state and wait for Enter before continuing.
     #[arg(long = "emulate-interactive")]
     emulate_interactive: bool,
+
+    /// Rename package in decompiled output (OLD=NEW). May be repeated. E.g. --rename-package com.old=com.new
+    #[arg(long = "rename-package", value_name = "OLD=NEW")]
+    rename_package: Vec<String>,
+
+    /// Rename class in decompiled output (OLD=NEW). May be repeated. OLD/NEW are full class names. E.g. --rename-class com.old.Main=com.new.MainActivity
+    #[arg(long = "rename-class", value_name = "OLD=NEW")]
+    rename_class: Vec<String>,
+
+    /// Rename method (ClassName#methodName=NEW). May be repeated. E.g. --rename-method "com.old.Main#onCreate=myOnCreate"
+    #[arg(long = "rename-method", value_name = "CLASS#METHOD=NEW")]
+    rename_method: Vec<String>,
+
+    /// Rename field (ClassName#fieldName=NEW). May be repeated. E.g. --rename-field "com.old.Main#count=mCount"
+    #[arg(long = "rename-field", value_name = "CLASS#FIELD=NEW")]
+    rename_field: Vec<String>,
+
+    /// Rename variable in a method (ClassName#methodName:oldVar=newVar). May be repeated. E.g. --rename-variable "com.old.Main#onCreate:p0=context"
+    #[arg(long = "rename-variable", value_name = "CLASS#METHOD:OLD=NEW")]
+    rename_variable: Vec<String>,
 }

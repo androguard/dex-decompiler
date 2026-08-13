@@ -138,10 +138,24 @@ pub fn parse_tries_and_handlers(
 /// Try and handler ranges in byte offsets (relative to start of insns, i.e. base_offset=0).
 /// try_start_byte, try_end_byte: [try_start_byte, try_end_byte) is the try range.
 /// handler_ranges: for each (type_idx, start_byte, end_byte), [start_byte, end_byte) is that handler's code.
+///
+/// Handler ends at the next handler / catch-all start. The last handler ends at
+/// `post_handler_end` (continuation after all handlers), not necessarily `code_end`.
 pub fn try_and_handler_byte_ranges(
     try_item: &TryItem,
     handler: &EncodedCatchHandler,
     insns_size_16bit: u32,
+) -> (u32, u32, Vec<(u32, u32, u32)>) {
+    try_and_handler_byte_ranges_with_end(try_item, handler, insns_size_16bit, None)
+}
+
+/// Like [`try_and_handler_byte_ranges`], but `post_handler_end` caps the last handler
+/// (e.g. next try start or method continuation).
+pub fn try_and_handler_byte_ranges_with_end(
+    try_item: &TryItem,
+    handler: &EncodedCatchHandler,
+    insns_size_16bit: u32,
+    post_handler_end: Option<u32>,
 ) -> (u32, u32, Vec<(u32, u32, u32)>) {
     let try_start_byte = try_item.start_addr * 2;
     let try_end_byte = (try_item.start_addr + try_item.insn_count as u32) * 2;
@@ -156,7 +170,12 @@ pub fn try_and_handler_byte_ranges(
     }
     boundaries.sort_unstable();
     boundaries.dedup();
-    boundaries.push(code_end_byte);
+    let last_cap = post_handler_end
+        .unwrap_or(code_end_byte)
+        .min(code_end_byte);
+    // Prefer ending last handler before continuation: if handlers sit after the try,
+    // use max(try_end, last handler start) stretch only to last_cap.
+    boundaries.push(last_cap);
     let mut handler_ranges = Vec::new();
     for type_addr in &handler.handlers {
         let start_byte = type_addr.addr * 2;
@@ -164,10 +183,72 @@ pub fn try_and_handler_byte_ranges(
             .iter()
             .find(|&&b| b > start_byte)
             .copied()
-            .unwrap_or(code_end_byte);
+            .unwrap_or(last_cap);
         handler_ranges.push((type_addr.type_idx, start_byte, end_byte));
     }
     (try_start_byte, try_end_byte, handler_ranges)
+}
+
+/// Catch-all handler byte range `[start, end)`.
+pub fn catch_all_byte_range(
+    handler: &EncodedCatchHandler,
+    typed_ranges: &[(u32, u32, u32)],
+    insns_size_16bit: u32,
+    post_handler_end: Option<u32>,
+) -> Option<(u32, u32)> {
+    let addr = handler.catch_all_addr?;
+    let start = addr * 2;
+    let code_end = insns_size_16bit * 2;
+    let last_cap = post_handler_end.unwrap_or(code_end).min(code_end);
+    let mut ends: Vec<u32> = typed_ranges.iter().map(|(_, s, _)| *s).collect();
+    ends.push(last_cap);
+    ends.sort_unstable();
+    let end = ends.into_iter().find(|b| *b > start).unwrap_or(last_cap);
+    Some((start, end))
+}
+
+/// True if catch-all body looks like a finally (cleanup + rethrow), not a real Throwable catch.
+pub fn looks_like_finally(handler_java: &str) -> bool {
+    let t = handler_java.to_ascii_lowercase();
+    let trimmed = handler_java.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    // Explicit exception handling → not finally.
+    let handles = t.contains("printstacktrace")
+        || t.contains("log(")
+        || t.contains("logger.")
+        || t.contains("system.err")
+        || t.contains("system.out")
+        || t.contains("instanceof ")
+        || (t.contains("return ") && (t.contains(" e") || t.contains("(e") || t.contains("= e")));
+    if handles {
+        return false;
+    }
+
+    let has_throw = t.contains("throw ") || t.contains("throw;");
+    let uses_exception =
+        t.contains(" e.") || t.contains("(e)") || t.contains(" e)") || t.contains("= e;");
+
+    // Cleanup-only patterns even without rethrow, when exception local unused.
+    let cleanup = t.contains(".close(")
+        || t.contains(".recycle(")
+        || t.contains(".unlock(")
+        || t.contains(".disconnect(")
+        || t.contains(".release(")
+        || t.contains(".endtransaction(")
+        || t.contains("monitor-exit")
+        || t.contains("finally");
+
+    if has_throw {
+        return true;
+    }
+    if cleanup && !uses_exception {
+        return true;
+    }
+    // Classic heuristic: no meaningful use of the exception object.
+    !uses_exception
 }
 
 /// Pairs of (try_item, its encoded_catch_handler) for emission.
@@ -216,7 +297,38 @@ pub fn try_handler_pairs(
 
 #[cfg(test)]
 mod tests {
-    use super::{EncodedCatchHandler, EncodedTypeAddr, TryItem, try_and_handler_byte_ranges};
+    use super::{
+        EncodedCatchHandler, EncodedTypeAddr, TryItem, looks_like_finally,
+        try_and_handler_byte_ranges,
+    };
+
+    #[test]
+    fn looks_like_finally_rethrow() {
+        assert!(looks_like_finally("throw th;\n"));
+        assert!(looks_like_finally("    throw e;\n"));
+    }
+
+    #[test]
+    fn looks_like_finally_cleanup_without_throw() {
+        assert!(looks_like_finally("    r.close();\n"));
+        assert!(looks_like_finally(
+            "    if (r != null) {\n        r.close();\n    }\n"
+        ));
+        assert!(looks_like_finally("    lock.unlock();\n"));
+        assert!(looks_like_finally(
+            "    cursor.close();\n    db.endTransaction();\n"
+        ));
+    }
+
+    #[test]
+    fn looks_like_finally_not_when_handling() {
+        assert!(!looks_like_finally("    e.printStackTrace();\n"));
+        assert!(!looks_like_finally("    log(e);\n"));
+        assert!(!looks_like_finally(
+            "    if (e instanceof IOException) {\n        return;\n    }\n"
+        ));
+        assert!(!looks_like_finally("    return e.getMessage();\n"));
+    }
 
     #[test]
     fn try_and_handler_byte_ranges_try_from_zero() {

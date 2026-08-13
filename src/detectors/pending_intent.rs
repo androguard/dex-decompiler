@@ -220,6 +220,7 @@ mod tests {
             rw_map,
             api_return_sources,
             invoke_method_map,
+            insn_at: HashMap::new(),
         }
     }
 
@@ -263,6 +264,7 @@ mod tests {
             rw_map,
             api_return_sources: vec![((4, 0), "some.Other.method".to_string())],
             invoke_method_map: HashMap::new(),
+            insn_at: HashMap::new(),
         };
         let findings = scan_pending_intents(&owned, "com.example.Foo", "bar");
         assert!(findings.is_empty());

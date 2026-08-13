@@ -28,11 +28,11 @@ fn test_decompiler_return_value() {
     );
 }
 
-/// if-eqz v0,+3; goto +2; return-void; return-void -> if/else with two returns.
+/// if-eqz v0,+4; goto +2; return-void; return-void -> if/else with two returns.
 #[test]
 fn test_decompiler_if_else_pattern() {
     let bytecode: &[u8] = &[
-        0x38, 0x00, 0x03, 0x00, // if-eqz v0, +3 -> target byte 8
+        0x38, 0x00, 0x04, 0x00, // if-eqz v0, +4 -> target byte 8
         0x28, 0x02,             // goto +2 -> target byte 8
         0x0e, 0x00,             // return-void at 6
         0x0e, 0x00,             // return-void at 8
@@ -53,8 +53,8 @@ fn test_decompiler_if_else_pattern() {
 fn test_decompiler_while_loop_pattern() {
     let bytecode: &[u8] = &[
         0x12, 0x00,             // const/4 v0, 0
-        0x38, 0x00, 0x04, 0x00, // if-eqz v0, +4 -> target 12
-        0x28, 0xfd,             // goto -3 -> target 2
+        0x38, 0x00, 0x05, 0x00, // if-eqz v0, +5 -> target 12
+        0x28, 0xfe,             // goto -2 -> target 2
         0x00, 0x00, 0x00, 0x00, // nop, nop
         0x0e, 0x00,             // return-void at 12
     ];
@@ -66,6 +66,7 @@ fn test_decompiler_while_loop_pattern() {
         java.contains("while ("),
         "decompiled loop should contain 'while (' (either while (true) or while (!(cond)))"
     );
+    eprintln!("WHILE JAVA:\n{java}");
     assert!(
         java.contains("continue;"),
         "loop with back-edge should emit 'continue;'"
@@ -78,14 +79,14 @@ fn test_decompiler_while_loop_pattern() {
 #[test]
 fn test_decompiler_loop_exit_path_two_blocks() {
     // 0: const/4 v0, 0
-    // 2: if-eqz v0, +4  -> target 12 (return block)
+    // 2: if-eqz v0, +5  -> target 12 (return block)
     // 6: goto -2        -> back to 2
     // 8: nop
     // 10: const/4 v0, 1   <- exit block 1 (must be emitted)
     // 12: return v0      <- exit block 2
     let bytecode: &[u8] = &[
         0x12, 0x00,             // const/4 v0, 0
-        0x38, 0x00, 0x04, 0x00, // if-eqz v0, +4 -> target 2+2+8=12
+        0x38, 0x00, 0x05, 0x00, // if-eqz v0, +5 -> target 12
         0x28, 0xfe,             // goto -2 -> target 2
         0x00, 0x00,             // nop
         0x12, 0x01,             // const/4 v0, 1  (exit path block 1)
@@ -109,7 +110,7 @@ fn test_decompiler_loop_exit_path_two_blocks() {
 /// When the region tree is Seq([Block(init), Loop {...}]) with init/update pattern we emit for (...).
 #[test]
 fn test_decompiler_for_loop_pattern() {
-    // 0: const/4 v0, 0; 2: if-eqz v0, +6 (exit); 6: add-int/lit8 v0,v0,1; 10: goto -4 (back); 14: return
+    // 0: const/4 v0, 0; 2: if-eqz v0, +6 (exit at 14); 6: add-int/lit8 v0,v0,1; 10: goto -4 (back); 14: return
     let bytecode: &[u8] = &[
         0x12, 0x00,             // const/4 v0, 0
         0x38, 0x00, 0x06, 0x00, // if-eqz v0, +6 (target 14)

@@ -73,7 +73,8 @@ A **DEX to Java decompiler** in pure Rust. It parses DEX files, disassembles Dal
 - **Anonymous Thread inlining**: Pattern `X.<init>(args);` + `X.start();` → inlined `new Thread() { public void run() { … } }.start();` with inner `run()` body and capture replacement (e.g. `val$o` → outer variable); **synchronized** blocks from monitor-enter/exit; unreachable exception-handler lines after `return;` stripped.
 - **Library API**: Parse DEX, decompile classes/methods, **find_method**, get **per-method bytecode and CFG** (nodes/edges) for visualization or tooling.
 - **Value flow / tainting**: Reaching definitions, def-use/use-def, propagation from seed or from API sources (e.g. `getLastLocation`).
-- **Vulnerability detectors**: PendingIntent scan (`--scan-pending-intent`), full scan (`--scan-vulns`: intent spoofing, RCE, insecure logging, SQL injection, WebView, hardcoded-secrets, IPC).
+- **Vulnerability detectors**: PendingIntent scan (`--scan-pending-intent`), full scan (`--scan-vulns`: intent spoofing, RCE, insecure logging, SQL injection, WebView, hardcoded-secrets, IPC), **native Semgrep** (`--scan-semgrep`: general Android rules + [OWASP MASTG](https://github.com/OWASP/mastg/tree/master/rules) via SSA/value-flow + Java/XML patterns).
+- **Global taint solver (Mariana Trench–style)**: JSON models (sources / sinks / propagations / sanitizers), rules by kind, call-graph + interprocedural fixpoint, traces, JSON issue report (`--taint-solve`). Includes a port of MT’s **74 end-to-end cases** under `tests/data/mariana_trench/` (`cargo test --test mariana_trench_e2e`).
 - **Progress**: With `--output-dir`, progress bar shows current class being decompiled.
 
 ## Simplifications
@@ -126,8 +127,21 @@ This builds (if needed) and runs the decompiler. See [Usage](#usage) below for m
 # Decompile a DEX file to stdout
 cargo run --bin dex-decompile -- -i classes.dex
 
+# Decompile an APK (extracts all classes*.dex) into a package tree
+cargo run --release --bin dex-decompile -- -i app.apk -d out
+
+# Multi-DEX merge (or multiple -i DEX/APK paths) into one tree
+cargo run --release --bin dex-decompile -- -i classes.dex -i classes2.dex -d out
+
 # Decompile to a single Java file
 cargo run --bin dex-decompile -- -i classes.dex -o Main.java
+
+# Modes (jadx-like): restructure (default), simple, fallback
+cargo run --bin dex-decompile -- -i app.apk -d out --decompilation-mode fallback
+
+# Auto-deobfuscate short/invalid names; use DEX debug_info names when present
+cargo run --bin dex-decompile -- -i app.apk -d out --deobf
+cargo run --bin dex-decompile -- -i app.apk -d out --no-debug-info
 
 # Decompile to a directory with package structure (e.g. out/com/example/MyClass.java)
 cargo run --bin dex-decompile -- -i classes.dex -d out
@@ -142,6 +156,15 @@ cargo run --bin dex-decompile -- -i classes.dex -d out --only-package com.exampl
 # Exclude packages (may be repeated; supports trailing . or .*)
 cargo run --bin dex-decompile -- -i classes.dex -d out --exclude android. --exclude kotlin.
 
+# Rename package, class, method, field, or variables in the decompiled output (may be repeated)
+cargo run --bin dex-decompile -- -i classes.dex -d out \
+  --rename-package com.old=com.new \
+  --rename-class "com.old.Main=com.new.MainActivity" \
+  --rename-method "com.old.Main#onCreate=myOnCreate" \
+  --rename-field "com.old.Main#count=mCount" \
+  --rename-variable "com.old.Main#onCreate:p0=context" \
+  --rename-variable "com.old.Main#onCreate:result=out"
+
 # Multi-DEX: taint mode searches for CLASS#METHOD in each file in order
 cargo run --bin dex-decompile -- -i classes.dex -i classes2.dex --taint-method "com.example.Main#onCreate" --taint-api getLastLocation
 
@@ -150,13 +173,21 @@ cargo run --bin dex-decompile -- -i classes.dex --taint-method "com.example.Main
 
 # Taint returns of Android API methods (e.g. getLastLocation)
 cargo run --bin dex-decompile -- -i app.dex --taint-method "com.example.Main#onCreate" --taint-api getLastLocation --taint-api getCurrentLocation
+
+# Native Semgrep (general Android + OWASP MASTG rules; SSA/value-flow + Java/XML patterns, no Semgrep binary)
+cargo run --release --bin dex-decompile -- -i classes.dex --scan-semgrep
+cargo run --release --bin dex-decompile -- -i app.apk --scan-semgrep --semgrep-rules rules/semgrep/android/general.yml
+cargo run --release --bin dex-decompile -- -i AndroidManifest.xml --scan-semgrep --semgrep-rules rules/semgrep/android/mastg
 ```
 
 | Option | Short | Description |
 |--------|--------|-------------|
-| `--input` | `-i` | Input DEX file path(s). May be repeated for **multi-DEX** apps (e.g. `classes.dex`, `classes2.dex`). Taint mode searches for `CLASS#METHOD` in each file in order; decompile uses the first file. |
+| `--input` | `-i` | Input **DEX and/or APK/ZIP** path(s). APK yields all `classes*.dex`. Decompile merges multi-DEX into one tree. |
 | `--output` | `-o` | Output Java file (single file); default: stdout. |
 | `--output-dir` | `-d` | Output directory: one `.java` per class under package structure. Decompilation is parallelized for large DEX files. |
+| `--decompilation-mode` | `-m` | `restructure` (default), `simple`, or `fallback`. |
+| `--deobf` | | Auto-rename short / invalid / non-printable identifiers. |
+| `--no-debug-info` | | Do not use DEX `debug_info` for local/parameter names. |
 | `--only-package` | | Only decompile classes in this package (e.g. `com.example`). Subpackages included. |
 | `--exclude` | | Exclude classes in this package (e.g. `android.`). Repeatable. |
 | `--taint-method` | | Data flow: method as `CLASS#METHOD` (e.g. `com.example.Main#onCreate`). Use with `--taint-offset` and `--taint-reg`, or with `--taint-api`. |
@@ -166,8 +197,47 @@ cargo run --bin dex-decompile -- -i app.dex --taint-method "com.example.Main#onC
 | `--scan-pending-intent` | | Scan all methods for PendingIntent creation sites (PITracker-like). Reports whether the base Intent has modifiable fields set and whether the PendingIntent flows to a dangerous sink (e.g. Notification). See [PITracker (WiSec'22)](https://diaowenrui.github.io/paper/wisec22-zhang.pdf). |
 | `--show-bytecode` | | Emit raw DEX instructions as comments before each method body and on statement lines (for debugging). Works with both stdout and `-d`/`--output-dir`: written `.java` files will contain the bytecode comments. |
 | `--scan-vulns` | | Run all vulnerability detectors on every method: intent spoofing, RCE (dynamic code loading), insecure logging, SQL injection, WebView (unsafe URL + JavaScriptInterface), hardcoded-secrets review, IPC intent validation. Optional: use with `--taint-api` to add logging sources. |
+| `--scan-semgrep` | | Native Semgrep-style Android rules (general Android + [OWASP MASTG](https://github.com/OWASP/mastg/tree/master/rules) by default). Uses SSA/value-flow and Java/XML pattern matching; no external Semgrep install. |
+| `--semgrep-rules` | | Path to Semgrep YAML file or directory. Default: `rules/semgrep/android/general.yml` + `rules/semgrep/android/mastg/`. |
+| `--taint-solve` | | Run the Mariana-Trench–style global taint solver (models, sanitizers, TITO propagations, rules, interprocedural traces). |
+| `--taint-config` | | JSON config path (sources/sinks/propagations/sanitizers/rules). Default: embedded Android models. |
+| `--taint-config-extra` | | Extra JSON merged on top of the base config. |
+| `--taint-output` | | Write `IssueReport` JSON (tool/stats/issues with traces). |
+| `--taint-max-iterations` | | Max interprocedural fixpoint iterations (default 8). |
+| `--taint-include-framework` | | Also analyze android/androidx/java/kotlin packages (off by default). |
+| `--rename-package` | | Rename package in output (`OLD=NEW`). Repeatable. |
+| `--rename-class` | | Rename class (`OLD=NEW`, full class names). Repeatable. |
+| `--rename-method` | | Rename method (`ClassName#methodName=NEW`). Repeatable. |
+| `--rename-field` | | Rename field (`ClassName#fieldName=NEW`). Repeatable. |
+| `--rename-variable` | | Rename variable in a method (`ClassName#methodName:oldVar=newVar`). Repeatable. |
 
-When `--output-dir` is set, progress is shown per class. When `--taint-method` is set with either (`--taint-offset` and `--taint-reg`) or `--taint-api`, the tool prints value-flow (reads/writes) and exits without decompiling. When `--scan-pending-intent` is set, the tool scans every method for PendingIntent creation and prints a risk report. When `--scan-vulns` is set, the tool runs all detectors and prints one line per finding (category, class#method, sink offset, sink method). When both `-o` and `-d` are omitted and neither taint nor scan is used, decompiled Java is printed to stdout.
+When `--output-dir` is set, progress is shown per class. When `--taint-method` is set with either (`--taint-offset` and `--taint-reg`) or `--taint-api`, the tool prints value-flow (reads/writes) and exits without decompiling. When `--scan-pending-intent` is set, the tool scans every method for PendingIntent creation and prints a risk report. When `--taint-solve` is set, the global taint solver runs and optionally writes JSON via `--taint-output`. When `--scan-vulns` is set, the tool runs all detectors and prints one line per finding (category, class#method, sink offset, sink method). When `--scan-semgrep` is set, native Semgrep-style Android rules (general Android + OWASP MASTG by default) run over every method via SSA/value-flow, plus XML rules on plaintext manifests. When both `-o` and `-d` are omitted and neither taint nor scan is used, decompiled Java is printed to stdout.
+
+### Global taint solver (Mariana Trench–style)
+
+`dex-decompiler` includes its own taint solver inspired by [Mariana Trench](https://mariana-tren.ch/):
+
+| MT concept | Implementation |
+|---|---|
+| Sources / sinks / kinds | JSON models (`TaintConfig`) |
+| Propagations (TITO) | Modeled passthroughs (e.g. `StringBuilder.append`) |
+| Sanitizers | Clear kinds at matching APIs |
+| Rules | `source_kind` → `sink_kind` issue generation |
+| Call graph | Built from invoke sites across methods / multi-DEX |
+| Interprocedural | Fixpoint over parameter / return summaries |
+| Traces / issues | `Issue` + `TraceFrame`; JSON `IssueReport` |
+
+```bash
+# Embedded Android defaults
+cargo run --release -- -i classes.dex --taint-solve --taint-output issues.json
+
+# Custom models
+cargo run --release -- -i classes.dex --taint-solve \
+  --taint-config configuration/my_models.json \
+  --taint-output issues.json
+```
+
+Library entry points: `default_config()`, `solve_dex` / `solve_dexes`, `write_issues_json`.
 
 ### Emulator
 
@@ -269,6 +339,34 @@ let (rows, nodes, edges) = decompiler.get_method_bytecode_and_cfg(encoded)?;
 // edges: Vec<CfgEdgeInfo> { from_id, to_id }
 ```
 
+### Rename API
+
+You can rename **package**, **class**, **method**, **field**, and **local variables** in the decompiled output by passing a `RenameMap` in `DecompilerOptions`. Keys for method/field/variable use the format `ClassName#memberName` (e.g. `com.example.Main#onCreate`). Variable renames are per method: key `ClassName#methodName` → map of old var name (e.g. `p0`, `result`, `i`) to new name.
+
+```rust
+use dex_decompiler::{parse_dex, Decompiler, DecompilerOptions, RenameMap};
+use std::collections::HashMap;
+
+let dex = parse_dex(&data)?;
+let mut rename = RenameMap::default();
+rename.package.insert("com.old".into(), "com.new".into());
+rename.class.insert("com.old.Main".into(), "com.new.MainActivity".into());
+rename.method.insert("com.old.Main#onCreate".into(), "myOnCreate".into());
+rename.field.insert("com.old.Main#count".into(), "mCount".into());
+let mut var_map = HashMap::new();
+var_map.insert("p0".into(), "context".into());
+rename.variable.insert("com.old.Main#onCreate".into(), var_map);
+
+let options = DecompilerOptions {
+    rename_map: Some(rename),
+    ..Default::default()
+};
+let decompiler = Decompiler::with_options(&dex, options);
+let java = decompiler.decompile()?;
+```
+
+When writing to a directory (`decompile_to_dir`), the output path uses the **renamed** class name (e.g. `com/new/MainActivity.java`).
+
 ### Value flow / data tainting
 
 To see **where a specific value is read/written** in a method (data tainting), use value-flow analysis. The tracker follows the value when it is **returned**, **passed to a function** (invoke argument), or copied through moves:
@@ -339,6 +437,15 @@ java_src = dex.decompile()
 dex.decompile_to_dir("out/")
 method_java = dex.decompile_method("com.example.MainActivity", "onCreate")
 bytecode_rows, cfg_nodes, cfg_edges = dex.get_method_bytecode_and_cfg("com.example.MainActivity", "onCreate")
+
+# Decompile with renames (package, class, method, field, variables)
+java_renamed = dex.decompile_with_renames(
+    package_renames={"com.example": "com.myname"},
+    class_renames={"com.example.Main": "com.myname.MainActivity"},
+    method_renames={"com.example.Main#onCreate": "myOnCreate"},
+    field_renames={"com.example.Main#count": "mCount"},
+    variable_renames={"com.example.Main#onCreate": {"p0": "context", "result": "out"}},
+)
 ```
 
 See [dex-decompiler-py/README.md](dex-decompiler-py/README.md) for full API and installation options.
@@ -352,6 +459,7 @@ Tests mirror [androguard decompiler tests](https://github.com/androguard/androgu
 - **Control flow**: `tests/decompiler/control_flow.rs` – return, if/else, while, loop exit.
 - **Equivalence**: `tests/decompiler/equivalence.rs` – parse-fail, minimal DEX, try/catch comment, switch packed cases. Optional tests for simplification and arrays run only if androguard test data exists under `tests/data/APK/` (Test.dex, FillArrays.dex).
 - **Value flow / tainting**: `src/decompile/value_flow.rs` (unit) and `tests/decompiler/value_flow.rs` (integration) – reaching definitions, def-use/use-def, propagation from a seed (return, pass to function, transitive copies, complex flows: param+return, callee return→return).
+- **Renames**: `tests/decompiler/renames.rs` – package, class, method, field, and variable renames via `RenameMap` and `decompile_with_renames` (Python).
 
 ```bash
 cargo test
@@ -364,6 +472,7 @@ cargo test -- --ignored   # with fixture DEXs
 - [Dalvik bytecode](https://source.android.com/docs/core/runtime/dalvik-bytecode)
 - [androguard decompiler](https://github.com/androguard/androguard/tree/master/androguard/decompiler)
 - [jadx](https://github.com/skylot/jadx/tree/master/jadx-core/src/main/java/jadx)
+- [jadx gap plan](docs/JADX_GAP_PLAN.md) — living backlog vs jadx (P0–P2)
 
 ## License
 

@@ -11,9 +11,10 @@ pub fn scan_ipc_intent_validation(
 ) -> Vec<VulnFinding> {
     scan_intent_spoofing(owned, class_name, method_name)
         .into_iter()
-        .map(|f| VulnFinding {
-            category: "ipc_intent_validation".to_string(),
-            ..f
+        .map(|mut f| {
+            f.category = "ipc_intent_validation".to_string();
+            f.refresh_category_meta();
+            f
         })
         .collect()
 }

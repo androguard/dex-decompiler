@@ -10,12 +10,19 @@ const INTENT_SOURCES: &[&str] = &[
     "getDataString",
     "getExtras",
     "getCharSequenceExtra",
+    "getParcelableExtra",
+    "getSerializableExtra",
+    "getQueryParameter",
+    "getLastPathSegment",
 ];
 const INTENT_SINKS: &[&str] = &[
     "startActivity",
     "startActivityForResult",
     "setResult",
     "sendBroadcast",
+    "sendOrderedBroadcast",
+    "startService",
+    "bindService",
 ];
 
 pub fn scan_intent_spoofing(

@@ -35,6 +35,12 @@ pub enum Stmt {
     Assign { dst: VarId, rhs: Expr, comment: Option<String> },
     Expr { expr: Expr, comment: Option<String> },
     Return { value: Option<Expr>, comment: Option<String> },
+    /// SSA φ-node (not emitted as Java; stripped after renaming).
+    Phi {
+        dst: VarId,
+        /// (predecessor block id, value from that predecessor)
+        incomings: Vec<(usize, VarId)>,
+    },
     Raw(String),
 }
 
@@ -108,6 +114,7 @@ impl Stmt {
                 };
                 append_comment(base, comment.as_deref())
             }
+            Stmt::Phi { .. } => String::new(),
             Stmt::Raw(s) => names
                 .map(|n| substitute_names_in_text(s, n))
                 .unwrap_or_else(|| s.clone()),
@@ -146,6 +153,9 @@ fn substitute_names_in_text(s: &str, names: &HashMap<VarId, String>) -> String {
             };
             let vid = VarId::new(reg, ver);
             if let Some(name) = names.get(&vid) {
+                out.push_str(name);
+            } else if let Some(name) = names.iter().find(|(k, _)| k.reg == reg).map(|(_, n)| n.as_str()) {
+                // Fallback: any SSA version of this register (avoids leftover vN / wrong localN).
                 out.push_str(name);
             } else {
                 out.push_str(&s[start..i]);

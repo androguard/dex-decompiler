@@ -41,20 +41,27 @@ pub fn region_is_empty(region: &Region) -> bool {
     }
 }
 
-/// Like region_is_empty but uses the CFG to treat a Block as empty when that block has no instructions.
-/// This allows flipping "if (cond) { } else { body }" to "if (!cond) { body }" when the then-branch is an empty block.
+/// Like region_is_empty but uses the CFG to treat a Block as empty when that block has no
+/// substantive instructions (or only a trailing goto). This allows flipping
+/// `if (cond) { } else { body }` / goto-only skip targets to `if (!cond) { body }`.
 pub fn region_is_empty_with_cfg(region: &Region, cfg: &MethodCfg) -> bool {
     match region {
-        Region::Block(bid) => cfg
-            .blocks
-            .get(*bid)
-            .map(|b| b.instruction_offsets.is_empty())
-            .unwrap_or(false),
+        Region::Block(bid) => cfg.blocks.get(*bid).map(block_is_effectively_empty).unwrap_or(false),
         Region::Seq(children) => {
             children.is_empty() || children.iter().all(|c| region_is_empty_with_cfg(c, cfg))
         }
         Region::If { .. } | Region::Loop { .. } | Region::Switch { .. } => false,
     }
+}
+
+/// True when a CFG block has no real work: no instructions, or only the terminating goto.
+fn block_is_effectively_empty(b: &crate::decompile::cfg::CfgBlock) -> bool {
+    if b.instruction_offsets.is_empty() {
+        return true;
+    }
+    // `if-eqz` skip targets are often a lone `goto` to the join — treat as empty so we can
+    // emit `if (x != null) { body }` instead of `if (x == null) { goto } else { body }`.
+    matches!(b.end, BlockEnd::Goto(_)) && b.instruction_offsets.len() <= 1
 }
 
 /// Returns true if the region contains a Loop (at any depth).
@@ -90,6 +97,124 @@ pub fn loop_body_break_pattern(body: &Region, header: BlockId) -> Option<(&str, 
             }
         }
         _ => None,
+    }
+}
+
+/// Unwrap a region that is a single `If`, or a `Seq` containing exactly one non-empty child that is an `If`.
+/// Used for emit-time `} else if (` instead of `} else { if (`.
+pub fn as_single_if(region: &Region) -> Option<(&str, &Region, &Region)> {
+    match region {
+        Region::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Some((condition.as_str(), then_branch.as_ref(), else_branch.as_ref())),
+        Region::Seq(children) => {
+            let mut found: Option<&Region> = None;
+            for c in children {
+                if region_is_empty(c) {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(c);
+            }
+            found.and_then(as_single_if)
+        }
+        _ => None,
+    }
+}
+
+/// Do-while pattern: loop body is `Seq([Block(header), …middle…, If { condition, then, else }])`
+/// with trailing exit-if (empty else = back-edge / continue).
+/// Returns `(exit_condition, do_body, then_branch)` for
+/// `do { do_body } while (!exit_condition); then_branch`.
+///
+/// Prefers do-while whenever there is real middle body (len ≥ 3). Classic while
+/// `Seq([Block(header), If])` is handled separately by [`loop_body_break_pattern`].
+pub fn loop_body_do_while_pattern(
+    body: &Region,
+    header: BlockId,
+) -> Option<(&str, Region, &Region)> {
+    let Region::Seq(children) = body else {
+        return None;
+    };
+    if children.len() < 3 {
+        return None;
+    }
+    match &children[0] {
+        Region::Block(bid) if *bid == header => {}
+        _ => return None,
+    }
+    let last = children.last()?;
+    let Region::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = last
+    else {
+        return None;
+    };
+    // Empty else = fall into loop back-edge; or else is empty-ish continue.
+    if !region_is_empty(else_branch) {
+        // Allow else that is only an empty Seq / empty Block placeholder.
+        match else_branch.as_ref() {
+            Region::Seq(c) if c.iter().all(region_is_empty) => {}
+            Region::Block(_) => return None,
+            _ => return None,
+        }
+    }
+    let do_body = Region::Seq(children[..children.len() - 1].to_vec());
+    Some((condition.as_str(), do_body, then_branch.as_ref()))
+}
+
+/// Looser do-while: last region in Seq is exit-If with empty else, and header appears
+/// as first block somewhere in the prefix (handles nested Seq wrappers).
+pub fn loop_body_do_while_loose(body: &Region, header: BlockId) -> Option<(&str, Region, &Region)> {
+    if let Some(r) = loop_body_do_while_pattern(body, header) {
+        return Some(r);
+    }
+    let Region::Seq(children) = body else {
+        return None;
+    };
+    if children.len() < 2 {
+        return None;
+    }
+    let last = children.last()?;
+    let Region::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = last
+    else {
+        return None;
+    };
+    if !region_is_empty(else_branch) {
+        return None;
+    }
+    let prefix = Region::Seq(children[..children.len() - 1].to_vec());
+    // Header must be reachable as first block of prefix.
+    if first_block(&prefix) != Some(header) && !region_contains_block(&prefix, header) {
+        return None;
+    }
+    Some((condition.as_str(), prefix, then_branch.as_ref()))
+}
+
+fn region_contains_block(region: &Region, id: BlockId) -> bool {
+    match region {
+        Region::Block(b) => *b == id,
+        Region::Seq(c) => c.iter().any(|r| region_contains_block(r, id)),
+        Region::If {
+            then_branch,
+            else_branch,
+            ..
+        } => region_contains_block(then_branch, id) || region_contains_block(else_branch, id),
+        Region::Loop { body, header, .. } => *header == id || region_contains_block(body, id),
+        Region::Switch { cases, default, .. } => {
+            cases.iter().any(|(_, r)| region_contains_block(r, id))
+                || region_contains_block(default, id)
+        }
     }
 }
 
@@ -257,6 +382,20 @@ fn build_regions_rec(
             branch_target,
             fall_through,
         } => {
+            // Classic if-eqz / if-nez skip: fall-through body rejoins at branch_target
+            // (e.g. `if (url == null) skip; setLoginUrl();` then shared `new Intent()`).
+            // Prefer this over expanding then_start backward, which can pull the fall-through
+            // body into the taken branch and drop the shared tail into the wrong arm.
+            // Only when fall-through has real work — a lone `goto join` is not a skip-body.
+            let fall_block = &cfg.blocks[*fall_through];
+            let fall_has_work = !block_is_effectively_empty(fall_block);
+            let skip_join = fall_has_work
+                && *branch_target != *fall_through
+                && loop_header != Some(*branch_target)
+                && !emitted.contains(branch_target)
+                && cfg.reachable_from(*fall_through, *branch_target, loop_header)
+                && !cfg.reachable_from(*branch_target, *fall_through, loop_header);
+
             // If branch_target is the loop header (back-edge), don't pull in fall-through predecessors
             // or we'd steal the loop body (e.g. in-loop Swap) into the then branch and leave else empty.
             // Otherwise, if some block falls through to branch_target (e.g. Swap → return), start
@@ -268,22 +407,68 @@ fn build_regions_rec(
                     .into_iter()
                     .find(|&bid| {
                         !emitted.contains(&bid)
+                            && bid != *fall_through
                             && !cfg.reachable_from(*fall_through, bid, loop_header)
                     })
                     .unwrap_or(*branch_target)
             };
-            // Inside a loop, build else (loop body) before then so the body blocks (e.g. in-loop Swap)
-            // are claimed by else_branch, not stolen by then_start when a body block falls through to then target.
-            let (then_r, else_r) = if loop_header.is_some() {
-                let else_r = build_regions_rec(cfg, *fall_through, loop_header, emitted, allowed)
-                    .unwrap_or_else(|| Region::Seq(vec![]));
-                let then_r = build_regions_rec(cfg, then_start, loop_header, emitted, allowed)
-                    .unwrap_or_else(|| Region::Seq(vec![]));
-                (then_r, else_r)
+
+            // Diamond: else reaches join and then does not reach else → join is shared tail.
+            // Prefer skip_join (branch_target) when the fall-through reaches the taken target.
+            let diamond_join = if skip_join {
+
+                Some(*branch_target)
+            } else if then_start != *fall_through
+                && !emitted.contains(&then_start)
+                && cfg.reachable_from(*fall_through, then_start, loop_header)
+                && !cfg.reachable_from(then_start, *fall_through, loop_header)
+            {
+                Some(then_start)
             } else {
-                let then_r = build_regions_rec(cfg, then_start, loop_header, emitted, allowed)
-                    .unwrap_or_else(|| Region::Seq(vec![]));
+                None
+            };
+
+            if let Some(join_id) = diamond_join {
+                let stop_at: HashSet<BlockId> = std::iter::once(join_id).collect();
+                let else_r = build_regions_rec_until(
+                    cfg,
+                    *fall_through,
+                    &stop_at,
+                    loop_header,
+                    emitted,
+                    allowed,
+                )
+                .unwrap_or_else(|| Region::Seq(vec![]));
+                let then_r = Region::Seq(vec![]);
+                // Emit the join block alone. Do NOT follow its goto/fall-through here —
+                // those successors belong to the enclosing region (e.g. the next else-if arm).
+                // Following the join was stealing later arms and leaving this if's body empty.
+                let after = if emitted.contains(&join_id) {
+                    Region::Seq(vec![])
+                } else if block_is_effectively_empty(&cfg.blocks[join_id]) {
+                    emitted.insert(join_id);
+                    Region::Seq(vec![])
+                } else {
+                    emitted.insert(join_id);
+                    Region::Block(join_id)
+                };
+                return Some(Region::Seq(vec![
+                    block_region,
+                    Region::If {
+                        condition: condition.clone(),
+                        then_branch: Box::new(then_r),
+                        else_branch: Box::new(else_r),
+                    },
+                    after,
+                ]));
+            }
+
+            // Prefer fall-through (else) before branch (then) so shared tails aren't
+            // claimed by the taken branch first. Matches typical if-eqz skip layouts.
+            let (then_r, else_r) = {
                 let else_r = build_regions_rec(cfg, *fall_through, loop_header, emitted, allowed)
+                    .unwrap_or_else(|| Region::Seq(vec![]));
+                let then_r = build_regions_rec(cfg, then_start, loop_header, emitted, allowed)
                     .unwrap_or_else(|| Region::Seq(vec![]));
                 (then_r, else_r)
             };
@@ -301,7 +486,11 @@ fn build_regions_rec(
             cases,
             default_block,
         } => {
-            let stop_at: HashSet<BlockId> = std::iter::once(*default_block).collect();
+            let stop_at: HashSet<BlockId> = cases
+                .iter()
+                .map(|(_, bid)| *bid)
+                .chain(std::iter::once(*default_block))
+                .collect();
             let case_regions: Vec<(i32, Box<Region>)> = cases
                 .iter()
                 .filter_map(|(val, bid)| {
@@ -379,17 +568,83 @@ fn build_regions_rec_until(
             branch_target,
             fall_through,
         } => {
-            let then_start = *branch_target;
-            let then_r = if stop_at.contains(&then_start) {
-                Region::Seq(vec![])
-            } else {
-                build_regions_rec_until(cfg, then_start, stop_at, loop_header, emitted, allowed)
-                    .unwrap_or_else(|| Region::Seq(vec![]))
-            };
-            let else_r = if stop_at.contains(fall_through) {
+            // Same skip-join handling as `build_regions_rec`. Nested conditionals often live
+            // under an outer `build_regions_rec_until` (e.g. whole method body under a top-level
+            // scheme check) — without this, fall-through skip bodies are lost.
+            let fall_has_work = !block_is_effectively_empty(&cfg.blocks[*fall_through]);
+            let skip_join = fall_has_work
+                && *branch_target != *fall_through
+                && loop_header != Some(*branch_target)
+                && !emitted.contains(branch_target)
+                && !stop_at.contains(branch_target)
+                && !stop_at.contains(fall_through)
+                && cfg.reachable_from(*fall_through, *branch_target, loop_header)
+                && !cfg.reachable_from(*branch_target, *fall_through, loop_header);
+
+            if skip_join {
+                let mut nested_stop = stop_at.clone();
+                nested_stop.insert(*branch_target);
+                let else_r = build_regions_rec_until(
+                    cfg,
+                    *fall_through,
+                    &nested_stop,
+                    loop_header,
+                    emitted,
+                    allowed,
+                )
+                .unwrap_or_else(|| Region::Seq(vec![]));
+                // Join block only (no follow) — successors continue below.
+                let after = if emitted.contains(branch_target) {
+                    Region::Seq(vec![])
+                } else if block_is_effectively_empty(&cfg.blocks[*branch_target]) {
+                    emitted.insert(*branch_target);
+                    Region::Seq(vec![])
+                } else {
+                    emitted.insert(*branch_target);
+                    Region::Block(*branch_target)
+                };
+                let mut parts = vec![
+                    block_region,
+                    Region::If {
+                        condition: condition.clone(),
+                        then_branch: Box::new(Region::Seq(vec![])),
+                        else_branch: Box::new(else_r),
+                    },
+                ];
+                match &after {
+                    Region::Seq(v) if v.is_empty() => {}
+                    _ => parts.push(after),
+                }
+                // Continue only via fall-through from a non-empty join. Do not follow a
+                // join's `goto` — that target is a shared exit / next else-if arm owned by
+                // the parent region.
+                let cont = match &cfg.blocks[*branch_target].end {
+                    BlockEnd::FallThrough => cfg
+                        .fall_through_block(*branch_target)
+                        .filter(|t| !stop_at.contains(t) && !emitted.contains(t)),
+                    _ => None,
+                };
+                if let Some(next) = cont {
+                    if let Some(r) =
+                        build_regions_rec_until(cfg, next, stop_at, loop_header, emitted, allowed)
+                    {
+                        parts.push(r);
+                    }
+                }
+                return Some(Region::Seq(parts));
+            }
+
+            // Fall-through first so taken-branch builds don't steal skip bodies.
+            let else_r = if stop_at.contains(fall_through) || emitted.contains(fall_through) {
                 Region::Seq(vec![])
             } else {
                 build_regions_rec_until(cfg, *fall_through, stop_at, loop_header, emitted, allowed)
+                    .unwrap_or_else(|| Region::Seq(vec![]))
+            };
+            let then_r = if stop_at.contains(branch_target) || emitted.contains(branch_target) {
+                Region::Seq(vec![])
+            } else {
+                build_regions_rec_until(cfg, *branch_target, stop_at, loop_header, emitted, allowed)
                     .unwrap_or_else(|| Region::Seq(vec![]))
             };
             Some(Region::Seq(vec![
@@ -486,8 +741,8 @@ mod tests {
     #[test]
     fn region_if_else() {
         let bytecode: &[u8] = &[
-            0x38, 0x00, 0x03, 0x00,
-            0x28, 0x02,
+            0x38, 0x00, 0x04, 0x00, // if-eqz +4 -> 8
+            0x28, 0x02,             // goto +2 -> 8
             0x0e, 0x00,
             0x0e, 0x00,
         ];
@@ -507,8 +762,8 @@ mod tests {
     fn region_loop() {
         let bytecode: &[u8] = &[
             0x12, 0x00,
-            0x38, 0x00, 0x04, 0x00,
-            0x28, 0xfd,
+            0x38, 0x00, 0x05, 0x00, // if-eqz +5 -> 12
+            0x28, 0xfe,             // goto -2 -> 2
             0x00, 0x00, 0x00, 0x00,
             0x0e, 0x00,
         ];
@@ -534,10 +789,10 @@ mod tests {
     /// The first If's then_branch (exit path) must include BOTH blocks (A and B).
     #[test]
     fn region_loop_exit_path_two_blocks() {
-        // Same layout as test_decompiler_loop_exit_path_two_blocks: const/4; if-eqz +4 (target 12); goto -2; nop; const/4 v0,1; return v0
+        // Same layout as test_decompiler_loop_exit_path_two_blocks: const/4; if-eqz +5 (target 12); goto -2; nop; const/4 v0,1; return v0
         let bytecode: &[u8] = &[
             0x12, 0x00,             // const/4 v0, 0
-            0x38, 0x00, 0x04, 0x00, // if-eqz v0, +4 -> target 12
+            0x38, 0x00, 0x05, 0x00, // if-eqz v0, +5 -> target 12
             0x28, 0xfe,             // goto -2 -> target 2
             0x00, 0x00,             // nop
             0x12, 0x01,             // const/4 v0, 1  (exit block 1)
