@@ -888,6 +888,7 @@ fn main() -> Result<()> {
         rename_map,
         mode,
         use_debug_names: !args.no_debug_info,
+        resource_map: None,
     };
     let primary = dex_refs[0];
     let _ = primary;

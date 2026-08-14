@@ -7,13 +7,14 @@ pub fn default_config() -> TaintConfig {
     TaintConfig::from_json_str(DEFAULT_JSON).expect("embedded default taint config must parse")
 }
 
-const DEFAULT_JSON: &str = r#"{
+const DEFAULT_JSON: &str = r#"
+{
   "sources": [
     {"patterns": ["getIntent", "Activity.getIntent"], "port": "return", "kind": "ActivityUserInput", "features": ["user-controlled"]},
-    {"patterns": ["getStringExtra", "getCharSequenceExtra", "getParcelableExtra", "getSerializableExtra", "getDataString", "Intent.getData"], "port": "return", "kind": "ActivityUserInput"},
-    {"patterns": ["getQueryParameter", "Uri.getQueryParameter", "getLastPathSegment"], "port": "return", "kind": "ActivityUserInput"},
+    {"patterns": ["getStringExtra", "getCharSequenceExtra", "getParcelableExtra", "getSerializableExtra", "getDataString", "Intent.getData", "Intent.getClipData", "getClipData"], "port": "return", "kind": "ActivityUserInput"},
+    {"patterns": ["getQueryParameter", "Uri.getQueryParameter", "getLastPathSegment", "getPath"], "port": "return", "kind": "ActivityUserInput"},
     {"patterns": ["EditText.getText"], "port": "return", "kind": "UserInput"},
-    {"patterns": ["ClipboardManager.getPrimaryClip", "ClipboardManager.getText"], "port": "return", "kind": "Clipboard"},
+    {"patterns": ["ClipboardManager.getPrimaryClip", "ClipboardManager.getText", "getPrimaryClip", "getText"], "port": "return", "kind": "Clipboard"},
     {"patterns": ["getDeviceId", "getImei", "getSubscriberId", "getAndroidId", "Settings$Secure.getString"], "port": "return", "kind": "DeviceId"},
     {"patterns": ["getLastLocation", "getCurrentLocation", "getLatitude", "getLongitude"], "port": "return", "kind": "Location"},
     {"patterns": ["onReceive", "BroadcastReceiver"], "port": {"argument": {"index": 0}}, "kind": "ReceiverUserInput"},
@@ -23,7 +24,7 @@ const DEFAULT_JSON: &str = r#"{
   "sinks": [
     {"patterns": ["Runtime.exec", "ProcessBuilder.<init>", "ProcessBuilder.start"], "port": {"argument": {"index": 0}}, "kind": "CodeExecution"},
     {"patterns": ["DexClassLoader.<init>", "PathClassLoader.<init>", "InMemoryDexClassLoader.<init>"], "port": {"argument": {"index": 1}}, "kind": "CodeExecution"},
-    {"patterns": ["loadClass", "System.load", "System.loadLibrary"], "port": {"argument": {"index": 1}}, "kind": "CodeExecution"},
+    {"patterns": ["loadClass", "System.load", "System.loadLibrary", "Method.invoke", "Class.forName"], "port": {"argument": {"index": 1}}, "kind": "CodeExecution"},
     {"patterns": ["rawQuery", "execSQL", "compileStatement"], "port": {"argument": {"index": 1}}, "kind": "SQLQuery"},
     {"patterns": ["WebView.loadUrl", "loadUrl", "loadData", "loadDataWithBaseURL", "evaluateJavascript"], "port": {"argument": {"index": 1}}, "kind": "ExecuteJavascript"},
     {"patterns": ["addJavascriptInterface"], "port": {"argument": {"index": 1}}, "kind": "JavascriptInterface"},
@@ -31,9 +32,17 @@ const DEFAULT_JSON: &str = r#"{
     {"patterns": ["Log.d", "Log.i", "Log.w", "Log.e", "Log.v", "println"], "port": {"argument": {"index": 1}}, "kind": "Logging"},
     {"patterns": ["startActivity", "startActivityForResult", "startService", "bindService", "sendBroadcast", "sendOrderedBroadcast"], "port": {"argument": {"index": 1}}, "kind": "LaunchingComponent"},
     {"patterns": ["setResult"], "port": {"argument": {"index": 2}}, "kind": "SetResult"},
-    {"patterns": ["openConnection", "HttpURLConnection", "OkHttpClient", "Request.Builder.url"], "port": {"argument": {"index": 0}}, "kind": "Network"},
+    {"patterns": ["Intent.setClipData", "setClipData", "Intent.addFlags", "addFlags"], "port": {"argument": {"index": 1}}, "kind": "UriGrant"},
+    {"patterns": ["grantUriPermission", "takePersistableUriPermission", "ContentResolver.takePersistableUriPermission"], "port": {"argument": {"index": 2}}, "kind": "UriGrant"},
+    {"patterns": ["openConnection", "HttpURLConnection", "OkHttpClient", "Request.Builder.url", "Call.execute", "Call.enqueue", "OutputStream.write", "URLConnection.getOutputStream", "HttpURLConnection.getOutputStream"], "port": {"argument": {"index": 0}}, "kind": "Network"},
+    {"patterns": ["OutputStream.write", "BufferedWriter.write", "Writer.write", "RequestBody.create"], "port": {"argument": {"index": 1}}, "kind": "Network"},
+    {"patterns": ["CookieManager.setCookie", "setCookie"], "port": {"argument": {"index": 1}}, "kind": "CookieWrite"},
+    {"patterns": ["ClipboardManager.setPrimaryClip", "ClipboardManager.setText", "setPrimaryClip"], "port": {"argument": {"index": 1}}, "kind": "ClipboardWrite"},
+    {"patterns": ["setHostnameVerifier", "hostnameVerifier", "HostnameVerifier.verify", "checkServerTrusted"], "port": {"argument": {"index": 1}}, "kind": "SslBypass"},
+    {"patterns": ["SSLContext.init"], "port": {"argument": {"index": 2}}, "kind": "SslBypass"},
     {"patterns": ["FileOutputStream.<init>", "FileWriter.<init>", "openFileOutput", "ParcelFileDescriptor.open"], "port": {"argument": {"index": 1}}, "kind": "FileWrite"},
     {"patterns": ["java.io.File.<init>", "File.<init>"], "port": {"argument": {"index": 2}}, "kind": "FileWrite"},
+    {"patterns": ["java.io.File.<init>", "File.<init>"], "port": {"argument": {"index": 1}}, "kind": "FileWrite"},
     {"patterns": ["SharedPreferences$Editor.putString", "Editor.putString"], "port": {"argument": {"index": 2}}, "kind": "SharedPrefsWrite"},
     {"patterns": ["ObjectInputStream.readObject", "readObject"], "port": {"argument": {"index": 0}}, "kind": "Deserialization"},
     {"patterns": ["SecretKeySpec.<init>", "IvParameterSpec.<init>"], "port": {"argument": {"index": 1}}, "kind": "WeakCrypto"}
@@ -45,12 +54,20 @@ const DEFAULT_JSON: &str = r#"{
     {"patterns": ["Uri.parse", "Uri.Builder.build", "Uri.Builder.appendQueryParameter"], "from": {"argument": {"index": 0}}, "to": "return"},
     {"patterns": ["Intent.putExtra", "putExtra"], "from": {"argument": {"index": 2}}, "to": {"argument": {"index": 0}}},
     {"patterns": ["Intent.setData", "setData", "setDataAndType"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
+    {"patterns": ["Intent.setClipData", "setClipData"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
+    {"patterns": ["Intent.addFlags", "addFlags", "Intent.setFlags", "setFlags"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
     {"patterns": ["Bundle.putString", "putCharSequence"], "from": {"argument": {"index": 2}}, "to": {"argument": {"index": 0}}},
-    {"patterns": ["setLoginUrl"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}}
+    {"patterns": ["ClipData.newRawUri", "ClipData.newUri", "ClipData.Item.getUri"], "from": {"argument": {"index": 1}}, "to": "return"},
+    {"patterns": ["setLoginUrl"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
+    {"patterns": ["Cipher.doFinal", "javax.crypto.Cipher.doFinal"], "from": {"argument": {"index": 1}}, "to": "return"},
+    {"patterns": ["Cipher.update", "javax.crypto.Cipher.update"], "from": {"argument": {"index": 1}}, "to": "return"},
+    {"patterns": ["CipherOutputStream.write"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
+    {"patterns": ["MessageDigest.digest", "MessageDigest.update"], "from": {"argument": {"index": 1}}, "to": "return"},
+    {"patterns": ["Base64.encode", "Base64.encodeToString"], "from": {"argument": {"index": 0}}, "to": "return"}
   ],
   "sanitizers": [
-    {"patterns": ["MessageDigest.digest", "MessageDigest.update", "hashCode", "Objects.hash"], "kinds": ["*"]},
-    {"patterns": ["URLEncoder.encode", "Uri.encode"], "kinds": ["ActivityUserInput", "UserInput"]},
+    {"patterns": ["MessageDigest.digest", "MessageDigest.update", "hashCode", "Objects.hash"], "kinds": []},
+    {"patterns": ["URLEncoder.encode", "Uri.encode"], "kinds": []},
     {"patterns": ["Base64.encode", "Base64.encodeToString"], "kinds": []}
   ],
   "rules": [
@@ -80,21 +97,21 @@ const DEFAULT_JSON: &str = r#"{
       "code": 3,
       "description": "User-controlled values may flow into an intent launcher",
       "sources": ["ActivityUserInput", "UserInput", "ReceiverUserInput"],
-      "sinks": ["LaunchingComponent", "SetResult"]
+      "sinks": ["LaunchingComponent", "SetResult", "UriGrant"]
     },
     {
       "name": "PII to logging",
       "code": 10,
       "description": "Device identifiers or location may flow into logs",
       "sources": ["DeviceId", "Location", "Clipboard", "ActivityUserInput", "UserInput"],
-      "sinks": ["Logging", "Network"]
+      "sinks": ["Logging", "Network", "ClipboardWrite", "CookieWrite"]
     },
     {
       "name": "User input to network",
       "code": 11,
       "description": "User-controlled values may flow into network APIs",
       "sources": ["ActivityUserInput", "UserInput"],
-      "sinks": ["Network"]
+      "sinks": ["Network", "CookieWrite"]
     },
     {
       "name": "User input to file write",
@@ -116,6 +133,35 @@ const DEFAULT_JSON: &str = r#"{
       "description": "User-controlled values may reach unsafe deserialization",
       "sources": ["ActivityUserInput", "UserInput", "ReceiverUserInput"],
       "sinks": ["Deserialization"]
+    },
+    {
+      "name": "User input to URI grant / ClipData flags",
+      "code": 15,
+      "description": "User-controlled Intent/URI may receive FLAG_GRANT_* or ClipData URI grants via setResult/setClipData/addFlags",
+      "sources": ["ActivityUserInput", "UserInput", "ReceiverUserInput", "ProviderUserInput"],
+      "sinks": ["UriGrant", "SetResult"]
+    },
+    {
+      "name": "Sensitive data to clipboard",
+      "code": 16,
+      "description": "Sensitive or user-controlled data may be written to the clipboard",
+      "sources": ["ActivityUserInput", "UserInput", "DeviceId", "Location", "Clipboard"],
+      "sinks": ["ClipboardWrite"]
+    },
+    {
+      "name": "PII to network exfil",
+      "code": 18,
+      "description": "Device identifiers or location may flow into network APIs (destination may be unresolved; crypto does not clear taint)",
+      "sources": ["DeviceId", "Location", "Clipboard"],
+      "sinks": ["Network", "CookieWrite", "Logging"]
+    },
+    {
+      "name": "SSL / hostname verification bypass surface",
+      "code": 17,
+      "description": "Untrusted values or custom trust managers may weaken TLS hostname/certificate checks",
+      "sources": ["ActivityUserInput", "UserInput", "UntrustedCodePath"],
+      "sinks": ["SslBypass"]
     }
   ]
-}"#;
+}
+"#;

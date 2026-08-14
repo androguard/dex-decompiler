@@ -1,7 +1,7 @@
-//! WebView: user input → loadUrl/loadDataWithBaseURL; and addJavascriptInterface.
+//! WebView: user input → loadUrl/loadDataWithBaseURL; JS bridge; file access.
 
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
-use crate::detectors::types::{invoke_scan, source_sink_scan, VulnFinding};
+use crate::detectors::types::{invoke_scan, method_matches_any, source_sink_scan, VulnFinding};
 
 const WEBVIEW_SOURCES: &[&str] = &[
     "getStringExtra",
@@ -10,6 +10,7 @@ const WEBVIEW_SOURCES: &[&str] = &[
     "getDataString",
     "getQueryParameter",
     "getIntent",
+    "getParcelableExtra",
 ];
 const WEBVIEW_SINKS: &[&str] = &[
     "loadUrl",
@@ -51,5 +52,28 @@ pub fn scan_webview_unsafe(
         "webview_file_access",
         FILE_ACCESS_PATTERNS,
     ));
+
+    let has_bridge = owned
+        .invoke_method_map
+        .values()
+        .any(|m| method_matches_any(m, JAVASCRIPT_INTERFACE_PATTERNS));
+    let has_user_load = !source_sink_scan(
+        owned,
+        class_name,
+        method_name,
+        "webview_unsafe_url",
+        WEBVIEW_SOURCES,
+        WEBVIEW_SINKS,
+    )
+    .is_empty();
+    if has_bridge && has_user_load {
+        out.extend(invoke_scan(
+            owned,
+            class_name,
+            method_name,
+            "webview_js_bridge_user_url",
+            &["addJavascriptInterface", "loadUrl", "evaluateJavascript"],
+        ));
+    }
     out
 }

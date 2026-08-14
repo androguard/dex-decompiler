@@ -283,6 +283,17 @@ fn infer_type_from_raw(s: &str, types: &HashMap<VarId, String>) -> Option<String
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
         return Some("java.lang.String".to_string());
     }
+    // const-class: "android.content.Context.class" / "Foo.class"
+    if let Some(ty) = s.strip_suffix(".class") {
+        let ty = ty.trim();
+        if !ty.is_empty()
+            && ty
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '[' || c == ']')
+        {
+            return Some("java.lang.Class".to_string());
+        }
+    }
     // Integer literal (optional minus, digits, optional L)
     let b = s.as_bytes();
     let mut i = 0;
@@ -772,6 +783,7 @@ fn type_prefix(ty: &str) -> &'static str {
         "android.os.Bundle" | "Bundle" => "bundle",
         "android.content.Context" | "Context" => "ctx",
         "android.view.View" | "View" => "view",
+        "java.lang.Class" | "Class" => "cls",
         _ if ty.ends_with("[]") => "arr",
         _ if ty.ends_with("Exception") => "ex",
         _ if ty.ends_with("List") => "list",

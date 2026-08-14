@@ -98,3 +98,108 @@ rules:
       method_name: onReceivedSslError
       methods:
         - proceed
+
+  # --- Curated high-signal extras (careful expand; not full MASTG) ---
+
+  - id: android.pendingintent.get-creation
+    message: >-
+      PendingIntent.get* creation site. Review FLAG_IMMUTABLE and whether the base
+      Intent leaves action/data/component unset (PITracker-style).
+    severity: INFO
+    languages: [java]
+    pattern-either:
+      - pattern: PendingIntent.getActivity(...)
+      - pattern: PendingIntent.getBroadcast(...)
+      - pattern: PendingIntent.getService(...)
+      - pattern: PendingIntent.getForegroundService(...)
+    metadata:
+      vuln_class: ipc
+      chain_tag: pending_intent
+    native:
+      kind: invoke
+      methods:
+        - PendingIntent.getActivity
+        - PendingIntent.getBroadcast
+        - PendingIntent.getService
+        - PendingIntent.getForegroundService
+
+  - id: android.ssl.check-server-trusted
+    message: >-
+      Custom TrustManager.checkServerTrusted present. Ensure it validates the chain
+      and throws CertificateException on failure (trust-all bypass risk).
+    severity: WARNING
+    languages: [java]
+    pattern: |
+      public void checkServerTrusted(...) {
+        ...
+      }
+    metadata:
+      vuln_class: network
+    native:
+      kind: invoke
+      methods:
+        - checkServerTrusted
+
+  - id: android.deserialization.read-object
+    message: >-
+      ObjectInputStream.readObject / similar deserialization. Prefer JSON with an
+      explicit schema when input is untrusted.
+    severity: ERROR
+    languages: [java]
+    pattern: $IN.readObject();
+    metadata:
+      vuln_class: ipc
+    native:
+      kind: invoke
+      methods:
+        - readObject
+        - ObjectInputStream.readObject
+
+  - id: android.crypto.secret-key-spec
+    message: >-
+      SecretKeySpec constructed in app code. Confirm key material is not hardcoded.
+    severity: WARNING
+    languages: [java]
+    pattern: new SecretKeySpec(...);
+    metadata:
+      vuln_class: storage
+    native:
+      kind: invoke
+      methods:
+        - SecretKeySpec.<init>
+
+  - id: android.webview.file-access-from-file-urls
+    message: >-
+      WebView allows file:// access from file URLs, enabling local file theft when
+      combined with attacker-controlled content.
+    severity: ERROR
+    languages: [java]
+    pattern-either:
+      - pattern: $S.setAllowFileAccessFromFileURLs(true);
+      - pattern: $S.setAllowUniversalAccessFromFileURLs(true);
+    metadata:
+      vuln_class: webview
+    native:
+      kind: invoke
+      methods:
+        - setAllowFileAccessFromFileURLs
+        - setAllowUniversalAccessFromFileURLs
+
+  - id: android.rce.dex-class-loader
+    message: >-
+      Dynamic DEX loading (DexClassLoader / PathClassLoader / InMemoryDexClassLoader).
+      Untrusted paths can lead to code execution.
+    severity: ERROR
+    languages: [java]
+    pattern-either:
+      - pattern: new DexClassLoader(...);
+      - pattern: new PathClassLoader(...);
+      - pattern: new InMemoryDexClassLoader(...);
+    metadata:
+      vuln_class: native
+    native:
+      kind: invoke
+      methods:
+        - DexClassLoader.<init>
+        - PathClassLoader.<init>
+        - InMemoryDexClassLoader.<init>

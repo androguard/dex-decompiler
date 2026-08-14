@@ -3,33 +3,61 @@
 //! Each detector lives in its own `.rs` file. Use `run_all_detectors` to run
 //! every detector (except PendingIntent, which has its own finding type and CLI flag).
 
+mod biometric;
+mod broadcast_abuse;
+mod credential_broadcast;
 mod hardcoded_secrets;
+mod implicit_intent;
 mod insecure_logging;
 mod intent_spoofing;
 mod ipc_intent_validation;
+mod keystore;
 mod path_traversal;
 pub mod pending_intent;
+mod pick_file_theft;
+mod pinning_bypass;
 mod rce_dynamic_loading;
+mod reflection_rce;
 mod sql_injection;
+mod sqlcipher_passphrase;
+mod ssl_trust_all;
+mod storage_mode;
+mod trackers;
 mod types;
 mod unsafe_deserialization;
+mod uri_grant;
 mod weak_crypto;
+mod weak_host_check;
 mod webview;
 
+pub use biometric::scan_biometric_misuse;
+pub use broadcast_abuse::scan_broadcast_abuse;
+pub use credential_broadcast::scan_credential_broadcast;
 pub use hardcoded_secrets::scan_hardcoded_secrets;
+pub use implicit_intent::scan_implicit_intent;
 pub use insecure_logging::scan_insecure_logging;
 pub use intent_spoofing::scan_intent_spoofing;
 pub use ipc_intent_validation::scan_ipc_intent_validation;
+pub use keystore::scan_keystore_misuse;
 pub use path_traversal::scan_path_traversal;
 pub use pending_intent::{scan_pending_intents, PendingIntentFinding};
+pub use pick_file_theft::scan_pick_file_theft;
+pub use pinning_bypass::scan_pinning_bypass;
 pub use rce_dynamic_loading::scan_rce_dynamic_loading;
+pub use reflection_rce::scan_reflection_rce;
 pub use sql_injection::scan_sql_injection;
+pub use sqlcipher_passphrase::scan_sqlcipher_passphrase;
+pub use ssl_trust_all::scan_ssl_trust_all;
+pub use storage_mode::scan_storage_mode;
+pub use trackers::scan_tracker_inventory;
 pub use types::{
     category_meta, invoke_scan, method_matches_any, source_sink_scan, CategoryMeta, VulnFinding,
     VulnTraceStep,
 };
 pub use unsafe_deserialization::scan_unsafe_deserialization;
+pub use uri_grant::scan_uri_grant;
 pub use weak_crypto::scan_weak_crypto;
+pub use weak_host_check::scan_weak_host_validation;
 pub use webview::scan_webview_unsafe;
 
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
@@ -142,8 +170,22 @@ pub fn run_all_detectors(
     all.extend(scan_hardcoded_secrets(owned, class_name, method_name));
     all.extend(scan_ipc_intent_validation(owned, class_name, method_name));
     all.extend(scan_path_traversal(owned, class_name, method_name));
+    all.extend(scan_uri_grant(owned, class_name, method_name));
     all.extend(scan_weak_crypto(owned, class_name, method_name));
     all.extend(scan_unsafe_deserialization(owned, class_name, method_name));
+    all.extend(scan_storage_mode(owned, class_name, method_name));
+    all.extend(scan_broadcast_abuse(owned, class_name, method_name));
+    all.extend(scan_ssl_trust_all(owned, class_name, method_name));
+    all.extend(scan_pinning_bypass(owned, class_name, method_name));
+    all.extend(scan_reflection_rce(owned, class_name, method_name));
+    all.extend(scan_sqlcipher_passphrase(owned, class_name, method_name));
+    all.extend(scan_implicit_intent(owned, class_name, method_name));
+    all.extend(scan_biometric_misuse(owned, class_name, method_name));
+    all.extend(scan_keystore_misuse(owned, class_name, method_name));
+    all.extend(scan_tracker_inventory(owned, class_name, method_name));
+    all.extend(scan_credential_broadcast(owned, class_name, method_name));
+    all.extend(scan_weak_host_validation(owned, class_name, method_name));
+    all.extend(scan_pick_file_theft(owned, class_name, method_name));
     let mut seen: HashSet<(String, String, String, u32)> = HashSet::new();
     all.into_iter()
         .filter(|f| {

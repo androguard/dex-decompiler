@@ -5759,6 +5759,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_assign_rhs_const_class_and_const4() {
+        assert_eq!(
+            super::parse_assign_rhs("const-class", "v9, android.content.Context"),
+            Some((9, "android.content.Context.class".into()))
+        );
+        assert_eq!(
+            super::parse_assign_rhs("const/4", "v10, 0"),
+            Some((10, "0".into()))
+        );
+        assert_eq!(super::format_aput("v9, v8, v10"), "v8[v10] = v9;");
+    }
+
+    #[test]
     fn format_array_length_aget_aput() {
         assert_eq!(super::format_array_length("v0, v1"), "v0 = v1.length;");
         assert_eq!(super::format_aget("v0, v1, v2"), "v0 = v1[v2];");

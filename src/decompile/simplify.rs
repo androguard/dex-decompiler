@@ -331,8 +331,9 @@ fn inline_static_field_refs(body: &str) -> String {
             let var = lhs.rsplit(' ').next().unwrap_or(lhs);
             let val = t[eq + 3..].trim_end_matches(';').trim();
             // Only static/instance field paths (e.g. System.out), never string literals
-            // like "android.permission.READ_…" which also contain '.'.
-            if is_java_ident(var) && is_simple_field_path(val) {
+            // like "android.permission.READ_…" which also contain '.', and never
+            // const-class literals (`Context.class`) which look like dotted paths.
+            if is_java_ident(var) && is_simple_field_path(val) && !is_class_literal(val) {
                 let reg_num = extract_reg_number(var).map(String::from);
                 aliases.push((var.to_string(), val.to_string(), reg_num));
             }
@@ -412,6 +413,10 @@ fn is_inlineable_rhs(rhs: &str) -> bool {
     if is_numeric_literal(rhs) {
         return true;
     }
+    // const-class: Context.class / android.content.Context.class
+    if is_class_literal(rhs) {
+        return true;
+    }
     // Simple identifier (copy): i0, s1, this, pickerIntent
     if is_java_ident(rhs) {
         return true;
@@ -429,6 +434,19 @@ fn is_inlineable_rhs(rhs: &str) -> bool {
         return true;
     }
     false
+}
+
+/// `Foo.class` / `com.example.Foo.class` (DEX const-class).
+fn is_class_literal(s: &str) -> bool {
+    let s = s.trim();
+    let Some(ty) = s.strip_suffix(".class") else {
+        return false;
+    };
+    let ty = ty.trim();
+    if ty.is_empty() || ty.contains('(') || ty.contains(' ') {
+        return false;
+    }
+    ty.split('.').all(|p| !p.is_empty() && is_java_ident(p))
 }
 
 /// `(Type) expr` — Type starts with uppercase letter / package.
@@ -584,13 +602,22 @@ fn is_cheap_literal_rhs(rhs: &str) -> bool {
     if rhs.starts_with('\'') && rhs.ends_with('\'') && rhs.len() >= 3 {
         return true;
     }
+    // Class literals are immutable / cheap to repeat at each use site.
+    if is_class_literal(rhs) {
+        return true;
+    }
     false
 }
 
 /// `this.foo`, `Foo.BAR`, `a.b.c` — identifiers separated by dots only.
+/// Not a class literal (`Foo.class` / `pkg.Foo.class`).
 fn is_simple_field_path(s: &str) -> bool {
     let s = s.trim();
     if !s.contains('.') || s.contains('(') || s.contains(')') || s.contains(' ') || s.contains('[') {
+        return false;
+    }
+    // `Type.class` is a const-class literal, not a field access.
+    if s.ends_with(".class") {
         return false;
     }
     s.split('.').all(|p| !p.is_empty() && is_java_ident(p))
@@ -601,6 +628,10 @@ fn is_simple_field_path(s: &str) -> bool {
 fn is_temp_like_name(var: &str) -> bool {
     if var.is_empty() {
         return false;
+    }
+    // Array-index temps from SemanticRole::Index (often hold a literal 0/1).
+    if matches!(var, "i" | "j" | "k") {
+        return true;
     }
     if var.starts_with("local") && var.bytes().skip(5).all(|b| b.is_ascii_digit()) {
         return true;
@@ -613,7 +644,7 @@ fn is_temp_like_name(var: &str) -> bool {
     {
         return true;
     }
-    // view0, textView0, arr0, …
+    // view0, textView0, arr0, cls0, …
     if let Some(i) = var.bytes().rposition(|c| c.is_ascii_alphabetic()) {
         let (prefix, digits) = var.split_at(i + 1);
         if !digits.is_empty()
@@ -3826,26 +3857,26 @@ fn split_leading_cast_at(expr: &str, start: usize) -> Option<(String, usize)> {
         return None;
     }
     let mut depth = 0i32;
-    let mut end = None;
-    for (i, c) in e.chars().enumerate() {
+    let mut end_byte = None;
+    for (i, c) in e.char_indices() {
         match c {
             '(' => depth += 1,
             ')' => {
                 depth -= 1;
                 if depth == 0 {
-                    end = Some(i);
+                    end_byte = Some(i);
                     break;
                 }
             }
             _ => {}
         }
     }
-    let end = end?;
-    let ty = e[1..end].trim();
+    let end_byte = end_byte?;
+    let ty = e[1..end_byte].trim();
     if ty.is_empty() || !looks_like_type_name(ty) {
         return None;
     }
-    let rest_rel = end + 1;
+    let rest_rel = end_byte + 1;
     if rest_rel >= e.len() {
         return None;
     }
@@ -4895,6 +4926,36 @@ mod tests {
             simplified
         );
         assert!(!simplified.contains("n0 = 12"), "n0 assignment should be removed: {:?}", simplified);
+    }
+
+    #[test]
+    fn simplify_inline_class_literal_and_index_zero() {
+        // Mirrors reflection Class[] / Object[] setup from OVAA invokePlugins.
+        let body = "\
+                Class[] arr0 = new Class[1];\n\
+                local1 = android.content.Context.class;\n\
+                j = 0;\n\
+                arr0[j] = local1;\n\
+                Object[] arr1 = new Object[1];\n\
+                arr1[j] = this;\n\
+                m.invoke(null, arr1);";
+        let simplified = simplify_method_body(body, false);
+        assert!(
+            simplified.contains("arr0[0] = android.content.Context.class")
+                || simplified.contains("arr0[0]=android.content.Context.class"),
+            "expected Context.class inlined at arr0[0]: {:?}",
+            simplified
+        );
+        assert!(
+            !simplified.contains("local1"),
+            "local1 should be gone: {:?}",
+            simplified
+        );
+        assert!(
+            !simplified.contains("[j]"),
+            "index j should fold to 0: {:?}",
+            simplified
+        );
     }
 
     #[test]

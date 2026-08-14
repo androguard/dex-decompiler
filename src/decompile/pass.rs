@@ -215,7 +215,8 @@ fn used_var_ids(stmts: &[IrStmt]) -> HashSet<VarId> {
             IrStmt::Assign { rhs, .. } => collect_var_ids_expr(rhs, &mut set),
             IrStmt::Expr { expr, .. } => collect_var_ids_expr(expr, &mut set),
             IrStmt::Return { value: Some(e), .. } => collect_var_ids_expr(e, &mut set),
-            IrStmt::Return { value: None, .. } | IrStmt::Raw(_) => {}
+            IrStmt::Return { value: None, .. } => {}
+            IrStmt::Raw(s) => var_ids_in_text(s, &mut set),
             IrStmt::Phi { incomings, .. } => {
                 for (_, v) in incomings {
                     set.insert(*v);
@@ -685,6 +686,38 @@ mod tests {
         assert_eq!(out[0].to_java_line(), "v0_1 = 0;");
         assert_eq!(out[1].to_java_line(), "v0_2 = v0_1;");
         assert_eq!(out[2].to_java_line(), "return v0_2;");
+    }
+
+    #[test]
+    fn dead_assign_keeps_const_class_used_in_aput_raw() {
+        let stmts = vec![
+            IrStmt::Assign {
+                dst: VarId::new(9, 0),
+                rhs: IrExpr::Raw("android.content.Context.class".into()),
+                comment: None,
+            },
+            IrStmt::Assign {
+                dst: VarId::new(10, 0),
+                rhs: IrExpr::Raw("0".into()),
+                comment: None,
+            },
+            IrStmt::Raw("v8[v10] = v9;".into()),
+        ];
+        let out = DeadAssignPass.run(stmts);
+        assert_eq!(out.len(), 3, "const-class/index must survive when only used in aput Raw: {:?}", out);
+        let regs = used_regs(&out);
+        assert!(regs.contains(&9) && regs.contains(&10), "{:?}", regs);
+    }
+
+    #[test]
+    fn var_ids_parses_versioned_aput() {
+        let mut set = HashSet::new();
+        var_ids_in_text("v8_2[v10_2] = v9_2;", &mut set);
+        assert!(set.contains(&VarId::new(8, 2)), "{:?}", set);
+        assert!(set.contains(&VarId::new(10, 2)), "{:?}", set);
+        assert!(set.contains(&VarId::new(9, 2)), "{:?}", set);
+        let regs: HashSet<u32> = set.iter().map(|v| v.reg).collect();
+        assert!(regs.contains(&9) && regs.contains(&10), "{:?}", regs);
     }
 
     #[test]
