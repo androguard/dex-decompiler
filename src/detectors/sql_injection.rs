@@ -108,6 +108,8 @@ mod tests {
             )],
             invoke_method_map,
             insn_at,
+            registers_size: 0,
+            ins_size: 0,
         };
         let findings = scan_sql_injection(&owned, "com.example.IapProvider", "query");
         assert!(

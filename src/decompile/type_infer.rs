@@ -642,9 +642,10 @@ fn normalize_type_name(ty: &str) -> String {
 /// True when two SSA versions of one register may share a display name.
 pub(crate) fn types_compatible_for_naming(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
-        // Untyped defs must not inherit String/Uri debug names (avoids `host = 0`).
+        // Untyped defs must not inherit String/Uri/class names (avoids `host = 0`).
+        // Exception: an untyped use may share an array name (`arr0`) with a typed `T[]`.
         // Typed defs may still share a name when the latest version's type is unknown.
-        (None, Some(_)) => false,
+        (None, Some(t)) => t.ends_with("[]"),
         (Some(_), None) => true,
         (None, None) => true,
         (Some(x), Some(y)) => normalize_type_name(x) == normalize_type_name(y),

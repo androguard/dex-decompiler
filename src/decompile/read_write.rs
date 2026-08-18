@@ -21,7 +21,18 @@ pub fn instruction_reads_writes(mnemonic: &str, ops_resolved: &str) -> (Vec<u32>
     let ops = ops_resolved.trim();
 
     // move / move-object: dst = src
-    if matches!(m, "move" | "move/from16" | "move/16" | "move-object") {
+    if matches!(
+        m,
+        "move"
+            | "move/from16"
+            | "move/16"
+            | "move-object"
+            | "move-object/from16"
+            | "move-object/16"
+            | "move-wide"
+            | "move-wide/from16"
+            | "move-wide/16"
+    ) {
         if let Some((dst, src)) = parse_two_regs(ops) {
             return (vec![src], vec![dst]);
         }
@@ -217,6 +228,13 @@ mod tests {
     fn const_write() {
         let (r, w) = instruction_reads_writes("const/4", "v0, 0");
         assert!(r.is_empty());
+        assert_eq!(w, vec![0]);
+    }
+
+    #[test]
+    fn move_object_from16_is_a_copy() {
+        let (r, w) = instruction_reads_writes("move-object/from16", "v0, v3");
+        assert_eq!(r, vec![3]);
         assert_eq!(w, vec![0]);
     }
 }

@@ -202,6 +202,37 @@ fn is_java_ident(name: &str) -> bool {
     chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
+/// Names already used in an `if (` / `else if (` condition are in scope.
+/// Prevents `if (b == 10) { int b = b + 1; }` when `b` is a prior SSA version.
+fn mark_condition_idents_declared(condition: &str, declared: &mut HashSet<String>) {
+    let mut cur = String::new();
+    let flush = |cur: &mut String, declared: &mut HashSet<String>| {
+        if cur.is_empty() {
+            return;
+        }
+        let name = std::mem::take(cur);
+        if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
+            return;
+        }
+        if matches!(
+            name.as_str(),
+            "true" | "false" | "null" | "new" | "this" | "super" | "instanceof"
+                | "int" | "long" | "boolean" | "byte" | "char" | "short" | "float" | "double"
+        ) {
+            return;
+        }
+        declared.insert(name);
+    };
+    for c in condition.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else {
+            flush(&mut cur, declared);
+        }
+    }
+    flush(&mut cur, declared);
+}
+
 /// Decompiler: takes a parsed DexFile and emits Java source.
 pub struct Decompiler<'a> {
     pub dex: &'a DexFile,
@@ -1410,6 +1441,8 @@ impl<'a> Decompiler<'a> {
             api_return_sources,
             invoke_method_map,
             insn_at,
+            registers_size: code.registers_size as u32,
+            ins_size: code.ins_size as u32,
         })
     }
 
@@ -1555,6 +1588,7 @@ impl<'a> Decompiler<'a> {
         if out.is_none() {
             let mut fallback = String::new();
             let mut declared = HashSet::new();
+            self.seed_declared_from_params(&mut declared, code);
             if let Some(root) = build_regions(&cfg, cfg.entry) {
                 self.emit_region(&root, &cfg, &instructions, code.insns_off, encoded, code, &mut fallback, 2, None, None, &mut declared, Some(&global_used_regs), None, class_name)?;
             }
@@ -2019,6 +2053,7 @@ impl<'a> Decompiler<'a> {
 
         let mut full = String::new();
         let mut declared = HashSet::new();
+        self.seed_declared_from_params(&mut declared, code);
         let mut cursor: u32 = 0;
 
         for (idx, (try_item, handler)) in pairs.iter().enumerate() {
@@ -2319,6 +2354,7 @@ impl<'a> Decompiler<'a> {
 
         let mut out = String::new();
         let mut declared = HashSet::new();
+        self.seed_declared_from_params(&mut declared, code);
         let global_used_regs = self.method_used_regs(cfg, instructions, code.insns_off, code_insns);
         for bid in 0..cfg.block_count() {
             let block = &cfg.blocks[bid];
@@ -2656,10 +2692,12 @@ impl<'a> Decompiler<'a> {
                 let else_empty_after = region_is_empty_with_cfg(else_branch, cfg);
                 if then_empty_after && !else_empty_after {
                     let neg = negate_condition(&condition);
+                    mark_condition_idents_declared(&neg, declared);
                     writeln!(out, "{}if ({}) {{", ind, shorten_java_names(&neg)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
                     writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 } else {
+                    mark_condition_idents_declared(&condition, declared);
                     writeln!(out, "{}if ({}) {{", ind, shorten_java_names(&condition)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
                     if !else_empty_after {
@@ -2860,6 +2898,7 @@ impl<'a> Decompiler<'a> {
         let mut current = else_branch;
         loop {
             if let Some((cond, then_b, else_b)) = as_single_if(current) {
+                mark_condition_idents_declared(cond, declared);
                 writeln!(
                     out,
                     "{}}} else if ({}) {{",
@@ -3214,6 +3253,23 @@ impl<'a> Decompiler<'a> {
             return add_like && goto_header;
         }
         false
+    }
+
+    /// Treat incoming Dalvik parameter registers as already declared so a later
+    /// SSA assign (`b = b + 1`) does not emit `int b = ...` after `if (b == 10)`.
+    fn seed_declared_from_params(&self, declared: &mut HashSet<String>, code: &CodeItem) {
+        let registers_size = code.registers_size as u32;
+        let ins_size = code.ins_size as u32;
+        let param_base = registers_size.saturating_sub(ins_size);
+        if let Some(names) = self.method_reg_names.borrow().as_ref() {
+            for reg in param_base..registers_size {
+                if let Some(n) = names.get(&reg) {
+                    if n != "this" {
+                        declared.insert(n.clone());
+                    }
+                }
+            }
+        }
     }
 
     /// Overlay DEX debug_info local/parameter names onto the variable name map.

@@ -13,6 +13,7 @@ mod helpers;
 mod imports;
 mod jadx_parity;
 mod pending_intent;
+mod privacy_vuln_demo;
 mod renames;
 mod taint_solver;
 mod value_flow;

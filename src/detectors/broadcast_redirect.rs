@@ -95,6 +95,20 @@ pub fn scan_broadcast_intent_redirect(
         }
     }
 
+    // Same VF pattern on an exported receiver is the confused-deputy
+    // exported_receiver_intent_redirect category (manifest export is AndroHunt-side).
+    let extras: Vec<VulnFinding> = findings
+        .iter()
+        .filter(|f| f.category == "broadcast_intent_redirect")
+        .cloned()
+        .map(|mut f| {
+            f.category = "exported_receiver_intent_redirect".into();
+            f.refresh_category_meta();
+            f
+        })
+        .collect();
+    findings.extend(extras);
+
     findings
 }
 
@@ -141,6 +155,8 @@ mod tests {
             )],
             invoke_method_map,
             insn_at,
+            registers_size: 0,
+            ins_size: 0,
         };
         let findings = scan_broadcast_intent_redirect(
             &owned,

@@ -14,11 +14,11 @@ const DEFAULT_JSON: &str = r#"
     {"patterns": ["getStringExtra", "getCharSequenceExtra", "getParcelableExtra", "getSerializableExtra", "getDataString", "Intent.getData", "Intent.getClipData", "getClipData"], "port": "return", "kind": "ActivityUserInput"},
     {"patterns": ["getQueryParameter", "Uri.getQueryParameter", "getLastPathSegment", "getPath"], "port": "return", "kind": "ActivityUserInput"},
     {"patterns": ["EditText.getText"], "port": "return", "kind": "UserInput"},
-    {"patterns": ["ClipboardManager.getPrimaryClip", "ClipboardManager.getText", "getPrimaryClip", "getText"], "port": "return", "kind": "Clipboard"},
+    {"patterns": ["ClipboardManager.getPrimaryClip", "ClipboardManager.getText", "getPrimaryClip"], "port": "return", "kind": "Clipboard"},
     {"patterns": ["getDeviceId", "getImei", "getSubscriberId", "getAndroidId", "Settings$Secure.getString"], "port": "return", "kind": "DeviceId"},
     {"patterns": ["getLastLocation", "getCurrentLocation", "getLatitude", "getLongitude"], "port": "return", "kind": "Location"},
     {"patterns": ["onReceive", "BroadcastReceiver"], "port": {"argument": {"index": 0}}, "kind": "ReceiverUserInput"},
-    {"patterns": ["query", "ContentResolver.query"], "port": "return", "kind": "ProviderUserInput"},
+    {"patterns": ["ContentResolver.query"], "port": "return", "kind": "ProviderUserInput"},
     {"patterns": ["getInstalledPackages", "createPackageContext", "getApplicationInfo", "File.getAbsolutePath", "Environment.getExternalStorageDirectory"], "port": "return", "kind": "UntrustedCodePath"}
   ],
   "sinks": [
@@ -26,7 +26,7 @@ const DEFAULT_JSON: &str = r#"
     {"patterns": ["DexClassLoader.<init>", "PathClassLoader.<init>", "InMemoryDexClassLoader.<init>"], "port": {"argument": {"index": 1}}, "kind": "CodeExecution"},
     {"patterns": ["loadClass", "System.load", "System.loadLibrary", "Method.invoke", "Class.forName"], "port": {"argument": {"index": 1}}, "kind": "CodeExecution"},
     {"patterns": ["rawQuery", "execSQL", "compileStatement"], "port": {"argument": {"index": 1}}, "kind": "SQLQuery"},
-    {"patterns": ["WebView.loadUrl", "loadUrl", "loadData", "loadDataWithBaseURL", "evaluateJavascript"], "port": {"argument": {"index": 1}}, "kind": "ExecuteJavascript"},
+    {"patterns": ["WebView.loadUrl", "loadData", "loadDataWithBaseURL", "evaluateJavascript"], "port": {"argument": {"index": 1}}, "kind": "ExecuteJavascript"},
     {"patterns": ["addJavascriptInterface"], "port": {"argument": {"index": 1}}, "kind": "JavascriptInterface"},
     {"patterns": ["setAllowFileAccessFromFileURLs", "setAllowUniversalAccessFromFileURLs"], "port": {"argument": {"index": 1}}, "kind": "WebViewFileAccess"},
     {"patterns": ["Log.d", "Log.i", "Log.w", "Log.e", "Log.v", "println"], "port": {"argument": {"index": 1}}, "kind": "Logging"},

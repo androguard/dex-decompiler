@@ -496,6 +496,8 @@ mod tests {
             api_return_sources,
             invoke_method_map,
             insn_at: HashMap::new(),
+            registers_size: 0,
+            ins_size: 0,
         }
     }
 

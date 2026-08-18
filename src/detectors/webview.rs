@@ -80,6 +80,22 @@ pub fn scan_webview_unsafe(
             "webview_js_bridge_user_url",
             &["addJavascriptInterface", "loadUrl", "evaluateJavascript"],
         ));
+        // Deeplink triad at DEX level: getDataString / Deeplink* + JS bridge + user URL.
+        let deeplink = class_name.contains("Deeplink")
+            || method_name.to_ascii_lowercase().contains("deeplink")
+            || owned
+                .invoke_method_map
+                .values()
+                .any(|m| m.contains("getDataString") || m.contains("getData"));
+        if deeplink {
+            out.extend(invoke_scan(
+                owned,
+                class_name,
+                method_name,
+                "deeplink_webview_js_bridge",
+                &["addJavascriptInterface", "loadUrl", "getDataString"],
+            ));
+        }
     }
 
     // TikTok CVE-2022-28799 impact path: attacker URL in WebView → cookie/token exfil.

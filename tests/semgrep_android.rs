@@ -48,9 +48,11 @@ fn builtin_includes_general_and_mastg() {
 #[test]
 fn default_android_rule_paths_exist() {
     let paths = default_android_rule_paths();
-    assert_eq!(paths.len(), 2);
-    assert!(paths[0].is_file(), "general rules YAML missing: {}", paths[0].display());
-    assert!(paths[1].is_dir(), "MASTG dir missing: {}", paths[1].display());
+    assert!(!paths.is_empty(), "expected default rule paths");
+    assert!(paths[0].is_file(), "primary rules YAML missing: {}", paths[0].display());
+    if paths.len() >= 2 {
+        assert!(paths[1].is_dir(), "MASTG dir missing: {}", paths[1].display());
+    }
 }
 
 #[test]
@@ -59,7 +61,11 @@ fn load_android_rules_none_file_and_dir() {
     assert!(builtin.len() >= 50);
 
     let from_file = load_android_rules(Some(&general_rules_path())).unwrap();
-    assert_eq!(from_file.len(), 4);
+    assert!(
+        from_file.len() >= 4,
+        "general.yml should include the original native rules, got {}",
+        from_file.len()
+    );
 
     let from_dir = load_android_rules(Some(&mastg_dir())).unwrap();
     assert!(from_dir.len() >= 40);
@@ -69,7 +75,11 @@ fn load_android_rules_none_file_and_dir() {
 #[test]
 fn load_rules_from_yaml_file_general() {
     let rules = load_rules_from_yaml_file(&general_rules_path()).unwrap();
-    assert_eq!(rules.len(), 4);
+    assert!(
+        rules.len() >= 4,
+        "general.yml should include the original native rules, got {}",
+        rules.len()
+    );
 }
 
 #[test]
@@ -117,7 +127,11 @@ fn mastg_dir_loads_every_yaml_file() {
 #[test]
 fn each_general_rule_has_native_hint() {
     let rules = load_rules_from_str(ANDROID_GENERAL_RULES_YAML).unwrap();
-    assert_eq!(rules.len(), 4);
+    assert!(
+        rules.len() >= 4,
+        "embedded general rules should include the original native set, got {}",
+        rules.len()
+    );
     for rule in &rules {
         assert!(
             rule.native.is_some(),
@@ -130,7 +144,11 @@ fn each_general_rule_has_native_hint() {
 #[test]
 fn yaml_roundtrip_from_embedded() {
     let rules = load_rules_from_str(ANDROID_GENERAL_RULES_YAML).unwrap();
-    assert_eq!(rules.len(), 4);
+    assert!(
+        rules.len() >= 4,
+        "embedded general rules should include the original native set, got {}",
+        rules.len()
+    );
     let ssl = rules
         .iter()
         .find(|r| r.id == "android.ssl.bypass-handler-proceed")

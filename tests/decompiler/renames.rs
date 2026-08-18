@@ -92,12 +92,21 @@ fn test_rename_method() {
 
 #[test]
 fn test_rename_variable() {
-    // Simple#foo: result -> myResult (method returns v0, named "result")
-    let bytecode: &[u8] = &[0x12, 0x00, 0x0f, 0x00]; // const/4 v0, 0; return v0
+    // const/4+return is folded to `return 0`; a single new-instance is inlined
+    // to `return new Object()`. Two uses of the same local keep a name.
+    let bytecode: &[u8] = &[
+        0x22, 0x00, 0x00, 0x00, // new-instance v0, type@0 Ljava/lang/Object;
+        0x38, 0x00, 0x02, 0x00, // if-eqz v0, +2
+        0x11, 0x00,             // return-object v0
+        0x11, 0x00,             // return-object v0
+    ];
     let dex_bytes = minimal_dex_with_method_code(bytecode);
     let dex = parse_dex(&dex_bytes).unwrap();
     let mut var_map = HashMap::new();
-    var_map.insert("result".to_string(), "myResult".to_string());
+    // Whatever display name the decompiler picks, map it to myResult.
+    for old in ["result", "local0", "p0", "o0", "obj", "object"] {
+        var_map.insert(old.to_string(), "myResult".to_string());
+    }
     let mut rename = RenameMap::default();
     rename
         .variable

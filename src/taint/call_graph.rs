@@ -42,10 +42,8 @@ impl CallGraph {
                 continue;
             };
             for (&invoke_offset, method_ref) in &owned.invoke_method_map {
-                let Some(callee) = index.resolve_callee(method_ref) else {
-                    continue;
-                };
-                if !include(callee) {
+                let callees = index.resolve_callees(method_ref);
+                if callees.is_empty() {
                     continue;
                 }
                 let arg_regs = owned
@@ -53,15 +51,20 @@ impl CallGraph {
                     .get(&invoke_offset)
                     .map(|(reads, _)| reads.clone())
                     .unwrap_or_default();
-                let edge = CallEdge {
-                    caller: mref.id,
-                    callee,
-                    invoke_offset,
-                    arg_regs,
-                    method_ref: method_ref.clone(),
-                };
-                cg.outs.entry(mref.id).or_default().push(edge.clone());
-                cg.ins.entry(callee).or_default().push(edge);
+                for callee in callees {
+                    if !include(callee) {
+                        continue;
+                    }
+                    let edge = CallEdge {
+                        caller: mref.id,
+                        callee,
+                        invoke_offset,
+                        arg_regs: arg_regs.clone(),
+                        method_ref: method_ref.clone(),
+                    };
+                    cg.outs.entry(mref.id).or_default().push(edge.clone());
+                    cg.ins.entry(callee).or_default().push(edge);
+                }
             }
         }
         Ok(cg)

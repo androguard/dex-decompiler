@@ -146,6 +146,8 @@ mod tests {
             api_return_sources: vec![],
             invoke_method_map,
             insn_at,
+            registers_size: 0,
+            ins_size: 0,
         };
         let findings =
             scan_command_receiver(&owned, "com.sec.factory.camera.TestReceiver", "onReceive");

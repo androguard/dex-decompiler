@@ -115,6 +115,8 @@ mod tests {
             api_return_sources: vec![((0, 0), "java.util.zip.ZipEntry.getName".into())],
             invoke_method_map,
             insn_at,
+            registers_size: 0,
+            ins_size: 0,
         };
         let findings = scan_zip_slip(&owned, "org.zeroturnaround.zip.Zips", "process");
         assert!(

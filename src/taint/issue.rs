@@ -11,6 +11,12 @@ pub struct TraceFrame {
     pub offset: Option<u32>,
     pub kind: String,
     pub description: String,
+    /// Recovered dest URL or `extra:<key>` breadcrumb.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<String>,
+    /// `field:Class.field` breadcrumb when the hop is heap-sensitive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -8,13 +8,13 @@
     {"patterns": ["getDeviceId", "getImei", "getSubscriberId", "getAndroidId", "Settings$Secure.getString"], "port": "return", "kind": "DeviceId"},
     {"patterns": ["getLastLocation", "getCurrentLocation", "getLatitude", "getLongitude"], "port": "return", "kind": "Location"},
     {"patterns": ["onReceive", "BroadcastReceiver"], "port": {"argument": {"index": 0}}, "kind": "ReceiverUserInput"},
-    {"patterns": ["query", "ContentResolver.query"], "port": "return", "kind": "ProviderUserInput"}
+    {"patterns": ["ContentResolver.query"], "port": "return", "kind": "ProviderUserInput"}
   ],
   "sinks": [
     {"patterns": ["Runtime.exec", "ProcessBuilder.<init>", "ProcessBuilder.start"], "port": {"argument": {"index": 0}}, "kind": "CodeExecution"},
     {"patterns": ["DexClassLoader.<init>", "PathClassLoader.<init>", "InMemoryDexClassLoader", "loadClass", "System.load", "System.loadLibrary"], "port": {"argument": {"index": 0}}, "kind": "CodeExecution"},
     {"patterns": ["rawQuery", "execSQL", "compileStatement"], "port": {"argument": {"index": 0}}, "kind": "SQLQuery"},
-    {"patterns": ["WebView.loadUrl", "loadUrl", "loadData", "loadDataWithBaseURL", "evaluateJavascript"], "port": {"argument": {"index": 0}}, "kind": "ExecuteJavascript"},
+    {"patterns": ["WebView.loadUrl", "loadData", "loadDataWithBaseURL", "evaluateJavascript"], "port": {"argument": {"index": 0}}, "kind": "ExecuteJavascript"},
     {"patterns": ["addJavascriptInterface"], "port": {"argument": {"index": 0}}, "kind": "JavascriptInterface"},
     {"patterns": ["Log.d", "Log.i", "Log.w", "Log.e", "Log.v", "println"], "port": {"argument": {"index": 1}}, "kind": "Logging"},
     {"patterns": ["startActivity", "startActivityForResult", "startService", "bindService", "sendBroadcast", "sendOrderedBroadcast"], "port": {"argument": {"index": 0}}, "kind": "LaunchingComponent"},
@@ -32,7 +32,7 @@
     {"patterns": ["Bundle.putString", "putString", "putCharSequence"], "from": {"argument": {"index": 2}}, "to": {"argument": {"index": 0}}}
   ],
   "sanitizers": [
-    {"patterns": ["MessageDigest.digest", "MessageDigest.update", "hashCode", "Objects.hash"], "kinds": ["*"]},
+    {"patterns": ["MessageDigest.digest", "MessageDigest.update", "hashCode", "Objects.hash"], "kinds": []},
     {"patterns": ["URLEncoder.encode", "Uri.encode"], "kinds": ["ActivityUserInput", "UserInput"]},
     {"patterns": ["Base64.encode", "Base64.encodeToString"], "kinds": []}
   ],

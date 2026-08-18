@@ -459,6 +459,7 @@ Tests mirror [androguard decompiler tests](https://github.com/androguard/androgu
 - **Control flow**: `tests/decompiler/control_flow.rs` – return, if/else, while, loop exit.
 - **Equivalence**: `tests/decompiler/equivalence.rs` – parse-fail, minimal DEX, try/catch comment, switch packed cases. Optional tests for simplification and arrays run only if androguard test data exists under `tests/data/APK/` (Test.dex, FillArrays.dex).
 - **Value flow / tainting**: `src/decompile/value_flow.rs` (unit) and `tests/decompiler/value_flow.rs` (integration) – reaching definitions, def-use/use-def, propagation from a seed (return, pass to function, transitive copies, complex flows: param+return, callee return→return).
+- **Privacy + vuln demo**: `testdata/privacy_vuln_demo/` — compile-able APK with intra-procedural PII leaks (default kinds + catalog extras) and one method per `scan_dex_parallel` detector category; `tests/decompiler/privacy_vuln_demo.rs` locks taint, extra-PII merge, VF detectors, and PendingIntent (`cargo test --test decompiler_tests privacy_vuln_demo`). Rebuild with `bash testdata/privacy_vuln_demo/build.sh`.
 - **Renames**: `tests/decompiler/renames.rs` – package, class, method, field, and variable renames via `RenameMap` and `decompile_with_renames` (Python).
 
 ```bash

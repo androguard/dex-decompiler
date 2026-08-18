@@ -21,6 +21,10 @@ pub struct ValueFlowAnalysisOwned {
     pub invoke_method_map: InvokeMethodMap,
     /// Disassembly label per instruction offset: `"mnemonic operands"`.
     pub insn_at: HashMap<u32, String>,
+    /// `code_item.registers_size` (total virtual registers).
+    pub registers_size: u32,
+    /// `code_item.ins_size` (incoming argument register slots, including `this`).
+    pub ins_size: u32,
 }
 
 impl ValueFlowAnalysisOwned {
