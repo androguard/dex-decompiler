@@ -482,6 +482,10 @@ fn is_platform_class(class_name: &str) -> bool {
 }
 
 fn collect_method_jobs(dex: &DexFile) -> Vec<MethodJob> {
+    collect_method_jobs_scoped(dex, None)
+}
+
+fn collect_method_jobs_scoped(dex: &DexFile, prefixes: Option<&[String]>) -> Vec<MethodJob> {
     let mut jobs = Vec::new();
     for class_result in dex.class_defs() {
         let Ok(class_def) = class_result else { continue };
@@ -489,6 +493,11 @@ fn collect_method_jobs(dex: &DexFile) -> Vec<MethodJob> {
         let class_name = descriptor_to_java(&class_type);
         if is_platform_class(&class_name) {
             continue;
+        }
+        if let Some(prefs) = prefixes {
+            if !crate::detectors::class_matches_prefixes(&class_name, prefs) {
+                continue;
+            }
         }
         let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
         for encoded in class_data
@@ -537,6 +546,19 @@ pub fn sequential_scan_method_cap() -> usize {
 pub fn scan_dex_semgrep_sequential_with_progress<F>(
     dex: &DexFile,
     rules: &[SemgrepRule],
+    on_progress: Option<F>,
+) -> Vec<SemgrepFinding>
+where
+    F: FnMut(usize, usize, &[SemgrepFinding]),
+{
+    scan_dex_semgrep_sequential_scoped_with_progress(dex, rules, None, on_progress)
+}
+
+/// Sequential Semgrep limited to `class_prefixes` (when `Some` and non-empty).
+pub fn scan_dex_semgrep_sequential_scoped_with_progress<F>(
+    dex: &DexFile,
+    rules: &[SemgrepRule],
+    class_prefixes: Option<&[String]>,
     mut on_progress: Option<F>,
 ) -> Vec<SemgrepFinding>
 where
@@ -549,13 +571,16 @@ where
         }
         return Vec::new();
     }
-    let mut jobs = collect_method_jobs(dex);
+    let mut jobs = collect_method_jobs_scoped(dex, class_prefixes);
     let cap = sequential_scan_method_cap();
     if jobs.len() > cap {
         jobs.truncate(cap);
     }
     let total = jobs.len();
-    let decompiler = Decompiler::new(dex);
+    // Recreate periodically: Decompiler caches (inner/lambda bodies) grow without bound
+    // across thousands of methods and Jetsam-kill the process on macOS.
+    const REFRESH_EVERY: usize = 48;
+    let mut decompiler = Decompiler::new(dex);
     let mut out = Vec::new();
     let progress_every = (total / 200).max(16);
     let mut last_reported_len = 0usize;
@@ -563,6 +588,9 @@ where
         cb(0, total, &out);
     }
     for (i, job) in jobs.iter().enumerate() {
+        if i > 0 && i % REFRESH_EVERY == 0 {
+            decompiler = Decompiler::new(dex);
+        }
         out.extend(scan_method_prepared(
             &decompiler,
             &job.encoded,

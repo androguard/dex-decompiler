@@ -1,4 +1,4 @@
-//! WebView: user input → loadUrl/loadDataWithBaseURL; JS bridge; file access.
+//! WebView: user input → loadUrl/loadDataWithBaseURL; JS bridge; file access; cookies.
 
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
 use crate::detectors::types::{invoke_scan, method_matches_any, source_sink_scan, VulnFinding};
@@ -23,6 +23,12 @@ const FILE_ACCESS_PATTERNS: &[&str] = &[
     "setAllowFileAccessFromFileURLs",
     "setAllowUniversalAccessFromFileURLs",
     "setAllowFileAccess",
+];
+const COOKIE_APIS: &[&str] = &[
+    "CookieManager.getCookie",
+    "CookieManager.setCookie",
+    "android.webkit.CookieManager.getCookie",
+    "android.webkit.CookieManager.setCookie",
 ];
 
 pub fn scan_webview_unsafe(
@@ -75,5 +81,23 @@ pub fn scan_webview_unsafe(
             &["addJavascriptInterface", "loadUrl", "evaluateJavascript"],
         ));
     }
+
+    // TikTok CVE-2022-28799 impact path: attacker URL in WebView → cookie/token exfil.
+    let has_cookie = owned
+        .invoke_method_map
+        .values()
+        .any(|m| method_matches_any(m, COOKIE_APIS));
+    if has_user_load && has_cookie {
+        let mut cookie = invoke_scan(
+            owned,
+            class_name,
+            method_name,
+            "webview_cookie_exfil",
+            COOKIE_APIS,
+        );
+        cookie.truncate(1);
+        out.extend(cookie);
+    }
+
     out
 }

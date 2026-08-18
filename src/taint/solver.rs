@@ -22,12 +22,17 @@ pub struct SolveOptions {
     pub max_iterations: usize,
     /// Skip methods whose class name starts with any of these prefixes.
     pub exclude_prefixes: Vec<String>,
+    /// When non-empty, only analyze classes matching these prefixes
+    /// (`class == prefix` or `class.starts_with(prefix + ".")`).
+    /// Library classes are still always skipped via [`crate::detectors::is_library_class`].
+    pub include_prefixes: Vec<String>,
 }
 
 impl SolveOptions {
     pub fn default_android() -> Self {
         Self {
             max_iterations: 8,
+            // Kept for callers that customize; primary skip is `is_library_class`.
             exclude_prefixes: vec![
                 "android.".into(),
                 "androidx.".into(),
@@ -36,8 +41,7 @@ impl SolveOptions {
                 "java.".into(),
                 "javax.".into(),
                 "dalvik.".into(),
-                "com.google.android.".into(),
-                "com.google.firebase.".into(),
+                "com.google.".into(),
                 "com.android.".into(),
                 "okhttp3.".into(),
                 "okio.".into(),
@@ -45,7 +49,13 @@ impl SolveOptions {
                 "com.squareup.".into(),
                 "com.facebook.".into(),
                 "io.sentry.".into(),
+                "org.apache.".into(),
+                "org.bouncycastle.".into(),
+                "org.checkerframework.".into(),
+                "io.grpc.".into(),
+                "io.reactivex.".into(),
             ],
+            include_prefixes: Vec::new(),
         }
     }
 }
@@ -109,9 +119,22 @@ fn sanitize_kinds(kinds: &HashSet<String>, san: &SanitizerModel) -> HashSet<Stri
 }
 
 fn should_skip(class_name: &str, opts: &SolveOptions) -> bool {
-    opts.exclude_prefixes
+    if crate::detectors::is_library_class(class_name) {
+        return true;
+    }
+    if opts
+        .exclude_prefixes
         .iter()
         .any(|p| class_name.starts_with(p.as_str()))
+    {
+        return true;
+    }
+    if !opts.include_prefixes.is_empty()
+        && !crate::detectors::class_matches_prefixes(class_name, &opts.include_prefixes)
+    {
+        return true;
+    }
+    false
 }
 
 /// Analyze a single DEX with the default Android options.

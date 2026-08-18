@@ -52,6 +52,30 @@ pub fn scan_uri_grant(
         }
     }
 
+    // Oversecured VulnerableActivity: setResult(-1, getIntent()) / setResult(getIntent()).
+    if method_name == "onCreate" || method_name == "onNewIntent" {
+        let has_set_result = owned
+            .invoke_method_map
+            .values()
+            .any(|m| m.contains("setResult"));
+        let has_get_intent = owned.invoke_method_map.values().any(|m| m.contains("getIntent"))
+            || owned
+                .api_return_sources
+                .iter()
+                .any(|(_, s)| s.contains("getIntent"));
+        if has_set_result && has_get_intent {
+            let mut passthrough = invoke_scan(
+                owned,
+                class_name,
+                method_name,
+                "uri_permission_setresult_passthrough",
+                &["setResult"],
+            );
+            passthrough.truncate(1);
+            findings.extend(passthrough);
+        }
+    }
+
     findings.extend(source_sink_scan(
         owned,
         class_name,

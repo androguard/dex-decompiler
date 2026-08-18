@@ -344,6 +344,378 @@ pub fn find_method_callees_by_class_method(
     Err(DexDecompilerError::Parse("class_idx out of range".into()))
 }
 
+/// One frame on a reverse call path (caller → … → target).
+#[derive(Debug, Clone, Serialize)]
+pub struct CallTraceFrame {
+    pub class_name: String,
+    pub method_name: String,
+    pub method_descriptor: String,
+    pub class_idx: usize,
+    pub method_idx_in_class: usize,
+    pub method_idx: u32,
+    /// Invoke offset inside this method that reaches the next frame (None on the target).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invoke_kind: Option<String>,
+}
+
+/// One full reverse call path: entry/root first, target last.
+#[derive(Debug, Clone, Serialize)]
+pub struct CallTracePath {
+    pub frames: Vec<CallTraceFrame>,
+}
+
+/// Reverse call traces for a method (who calls it, and who calls those callers, …).
+#[derive(Debug, Clone, Serialize)]
+pub struct MethodCallTracesInfo {
+    pub target_method_idx: u32,
+    pub target_class_name: String,
+    pub target_method_name: String,
+    pub target_descriptor: String,
+    pub paths: Vec<CallTracePath>,
+    /// Depth / fan-in / path caps were hit.
+    pub truncated: bool,
+    pub max_depth: usize,
+}
+
+const CALL_TRACE_MAX_DEPTH: usize = 6;
+const CALL_TRACE_MAX_PATHS: usize = 48;
+const CALL_TRACE_MAX_FANIN: usize = 16;
+
+#[derive(Clone, Copy, Debug)]
+struct CompactInEdge {
+    caller_method_idx: u32,
+    class_idx: u32,
+    method_idx_in_class: u32,
+    offset: u32,
+    opcode: u8,
+}
+
+fn resolve_encoded_method_idx(
+    dex: &DexFile,
+    class_idx: usize,
+    method_idx_in_class: usize,
+) -> Result<u32> {
+    let mut n = 0usize;
+    for class_result in dex.class_defs() {
+        let Ok(class_def) = class_result else {
+            n += 1;
+            continue;
+        };
+        if n != class_idx {
+            n += 1;
+            continue;
+        }
+        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else {
+            return Err(DexDecompilerError::Parse(format!(
+                "class_idx {} has no class_data",
+                class_idx
+            )));
+        };
+        let all: Vec<&EncodedMethod> = class_data
+            .direct_methods
+            .iter()
+            .chain(class_data.virtual_methods.iter())
+            .collect();
+        let encoded = all.get(method_idx_in_class).ok_or_else(|| {
+            DexDecompilerError::Parse(format!(
+                "method_idx {} out of range (class has {} methods)",
+                method_idx_in_class,
+                all.len()
+            ))
+        })?;
+        return Ok(encoded.method_idx);
+    }
+    Err(DexDecompilerError::Parse(format!(
+        "class_idx {} out of range",
+        class_idx
+    )))
+}
+
+/// One-pass reverse call index: callee method_ids → incoming invoke edges (capped per callee).
+///
+/// Build once per DEX and reuse with [`find_method_call_traces_with_index`] — rebuilding this
+/// for every sink is the main cost of entry-point reachability.
+#[derive(Debug, Clone, Default)]
+pub struct ReverseCallIndex {
+    rev: std::collections::HashMap<u32, Vec<CompactInEdge>>,
+}
+
+impl ReverseCallIndex {
+    pub fn build(dex: &DexFile) -> Self {
+        Self::build_with_progress(dex, |_, _| {})
+    }
+
+    /// Like [`build`], but invokes `on_progress(classes_done, classes_total)` periodically.
+    pub fn build_with_progress(dex: &DexFile, on_progress: impl FnMut(usize, usize)) -> Self {
+        Self {
+            rev: build_reverse_call_index(dex, on_progress),
+        }
+    }
+
+    pub fn incoming_count(&self) -> usize {
+        self.rev.len()
+    }
+}
+
+/// One-pass reverse call index: callee method_ids → incoming invoke edges (capped per callee).
+fn build_reverse_call_index(
+    dex: &DexFile,
+    mut on_progress: impl FnMut(usize, usize),
+) -> std::collections::HashMap<u32, Vec<CompactInEdge>> {
+    use std::collections::HashMap;
+    let mut rev: HashMap<u32, Vec<CompactInEdge>> = HashMap::new();
+    let total = dex.header.class_defs_size as usize;
+    let mut last_report = 0usize;
+
+    for (class_idx, class_result) in dex.class_defs().enumerate() {
+        let done = class_idx + 1;
+        // ~2% steps or every 250 classes, whichever is more frequent for small DEXes.
+        let step = (total / 50).max(250).min(2000).max(1);
+        if done == total || done - last_report >= step {
+            on_progress(done, total);
+            last_report = done;
+        }
+        let Ok(class_def) = class_result else { continue };
+        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+        let all: Vec<&EncodedMethod> = class_data
+            .direct_methods
+            .iter()
+            .chain(class_data.virtual_methods.iter())
+            .collect();
+        for (method_idx_in_class, encoded) in all.into_iter().enumerate() {
+            if encoded.code_off == 0 {
+                continue;
+            }
+            let Ok(code) = dex.get_code_item(encoded.code_off) else {
+                continue;
+            };
+            let insns = code.insns_slice(&dex.data);
+            let Ok(decoded) = decode_all(insns, 0) else {
+                continue;
+            };
+            for ins in decoded {
+                let Some(callee) = invoke_method_index(insns, ins.offset, ins.opcode) else {
+                    continue;
+                };
+                let entry = rev.entry(callee).or_default();
+                if entry.len() >= CALL_TRACE_MAX_FANIN {
+                    continue;
+                }
+                // Prefer unique callers (first invoke site wins).
+                if entry
+                    .iter()
+                    .any(|e| e.caller_method_idx == encoded.method_idx)
+                {
+                    continue;
+                }
+                entry.push(CompactInEdge {
+                    caller_method_idx: encoded.method_idx,
+                    class_idx: class_idx as u32,
+                    method_idx_in_class: method_idx_in_class as u32,
+                    offset: ins.offset,
+                    opcode: ins.opcode,
+                });
+            }
+        }
+    }
+    rev
+}
+
+fn frame_from_method(
+    dex: &DexFile,
+    method_idx: u32,
+    class_idx: usize,
+    method_idx_in_class: usize,
+    offset: Option<u32>,
+    invoke_kind: Option<String>,
+) -> CallTraceFrame {
+    let (class_name, method_name, method_descriptor) =
+        method_descriptor_from_dex(dex, method_idx).unwrap_or_else(|_| {
+            ("?".into(), "?".into(), "()".into())
+        });
+    CallTraceFrame {
+        class_name,
+        method_name,
+        method_descriptor,
+        class_idx,
+        method_idx_in_class,
+        method_idx,
+        offset,
+        invoke_kind,
+    }
+}
+
+/// Build reverse call traces ending at `callee_method_idx` (paths are root → … → target).
+pub fn find_method_call_traces(
+    dex: &DexFile,
+    callee_method_idx: u32,
+) -> Result<MethodCallTracesInfo> {
+    let index = ReverseCallIndex::build(dex);
+    find_method_call_traces_with_index(dex, callee_method_idx, &index)
+}
+
+/// Like [`find_method_call_traces`], but reuses a precomputed [`ReverseCallIndex`].
+pub fn find_method_call_traces_with_index(
+    dex: &DexFile,
+    callee_method_idx: u32,
+    index: &ReverseCallIndex,
+) -> Result<MethodCallTracesInfo> {
+    if callee_method_idx >= dex.header.method_ids_size {
+        return Err(DexDecompilerError::Parse(format!(
+            "method index {} out of range (size {})",
+            callee_method_idx, dex.header.method_ids_size
+        )));
+    }
+    let (target_class_name, target_method_name, target_descriptor) =
+        method_descriptor_from_dex(dex, callee_method_idx)?;
+
+    let rev = &index.rev;
+    let mut paths = Vec::new();
+    let mut truncated = false;
+
+    // Locate UI indices for the target (best-effort).
+    let (target_class_idx, target_method_idx_in_class) = {
+        let mut found = (0usize, 0usize);
+        'outer: for (ci, class_result) in dex.class_defs().enumerate() {
+            let Ok(class_def) = class_result else { continue };
+            let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+            for (mi, encoded) in class_data
+                .direct_methods
+                .iter()
+                .chain(class_data.virtual_methods.iter())
+                .enumerate()
+            {
+                if encoded.method_idx == callee_method_idx {
+                    found = (ci, mi);
+                    break 'outer;
+                }
+            }
+        }
+        found
+    };
+
+    let target_frame = frame_from_method(
+        dex,
+        callee_method_idx,
+        target_class_idx,
+        target_method_idx_in_class,
+        None,
+        None,
+    );
+
+    fn walk(
+        dex: &DexFile,
+        rev: &std::collections::HashMap<u32, Vec<CompactInEdge>>,
+        current: u32,
+        path_to_target: &[CallTraceFrame], // current … target (current first)
+        depth: usize,
+        paths: &mut Vec<CallTracePath>,
+        truncated: &mut bool,
+        on_path: &mut std::collections::HashSet<u32>,
+    ) {
+        if paths.len() >= CALL_TRACE_MAX_PATHS {
+            *truncated = true;
+            return;
+        }
+        let incoming = rev.get(&current).map(|v| v.as_slice()).unwrap_or(&[]);
+        let mut preferred: Vec<&CompactInEdge> = incoming
+            .iter()
+            .filter(|e| {
+                method_descriptor_from_dex(dex, e.caller_method_idx)
+                    .map(|(c, _, _)| !crate::detectors::is_library_class(&c))
+                    .unwrap_or(true)
+            })
+            .collect();
+        if preferred.is_empty() {
+            preferred = incoming.iter().collect();
+        }
+
+        if preferred.is_empty() || depth >= CALL_TRACE_MAX_DEPTH {
+            let mut frames = path_to_target.to_vec();
+            frames.reverse();
+            paths.push(CallTracePath { frames });
+            return;
+        }
+
+        let mut expanded = false;
+        for edge in preferred.into_iter().take(CALL_TRACE_MAX_FANIN) {
+            if paths.len() >= CALL_TRACE_MAX_PATHS {
+                *truncated = true;
+                break;
+            }
+            if !on_path.insert(edge.caller_method_idx) {
+                continue;
+            }
+            expanded = true;
+            let caller_frame = frame_from_method(
+                dex,
+                edge.caller_method_idx,
+                edge.class_idx as usize,
+                edge.method_idx_in_class as usize,
+                Some(edge.offset),
+                Some(invoke_kind_name(edge.opcode).to_string()),
+            );
+            let mut next_path = Vec::with_capacity(path_to_target.len() + 1);
+            next_path.push(caller_frame);
+            next_path.extend_from_slice(path_to_target);
+            walk(
+                dex,
+                rev,
+                edge.caller_method_idx,
+                &next_path,
+                depth + 1,
+                paths,
+                truncated,
+                on_path,
+            );
+            on_path.remove(&edge.caller_method_idx);
+        }
+        if !expanded {
+            let mut frames = path_to_target.to_vec();
+            frames.reverse();
+            paths.push(CallTracePath { frames });
+        }
+    }
+
+    let mut on_path = std::collections::HashSet::new();
+    on_path.insert(callee_method_idx);
+    walk(
+        dex,
+        rev,
+        callee_method_idx,
+        &[target_frame],
+        0,
+        &mut paths,
+        &mut truncated,
+        &mut on_path,
+    );
+
+    // Prefer longer paths first (deeper reverse chains).
+    paths.sort_by(|a, b| b.frames.len().cmp(&a.frames.len()));
+
+    Ok(MethodCallTracesInfo {
+        target_method_idx: callee_method_idx,
+        target_class_name,
+        target_method_name,
+        target_descriptor,
+        paths,
+        truncated,
+        max_depth: CALL_TRACE_MAX_DEPTH,
+    })
+}
+
+/// Resolve UI class/method indices, then build reverse call traces.
+pub fn find_method_call_traces_by_class_method(
+    dex: &DexFile,
+    class_idx: usize,
+    method_idx_in_class: usize,
+) -> Result<MethodCallTracesInfo> {
+    let method_idx = resolve_encoded_method_idx(dex, class_idx, method_idx_in_class)?;
+    find_method_call_traces(dex, method_idx)
+}
+
 /// One field get/put site.
 #[derive(Debug, Clone, Serialize)]
 pub struct FieldXref {

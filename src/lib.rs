@@ -28,14 +28,16 @@ pub use decompile::json_export::{ClassJson, DexJsonExport, FieldJson, MethodJson
 pub use decompile::value_flow::{ValueFlowAnalysis, ValueFlowAnalysisOwned, ValueFlowResult};
 pub use detectors::pending_intent::{PendingIntentFinding, scan_pending_intents};
 pub use detectors::{
-    category_meta, is_library_class, run_all_detectors, scan_dex_parallel,
-    scan_pending_intents_dex_parallel, CategoryMeta, VulnFinding, VulnTraceStep,
+    category_meta, class_matches_prefixes, count_method_jobs_scoped, is_com_android_lab_app,
+    is_library_class, run_all_detectors, scan_dex_parallel, scan_dex_parallel_scoped,
+    scan_pending_intents_dex_parallel, scan_pending_intents_dex_parallel_scoped, CategoryMeta,
+    VulnFinding, VulnTraceStep,
 };
 pub use semgrep::{
     builtin_android_rules, default_android_rule_paths, load_android_rules, load_rules_from_dir,
     load_rules_from_str, load_rules_from_yaml_file, scan_dex_semgrep, scan_dex_semgrep_sequential,
-    scan_dex_semgrep_sequential_with_progress, scan_dex_semgrep_with_progress, scan_method_semgrep,
-    scan_xml_semgrep,
+    scan_dex_semgrep_sequential_scoped_with_progress, scan_dex_semgrep_sequential_with_progress,
+    scan_dex_semgrep_with_progress, scan_method_semgrep, scan_xml_semgrep,
     scan_xml_semgrep_sequential, SemgrepFinding, SemgrepRule, ANDROID_ALL_RULES_YAML,
     ANDROID_GENERAL_RULES_YAML,
 };
@@ -50,8 +52,10 @@ pub use taint::{
 };
 pub use xref::{
     find_field_xrefs, find_method_callees, find_method_callees_by_class_method,
-    find_method_callers, find_method_callers_by_class_method, FieldXref, FieldXrefsInfo,
-    MethodCallee, MethodCalleesInfo, MethodCaller, MethodCallersInfo,
+    find_method_call_traces, find_method_call_traces_by_class_method,
+    find_method_call_traces_with_index, find_method_callers, find_method_callers_by_class_method,
+    CallTraceFrame, CallTracePath, FieldXref, FieldXrefsInfo, MethodCallee, MethodCalleesInfo,
+    MethodCaller, MethodCallersInfo, MethodCallTracesInfo, ReverseCallIndex,
 };
 
 /// Parse a DEX file from raw bytes. Returns decompiler Result (maps parser errors to Parse).
