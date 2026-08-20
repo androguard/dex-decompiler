@@ -64,6 +64,16 @@ fn block_is_effectively_empty(b: &crate::decompile::cfg::CfgBlock) -> bool {
     matches!(b.end, BlockEnd::Goto(_)) && b.instruction_offsets.len() <= 1
 }
 
+/// Returns true if the region contains an If (at any depth).
+pub fn region_contains_if(region: &Region) -> bool {
+    match region {
+        Region::If { .. } | Region::Switch { .. } => true,
+        Region::Seq(children) => children.iter().any(region_contains_if),
+        Region::Loop { body, .. } => region_contains_if(body),
+        Region::Block(_) => false,
+    }
+}
+
 /// Returns true if the region contains a Loop (at any depth).
 /// Used to prefer "if (cond) { short/return } else { loop }" by swapping when then has loop and else doesn't.
 pub fn region_contains_loop(region: &Region) -> bool {
@@ -80,27 +90,452 @@ pub fn region_contains_loop(region: &Region) -> bool {
     }
 }
 
-/// If loop body is Seq([Block(header), If { condition, then_branch, else_branch }]), returns
-/// (condition, else_branch, then_branch) so emitter can emit "while (!(condition)) { else_branch }; then_branch".
-/// When then_branch is non-empty (e.g. exit block with Swap + return), it is emitted after the while.
+/// Strict break pattern: `Seq([Block(header), If { … }])` only.
 pub fn loop_body_break_pattern(body: &Region, header: BlockId) -> Option<(&str, &Region, &Region)> {
-    match body {
-        Region::Seq(children) if children.len() >= 2 => {
-            let (first, second) = (&children[0], &children[1]);
-            match (first, second) {
-                (Region::Block(bid), Region::If { condition, then_branch, else_branch })
-                    if *bid == header =>
-                {
-                    Some((condition.as_str(), else_branch, then_branch))
+    let Region::Seq(children) = body else {
+        return None;
+    };
+    if children.len() < 2 {
+        return None;
+    }
+    match (&children[0], &children[1]) {
+        (
+            Region::Block(bid),
+            Region::If {
+                condition,
+                then_branch,
+                else_branch,
+            },
+        ) if *bid == header => {
+            // Empty-then + non-empty-else is do-while / while(true) territory, not break-while.
+            if region_is_empty(then_branch) && !region_is_empty(else_branch) {
+                return None;
+            }
+            Some((condition.as_str(), else_branch, then_branch))
+        }
+        _ => None,
+    }
+}
+
+/// Trailing exit-if break pattern (handles nested `Seq` wrappers). Used for mis-peeled
+/// empty do-while tails (e.g. sum2d inner index loop) — not for general loop emission.
+pub fn loop_body_break_pattern_trailing(body: &Region, header: BlockId) -> Option<(&str, &Region, &Region)> {
+    let Region::Seq(children) = body else {
+        return None;
+    };
+    if children.is_empty() {
+        return None;
+    }
+    match children.first()? {
+        Region::Block(bid) if *bid == header => {}
+        _ => return None,
+    }
+    let suffix = &children[1..];
+    let (cond, else_b, then_b) = trailing_exit_if(suffix)?;
+    if let Some(middle) = prefix_before_trailing_if(suffix) {
+        if region_contains_loop(&middle) {
+            return None;
+        }
+    }
+    if region_contains_loop(else_b) || region_contains_loop(then_b) {
+        return None;
+    }
+    Some((cond, else_b, then_b))
+}
+
+fn trailing_exit_if(suffix: &[Region]) -> Option<(&str, &Region, &Region)> {
+    if suffix.is_empty() {
+        return None;
+    }
+    match suffix.last()? {
+        Region::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Some((condition.as_str(), else_branch, then_branch)),
+        Region::Seq(inner) => trailing_exit_if(inner),
+        _ => None,
+    }
+}
+
+/// Middle regions between loop header block and trailing exit-if (for emission inside the while body).
+pub fn loop_body_break_middle(body: &Region, header: BlockId) -> Option<Region> {
+    let Region::Seq(children) = body else {
+        return None;
+    };
+    if children.is_empty() {
+        return None;
+    }
+    match children.first()? {
+        Region::Block(bid) if *bid == header => {}
+        _ => return None,
+    }
+    prefix_before_trailing_if(&children[1..])
+}
+
+fn prefix_before_trailing_if(suffix: &[Region]) -> Option<Region> {
+    if suffix.is_empty() {
+        return Some(Region::Seq(vec![]));
+    }
+    match suffix.last()? {
+        Region::If { .. } => {
+            if suffix.len() == 1 {
+                Some(Region::Seq(vec![]))
+            } else {
+                Some(Region::Seq(suffix[..suffix.len() - 1].to_vec()))
+            }
+        }
+        Region::Seq(inner) => {
+            let inner_prefix = prefix_before_trailing_if(inner)?;
+            if suffix.len() == 1 {
+                Some(inner_prefix)
+            } else {
+                let mut parts: Vec<Region> = suffix[..suffix.len() - 1].to_vec();
+                if !region_is_empty(&inner_prefix) {
+                    parts.push(inner_prefix);
                 }
-                _ => None,
+                Some(Region::Seq(parts))
             }
         }
         _ => None,
     }
 }
 
-/// Unwrap a region that is a single `If`, or a `Seq` containing exactly one non-empty child that is an `If`.
+/// Pretty-print a region tree with block ids (L0-2 debug helper).
+pub fn format_region_debug(region: &Region, cfg: &MethodCfg) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    fn walk(r: &Region, cfg: &MethodCfg, d: usize, out: &mut String) {
+        match r {
+            Region::Block(bid) => {
+                let end = cfg.blocks.get(*bid).map(|b| format!("{:?}", b.end)).unwrap_or_default();
+                let _ = writeln!(out, "{:indent$}Block({bid}) {end}", "", indent = d * 2);
+            }
+            Region::Seq(v) => {
+                let _ = writeln!(out, "{:indent$}Seq({})", "", v.len(), indent = d * 2);
+                for c in v {
+                    walk(c, cfg, d + 1, out);
+                }
+            }
+            Region::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let _ = writeln!(out, "{:indent$}If({condition})", "", indent = d * 2);
+                walk(then_branch, cfg, d + 1, out);
+                walk(else_branch, cfg, d + 1, out);
+            }
+            Region::Loop { header, body } => {
+                let _ = writeln!(out, "{:indent$}Loop(header={header})", "", indent = d * 2);
+                walk(body, cfg, d + 1, out);
+            }
+            Region::Switch { condition, cases, default } => {
+                let _ = writeln!(out, "{:indent$}Switch({condition}, {} cases)", "", cases.len(), indent = d * 2);
+                for (val, body) in cases {
+                    let _ = writeln!(out, "{:indent$}case {val}:", "", indent = d * 2);
+                    walk(body, cfg, d + 1, out);
+                }
+                let _ = writeln!(out, "{:indent$}default:", "", indent = d * 2);
+                walk(default, cfg, d + 1, out);
+            }
+        }
+    }
+    walk(region, cfg, 0, &mut out);
+    let mut ids = Vec::new();
+    collect_block_ids(region, &mut ids);
+    let _ = writeln!(out, "region blocks: {ids:?}");
+    out
+}
+
+fn collect_block_ids(region: &Region, out: &mut Vec<BlockId>) {
+    match region {
+        Region::Block(bid) => out.push(*bid),
+        Region::Seq(v) => v.iter().for_each(|c| collect_block_ids(c, out)),
+        Region::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_block_ids(then_branch, out);
+            collect_block_ids(else_branch, out);
+        }
+        Region::Loop { body, .. } => collect_block_ids(body, out),
+        Region::Switch { cases, default, .. } => {
+            cases.iter().for_each(|(_, r)| collect_block_ids(r, out));
+            collect_block_ids(default, out);
+        }
+    }
+}
+
+/// Exit tail after a bogus empty do-while — real loop body (assignments), not a lone return.
+pub fn region_has_non_return_work(region: &Region, cfg: &MethodCfg) -> bool {
+    match region {
+        Region::Seq(children) => children
+            .iter()
+            .any(|c| region_has_non_return_work(c, cfg)),
+        Region::Block(bid) => cfg.blocks.get(*bid).is_some_and(|b| {
+            if b.instruction_offsets.len() > 1 {
+                return true;
+            }
+            !matches!(b.end, crate::decompile::cfg::BlockEnd::Exit)
+        }),
+        Region::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            region_has_non_return_work(then_branch, cfg)
+                || region_has_non_return_work(else_branch, cfg)
+        }
+        Region::Loop { body, .. } => region_has_non_return_work(body, cfg),
+        Region::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|(_, r)| region_has_non_return_work(r, cfg))
+                || region_has_non_return_work(default, cfg)
+        }
+    }
+}
+
+/// True when a peeled do-while body contains more than the loop header block alone.
+pub fn loop_has_substantial_body(do_body: &Region, header: BlockId, cfg: &MethodCfg) -> bool {
+    match do_body {
+        Region::Seq(children) => children.iter().any(|c| match c {
+            Region::Block(b) => *b != header && !region_is_empty_with_cfg(c, cfg),
+            other => !region_is_empty_with_cfg(other, cfg),
+        }),
+        other => !region_is_empty_with_cfg(other, cfg),
+    }
+}
+
+/// First exit block for loop emission `break` wiring (L2-2).
+pub fn loop_exit_break_target(body: &Region, header: BlockId, cfg: &MethodCfg) -> Option<BlockId> {
+    if let Some((_, _, then_branch)) = loop_body_break_pattern(body, header) {
+        if !region_is_empty(then_branch) {
+            return first_block(then_branch);
+        }
+    }
+    cfg.loop_exit_targets(header).iter().copied().min()
+}
+
+fn trim_trailing_exit_if_suffix(suffix: Region) -> Region {
+    match suffix {
+        Region::Seq(ref children) if children.is_empty() => Region::Seq(vec![]),
+        Region::Seq(children) => {
+            let last_idx = children.len() - 1;
+            match &children[last_idx] {
+                Region::If {
+                    condition,
+                    else_branch,
+                    ..
+                } => {
+                    let mut new_children = children[..last_idx].to_vec();
+                    new_children.push(Region::If {
+                        condition: condition.clone(),
+                        then_branch: Box::new(Region::Seq(vec![])),
+                        else_branch: else_branch.clone(),
+                    });
+                    Region::Seq(new_children)
+                }
+                Region::Seq(_) => {
+                    let mut new_children = children.clone();
+                    new_children[last_idx] = trim_trailing_exit_if_suffix(children[last_idx].clone());
+                    Region::Seq(new_children)
+                }
+                _ => Region::Seq(children),
+            }
+        }
+        Region::If {
+            condition,
+            else_branch,
+            ..
+        } => Region::If {
+            condition: condition.clone(),
+            then_branch: Box::new(Region::Seq(vec![])),
+            else_branch: else_branch.clone(),
+        },
+        other => other,
+    }
+}
+
+fn trim_trailing_exit_if(body: &Region, header: BlockId) -> Option<Region> {
+    let Region::Seq(children) = body else {
+        return None;
+    };
+    if children.is_empty() {
+        return None;
+    }
+    match children.first()? {
+        Region::Block(bid) if *bid == header => {}
+        _ => return None,
+    }
+    let suffix = if children.len() > 1 {
+        trim_trailing_exit_if_suffix(Region::Seq(children[1..].to_vec()))
+    } else {
+        Region::Seq(vec![])
+    };
+    Some(Region::Seq(vec![children[0].clone(), suffix]))
+}
+
+fn should_peel_tail(then_branch: &Region, header: BlockId) -> bool {
+    fn contains_other_loop(r: &Region, header: BlockId) -> bool {
+        match r {
+            Region::Loop { header: h, .. } if *h != header => true,
+            Region::Seq(v) => v.iter().any(|c| contains_other_loop(c, header)),
+            Region::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                contains_other_loop(then_branch, header) || contains_other_loop(else_branch, header)
+            }
+            _ => false,
+        }
+    }
+    contains_other_loop(then_branch, header)
+}
+
+fn peel_one_loop(region: Region, cfg: &MethodCfg) -> Option<Vec<Region>> {
+    let Region::Loop { header, body } = region else {
+        return None;
+    };
+    let (_, _, then_branch) = loop_body_break_pattern(&body, header)?;
+    if region_is_empty(then_branch) || !should_peel_tail(then_branch, header) {
+        return None;
+    }
+    let exit_start = first_block(then_branch)?;
+    if cfg.natural_loop_blocks(header).contains(&exit_start) {
+        return None;
+    }
+    let trimmed_body = trim_trailing_exit_if(&body, header)?;
+    let main = Region::Loop {
+        header,
+        body: Box::new(peel_sequential_loop_tails(trimmed_body, cfg)),
+    };
+    let tail = peel_sequential_loop_tails(then_branch.clone(), cfg);
+    let mut parts = vec![main];
+    match tail {
+        Region::Seq(ts) => parts.extend(ts),
+        t if !region_is_empty(&t) => parts.push(t),
+        _ => {}
+    }
+    Some(parts)
+}
+
+/// L1-2 / L1-4: promote exit tails (tail loops, return) from loop bodies to sequential siblings.
+pub fn peel_sequential_loop_tails(region: Region, cfg: &MethodCfg) -> Region {
+    match region {
+        Region::Seq(children) => {
+            let mut out = Vec::new();
+            for c in children {
+                match peel_one_loop(c.clone(), cfg) {
+                    Some(parts) => out.extend(parts),
+                    None => out.push(peel_sequential_loop_tails(c, cfg)),
+                }
+            }
+            if out.len() == 1 {
+                out.into_iter().next().unwrap()
+            } else {
+                Region::Seq(out)
+            }
+        }
+        Region::Loop { .. } => {
+            if let Some(parts) = peel_one_loop(region.clone(), cfg) {
+                if parts.len() == 1 {
+                    parts.into_iter().next().unwrap()
+                } else {
+                    Region::Seq(parts)
+                }
+            } else {
+                region
+            }
+        }
+        Region::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Region::If {
+            condition,
+            then_branch: Box::new(peel_sequential_loop_tails(*then_branch, cfg)),
+            else_branch: Box::new(peel_sequential_loop_tails(*else_branch, cfg)),
+        },
+        Region::Switch {
+            condition,
+            cases,
+            default,
+        } => Region::Switch {
+            condition,
+            cases: cases
+                .into_iter()
+                .map(|(v, r)| (v, Box::new(peel_sequential_loop_tails(*r, cfg))))
+                .collect(),
+            default: Box::new(peel_sequential_loop_tails(*default, cfg)),
+        },
+        other => other,
+    }
+}
+
+/// L3-2: sequential exit tests in a loop prefix → `(condition, exit_region)` chain.
+pub fn loop_prefix_multi_exit_ifs(region: &Region, header: BlockId) -> Vec<(String, Region)> {
+    let Some(middle) = loop_body_break_middle(region, header) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_exit_ifs(&middle, &mut out);
+    out
+}
+
+fn collect_exit_ifs(region: &Region, out: &mut Vec<(String, Region)>) {
+    match region {
+        Region::Seq(children) => {
+            for c in children {
+                collect_exit_ifs(c, out);
+            }
+        }
+        Region::If {
+            condition,
+            then_branch,
+            else_branch,
+        } if !region_is_empty(then_branch) => {
+            out.push((condition.clone(), then_branch.as_ref().clone()));
+            if !region_is_empty(else_branch) {
+                collect_exit_ifs(else_branch, out);
+            }
+        }
+        Region::If {
+            else_branch, ..
+        } => collect_exit_ifs(else_branch, out),
+        _ => {}
+    }
+}
+
+fn resolve_then_start(
+    cfg: &MethodCfg,
+    branch_target: BlockId,
+    fall_through: BlockId,
+    loop_header: Option<BlockId>,
+    emitted: &HashSet<BlockId>,
+) -> BlockId {
+    if loop_header == Some(branch_target) {
+        return branch_target;
+    }
+    if cfg.is_loop_exit_target(branch_target, loop_header) {
+        let chain = cfg.exit_chain_head(branch_target, loop_header, emitted);
+        if !emitted.contains(&chain) && chain != fall_through {
+            return chain;
+        }
+    }
+    cfg.blocks_that_fall_through_to(branch_target)
+        .into_iter()
+        .find(|&bid| {
+            !emitted.contains(&bid)
+                && bid != fall_through
+                && !cfg.reachable_from(fall_through, bid, loop_header)
+        })
+        .unwrap_or(branch_target)
+}
+
 /// Used for emit-time `} else if (` instead of `} else { if (`.
 pub fn as_single_if(region: &Region) -> Option<(&str, &Region, &Region)> {
     match region {
@@ -199,6 +634,49 @@ pub fn loop_body_do_while_loose(body: &Region, header: BlockId) -> Option<(&str,
         return None;
     }
     Some((condition.as_str(), prefix, then_branch.as_ref()))
+}
+
+/// Bottom-tested do-while: `if (continue) goto header` with empty taken arm and real
+/// work on fall-through — `do { … } while (continue); exit_tail`.
+pub fn loop_body_do_while_exit_in_else(body: &Region, header: BlockId) -> Option<(&str, Region, &Region)> {
+    let Region::Seq(children) = body else {
+        return None;
+    };
+    if children.is_empty() {
+        return None;
+    }
+    let Region::Block(first) = &children[0] else {
+        return None;
+    };
+    if *first != header {
+        return None;
+    }
+    let (cond, else_branch, if_idx) = trailing_continue_if(children)?;
+    let do_body = Region::Seq(children[..if_idx].to_vec());
+    Some((cond, do_body, else_branch))
+}
+
+/// Find a trailing `If(empty then, else exit)`; returns condition, else branch, and If index.
+fn trailing_continue_if(children: &[Region]) -> Option<(&str, &Region, usize)> {
+    if let Some(Region::If {
+        condition,
+        then_branch,
+        else_branch,
+    }) = children.last()
+    {
+        if region_is_empty(then_branch) && !region_is_empty(else_branch) {
+            return Some((
+                condition.as_str(),
+                else_branch.as_ref(),
+                children.len() - 1,
+            ));
+        }
+    }
+    if let Some(Region::Seq(inner)) = children.last() {
+        let (cond, else_branch, _inner_idx) = trailing_continue_if(inner)?;
+        return Some((cond, else_branch, children.len() - 1));
+    }
+    None
 }
 
 fn region_contains_block(region: &Region, id: BlockId) -> bool {
@@ -312,6 +790,11 @@ pub fn build_regions(cfg: &MethodCfg, entry: BlockId) -> Option<Region> {
     build_regions_rec(cfg, entry, None, &mut emitted, None)
 }
 
+/// Like [`build_regions`] but promotes sequential tail loops to siblings (L1-2 / L1-4).
+pub fn build_regions_with_peeled_tails(cfg: &MethodCfg, entry: BlockId) -> Option<Region> {
+    build_regions(cfg, entry).map(|r| peel_sequential_loop_tails(r, cfg))
+}
+
 /// Like build_regions but only includes blocks in `allowed`. Used for try body (only try-range blocks)
 /// or catch body (only handler-range blocks). Successors outside `allowed` are treated as exit.
 pub fn build_regions_filtered(
@@ -324,6 +807,73 @@ pub fn build_regions_filtered(
     }
     let mut emitted = HashSet::new();
     build_regions_rec(cfg, entry, None, &mut emitted, Some(allowed))
+}
+
+fn build_if_branches(
+    cfg: &MethodCfg,
+    then_start: BlockId,
+    fall_through: BlockId,
+    loop_header: Option<BlockId>,
+    emitted: &mut HashSet<BlockId>,
+    allowed: Option<&HashSet<BlockId>>,
+    exit_target: bool,
+) -> (Region, Region) {
+    if exit_target {
+        let then_r = build_regions_rec(cfg, then_start, loop_header, emitted, allowed)
+            .unwrap_or_else(|| Region::Seq(vec![]));
+        let else_r = build_regions_rec(cfg, fall_through, loop_header, emitted, allowed)
+            .unwrap_or_else(|| Region::Seq(vec![]));
+        (then_r, else_r)
+    } else {
+        // Prefer fall-through (else) before branch (then) so shared tails aren't
+        // claimed by the taken branch first. Matches typical if-eqz skip layouts.
+        let else_r = build_regions_rec(cfg, fall_through, loop_header, emitted, allowed)
+            .unwrap_or_else(|| Region::Seq(vec![]));
+        let then_r = build_regions_rec(cfg, then_start, loop_header, emitted, allowed)
+            .unwrap_or_else(|| Region::Seq(vec![]));
+        (then_r, else_r)
+    }
+}
+
+fn build_if_branches_until(
+    cfg: &MethodCfg,
+    then_start: BlockId,
+    fall_through: BlockId,
+    stop_at: &HashSet<BlockId>,
+    loop_header: Option<BlockId>,
+    emitted: &mut HashSet<BlockId>,
+    allowed: Option<&HashSet<BlockId>>,
+    exit_target: bool,
+) -> (Region, Region) {
+    if exit_target {
+        let then_r = if stop_at.contains(&then_start) || emitted.contains(&then_start) {
+            Region::Seq(vec![])
+        } else {
+            build_regions_rec_until(cfg, then_start, stop_at, loop_header, emitted, allowed)
+                .unwrap_or_else(|| Region::Seq(vec![]))
+        };
+        let else_r = if stop_at.contains(&fall_through) || emitted.contains(&fall_through) {
+            Region::Seq(vec![])
+        } else {
+            build_regions_rec_until(cfg, fall_through, stop_at, loop_header, emitted, allowed)
+                .unwrap_or_else(|| Region::Seq(vec![]))
+        };
+        (then_r, else_r)
+    } else {
+        let else_r = if stop_at.contains(&fall_through) || emitted.contains(&fall_through) {
+            Region::Seq(vec![])
+        } else {
+            build_regions_rec_until(cfg, fall_through, stop_at, loop_header, emitted, allowed)
+                .unwrap_or_else(|| Region::Seq(vec![]))
+        };
+        let then_r = if stop_at.contains(&then_start) || emitted.contains(&then_start) {
+            Region::Seq(vec![])
+        } else {
+            build_regions_rec_until(cfg, then_start, stop_at, loop_header, emitted, allowed)
+                .unwrap_or_else(|| Region::Seq(vec![]))
+        };
+        (then_r, else_r)
+    }
 }
 
 fn build_regions_rec(
@@ -389,9 +939,11 @@ fn build_regions_rec(
             // Only when fall-through has real work — a lone `goto join` is not a skip-body.
             let fall_block = &cfg.blocks[*fall_through];
             let fall_has_work = !block_is_effectively_empty(fall_block);
+            let exit_target = cfg.is_loop_exit_target(*branch_target, loop_header);
             let skip_join = fall_has_work
                 && *branch_target != *fall_through
                 && loop_header != Some(*branch_target)
+                && !exit_target
                 && !emitted.contains(branch_target)
                 && cfg.reachable_from(*fall_through, *branch_target, loop_header)
                 && !cfg.reachable_from(*branch_target, *fall_through, loop_header);
@@ -400,24 +952,20 @@ fn build_regions_rec(
             // or we'd steal the loop body (e.g. in-loop Swap) into the then branch and leave else empty.
             // Otherwise, if some block falls through to branch_target (e.g. Swap → return), start
             // then_branch from that block so we emit the full exit path.
-            let then_start = if loop_header == Some(*branch_target) {
-                *branch_target
-            } else {
-                cfg.blocks_that_fall_through_to(*branch_target)
-                    .into_iter()
-                    .find(|&bid| {
-                        !emitted.contains(&bid)
-                            && bid != *fall_through
-                            && !cfg.reachable_from(*fall_through, bid, loop_header)
-                    })
-                    .unwrap_or(*branch_target)
-            };
+            let then_start = resolve_then_start(
+                cfg,
+                *branch_target,
+                *fall_through,
+                loop_header,
+                emitted,
+            );
 
             // Diamond: else reaches join and then does not reach else → join is shared tail.
             // Prefer skip_join (branch_target) when the fall-through reaches the taken target.
             let diamond_join = if skip_join {
-
                 Some(*branch_target)
+            } else if exit_target {
+                None
             } else if then_start != *fall_through
                 && !emitted.contains(&then_start)
                 && cfg.reachable_from(*fall_through, then_start, loop_header)
@@ -463,15 +1011,10 @@ fn build_regions_rec(
                 ]));
             }
 
-            // Prefer fall-through (else) before branch (then) so shared tails aren't
-            // claimed by the taken branch first. Matches typical if-eqz skip layouts.
-            let (then_r, else_r) = {
-                let else_r = build_regions_rec(cfg, *fall_through, loop_header, emitted, allowed)
-                    .unwrap_or_else(|| Region::Seq(vec![]));
-                let then_r = build_regions_rec(cfg, then_start, loop_header, emitted, allowed)
-                    .unwrap_or_else(|| Region::Seq(vec![]));
-                (then_r, else_r)
-            };
+            // Prefer fall-through (else) before branch (then) for join/skip layouts;
+            // for loop exits, build the taken (exit) branch first so tail blocks aren't stolen.
+            let (then_r, else_r) =
+                build_if_branches(cfg, then_start, *fall_through, loop_header, emitted, allowed, exit_target);
             Some(Region::Seq(vec![
                 block_region,
                 Region::If {
@@ -572,9 +1115,11 @@ fn build_regions_rec_until(
             // under an outer `build_regions_rec_until` (e.g. whole method body under a top-level
             // scheme check) — without this, fall-through skip bodies are lost.
             let fall_has_work = !block_is_effectively_empty(&cfg.blocks[*fall_through]);
+            let exit_target = cfg.is_loop_exit_target(*branch_target, loop_header);
             let skip_join = fall_has_work
                 && *branch_target != *fall_through
                 && loop_header != Some(*branch_target)
+                && !exit_target
                 && !emitted.contains(branch_target)
                 && !stop_at.contains(branch_target)
                 && !stop_at.contains(fall_through)
@@ -634,19 +1179,17 @@ fn build_regions_rec_until(
                 return Some(Region::Seq(parts));
             }
 
-            // Fall-through first so taken-branch builds don't steal skip bodies.
-            let else_r = if stop_at.contains(fall_through) || emitted.contains(fall_through) {
-                Region::Seq(vec![])
-            } else {
-                build_regions_rec_until(cfg, *fall_through, stop_at, loop_header, emitted, allowed)
-                    .unwrap_or_else(|| Region::Seq(vec![]))
-            };
-            let then_r = if stop_at.contains(branch_target) || emitted.contains(branch_target) {
-                Region::Seq(vec![])
-            } else {
-                build_regions_rec_until(cfg, *branch_target, stop_at, loop_header, emitted, allowed)
-                    .unwrap_or_else(|| Region::Seq(vec![]))
-            };
+            // Fall-through first for join layouts; exit targets build taken branch first.
+            let (then_r, else_r) = build_if_branches_until(
+                cfg,
+                *branch_target,
+                *fall_through,
+                stop_at,
+                loop_header,
+                emitted,
+                allowed,
+                exit_target,
+            );
             Some(Region::Seq(vec![
                 block_region,
                 Region::If {
@@ -693,18 +1236,23 @@ fn build_loop_body(
             // start then_branch from that block so we emit the full exit path. Exclude blocks
             // that are reachable from the loop body (fall_through), or we'd pick the wrong block
             // (e.g. the in-loop block that ends at the same address as the exit block start).
-            let then_start = cfg
-                .blocks_that_fall_through_to(*branch_target)
-                .into_iter()
-                .find(|&bid| {
-                    !emitted.contains(&bid)
-                        && !cfg.reachable_from(*fall_through, bid, Some(header_id))
-                })
-                .unwrap_or(*branch_target);
-            let then_r = build_regions_rec(cfg, then_start, Some(header_id), emitted, allowed)
-                .unwrap_or_else(|| Region::Seq(vec![]));
-            let else_r = build_regions_rec(cfg, *fall_through, Some(header_id), emitted, allowed)
-                .unwrap_or_else(|| Region::Seq(vec![]));
+            let then_start = resolve_then_start(
+                cfg,
+                *branch_target,
+                *fall_through,
+                Some(header_id),
+                emitted,
+            );
+            let exit_target = cfg.is_loop_exit_target(*branch_target, Some(header_id));
+            let (then_r, else_r) = build_if_branches(
+                cfg,
+                then_start,
+                *fall_through,
+                Some(header_id),
+                emitted,
+                allowed,
+                exit_target,
+            );
             Region::Seq(vec![
                 block_reg,
                 Region::If {
@@ -785,6 +1333,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn region_do_while_bottom_continue() {
+        let bytecode: &[u8] = &[
+            0x12, 0x00,
+            0xd8, 0x00, 0x00, 0x01,
+            0x34, 0x10, 0xfe, 0xff,
+            0x0f, 0x00,
+        ];
+        let instructions = decode_all(bytecode, 0).unwrap();
+        let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_for);
+        assert!(
+            cfg.loop_headers.contains(&1),
+            "block 1 should be loop header, headers={:?} edges={:?}",
+            cfg.loop_headers,
+            cfg.successor_edges()
+        );
+        let r = build_regions(&cfg, cfg.entry).expect("build_regions");
+        assert!(contains_loop(&r), "expected Loop in {r:?}");
+        let (header, body) = match &r {
+            Region::Seq(s) => s.iter().find_map(|c| match c {
+                Region::Loop { header, body } => Some((*header, body.as_ref())),
+                _ => None,
+            }),
+            Region::Loop { header, body } => Some((*header, body.as_ref())),
+            _ => None,
+        }
+        .expect("loop");
+        assert!(
+            loop_body_do_while_exit_in_else(body, header).is_some(),
+            "expected bottom-continue do-while in {body:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_continue_if_nested() {
+        let inner = Region::Seq(vec![
+            Region::Block(2),
+            Region::If {
+                condition: "i < n".into(),
+                then_branch: Box::new(Region::Seq(vec![])),
+                else_branch: Box::new(Region::Block(3)),
+            },
+        ]);
+        let body = Region::Seq(vec![Region::Block(1), inner]);
+        assert!(loop_body_do_while_exit_in_else(&body, 1).is_some());
+    }
+
     /// Partition-style: exit path = (block A) + (block B return).
     /// The first If's then_branch (exit path) must include BOTH blocks (A and B).
     #[test]
@@ -829,5 +1424,179 @@ mod tests {
             then_branch,
             r
         );
+    }
+
+    /// Exit from loop A into loop B (with return) must preserve both loops in the region tree.
+    #[test]
+    fn region_loop_exit_then_second_loop() {
+        // Loop1: header 2, body exits to header 11 when v0==0; Loop2 at 11 exits to return at 19.
+        // Layout mirrors merge tail: main loop back-edge + sequential tail loop + return.
+        let bytecode: &[u8] = &[
+            0x12, 0x00,             // 0: const/4 v0, 0  (init — not part of loop under test)
+            0x28, 0x09,             // 2: goto +9 -> 20 (enter loop1 header)
+            0x00, 0x00,             // 4: nop padding
+            0x38, 0x00, 0x08, 0x00, // 6: if-eqz v0, +8 -> 22 (exit to loop2 header)
+            0x12, 0x00,             // 10: const/4 v0, 0 (loop1 body)
+            0x28, 0xf8,             // 12: goto -8 -> 6  (back — treat block 6 as header via back edge)
+            0x00, 0x00,             // 14: nop
+            0x38, 0x00, 0x04, 0x00, // 16: if-eqz v0, +4 -> 24 (loop2 exit to return)
+            0x12, 0x01,             // 20: const/4 v0, 1 (loop2 body)
+            0x28, 0xf8,             // 22: goto -8 -> 16 (back to loop2 header)
+            0x12, 0x02,             // 24: const/4 v0, 2
+            0x0f, 0x00,             // 26: return v0
+        ];
+        let instructions = decode_all(bytecode, 0).unwrap();
+        let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_for);
+        let r = build_regions(&cfg, cfg.entry).expect("build_regions");
+        fn contains_loop_header(r: &Region, header: BlockId) -> bool {
+            match r {
+                Region::Loop { header: h, body } => *h == header || contains_loop_header(body, header),
+                Region::Seq(v) => v.iter().any(|c| contains_loop_header(c, header)),
+                Region::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    contains_loop_header(then_branch, header)
+                        || contains_loop_header(else_branch, header)
+                }
+                Region::Block(_) | Region::Switch { .. } => false,
+            }
+        }
+        fn contains_return(r: &Region, cfg: &MethodCfg) -> bool {
+            match r {
+                Region::Block(bid) => {
+                    matches!(cfg.blocks[*bid].end, BlockEnd::Exit)
+                }
+                Region::Seq(v) => v.iter().any(|c| contains_return(c, cfg)),
+                Region::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => contains_return(then_branch, cfg) || contains_return(else_branch, cfg),
+                Region::Loop { body, .. } => contains_return(body, cfg),
+                Region::Switch { cases, default, .. } => {
+                    cases.iter().any(|(_, c)| contains_return(c, cfg)) || contains_return(default, cfg)
+                }
+            }
+        }
+        // At least one loop header from the CFG must appear, and the return block must be reachable in the tree.
+        assert!(
+            cfg.loop_headers.iter().any(|h| contains_loop_header(&r, *h)),
+            "region tree should contain a loop; region = {r:?}"
+        );
+        assert!(
+            contains_return(&r, &cfg),
+            "region tree should include return block; region = {r:?}"
+        );
+    }
+
+    /// L1-4: peeled merge region tree has sequential tail loop headers as siblings.
+    #[test]
+    fn region_merge_peeled_sequential_tail_loops() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/decompiler_fixtures/classes.dex");
+        let data = std::fs::read(&path).unwrap();
+        let dex = crate::parse_dex(&data).unwrap();
+        let class_name = "com.androguard.decompilefixtures.AlgorithmFixtures";
+        let mut merge_code = None;
+        for class_def in dex.class_defs().flatten() {
+            let class_type = dex.get_type(class_def.class_idx).unwrap();
+            if crate::java::descriptor_to_java(&class_type) != class_name {
+                continue;
+            }
+            let Some(cd) = dex.get_class_data(&class_def).unwrap() else {
+                continue;
+            };
+            for enc in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                let info = dex.get_method_info(enc.method_idx).unwrap();
+                if info.name == "merge" {
+                    merge_code = Some(dex.get_code_item(enc.code_off).unwrap());
+                    break;
+                }
+            }
+        }
+        let code = merge_code.unwrap();
+        let insns_bytes = code.insns_slice(&*dex.data);
+        let insns = decode_all(insns_bytes, 0).unwrap();
+        let cfg = MethodCfg::build(&insns, insns_bytes, 0, &|_| "cond".into());
+        let peeled = build_regions_with_peeled_tails(&cfg, cfg.entry).expect("regions");
+        let debug = format_region_debug(&peeled, &cfg);
+        assert!(
+            debug.contains("Loop(header=11)") && debug.contains("Loop(header=15)"),
+            "peeled merge should surface tail loops; got:\n{debug}"
+        );
+        fn count_loops(r: &Region) -> usize {
+            match r {
+                Region::Loop { body, .. } => 1 + count_loops(body),
+                Region::Seq(v) => v.iter().map(count_loops).sum(),
+                Region::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => count_loops(then_branch) + count_loops(else_branch),
+                Region::Switch { cases, default, .. } => {
+                    cases.iter().map(|(_, b)| count_loops(b)).sum::<usize>() + count_loops(default)
+                }
+                Region::Block(_) => 0,
+            }
+        }
+        assert!(
+            count_loops(&peeled) >= 3,
+            "peeled merge should contain ≥3 loops; tree:\n{debug}"
+        );
+    }
+
+    /// Minimal three-loop kernel: main loop → tail loop → return.
+    #[test]
+    fn region_three_loop_kernel() {
+        let bytecode: &[u8] = &[
+            0x38, 0x00, 0x10, 0x00, // 0: if-eqz v0, +16 -> exit loop2 @ 32
+            0x38, 0x01, 0x04, 0x00, // 4: if-eqz v1, +4 -> loop2 head @ 12
+            0x12, 0x02,             // 8: main body
+            0x28, 0xf6,             // 10: goto -10 -> 0
+            0x38, 0x00, 0x06, 0x00, // 12: if-eqz v0, +6 -> return @ 24
+            0x12, 0x03,             // 16: tail1 body
+            0x28, 0xfa,             // 18: goto -6 -> 12
+            0x12, 0x04,             // 20: return prep
+            0x0f, 0x00,             // 22: return v0
+            0x00, 0x00, 0x00, 0x00, // padding
+        ];
+        let instructions = decode_all(bytecode, 0).unwrap();
+        let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_for);
+        let r = build_regions(&cfg, cfg.entry).expect("build_regions");
+        fn has_return(r: &Region, cfg: &MethodCfg) -> bool {
+            match r {
+                Region::Block(b) => matches!(cfg.blocks[*b].end, BlockEnd::Exit),
+                Region::Seq(v) => v.iter().any(|c| has_return(c, cfg)),
+                Region::If { then_branch, else_branch, .. } => {
+                    has_return(then_branch, cfg) || has_return(else_branch, cfg)
+                }
+                Region::Loop { body, .. } => has_return(body, cfg),
+                Region::Switch { cases, default, .. } => {
+                    cases.iter().any(|(_, c)| has_return(c, cfg)) || has_return(default, cfg)
+                }
+            }
+        }
+        assert!(has_return(&r, &cfg), "three-loop kernel must retain return; {r:?}");
+    }
+
+    #[test]
+    fn format_cfg_and_region_debug_smoke() {
+        let bytecode: &[u8] = &[
+            0x12, 0x00,
+            0x38, 0x00, 0x05, 0x00,
+            0x28, 0xfe,
+            0x00, 0x00,
+            0x12, 0x01,
+            0x0f, 0x00,
+        ];
+        let instructions = decode_all(bytecode, 0).unwrap();
+        let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_for);
+        let cfg_dump = cfg.format_debug();
+        assert!(cfg_dump.contains("blocks=") && cfg_dump.contains("edges="));
+        let r = build_regions(&cfg, cfg.entry).unwrap();
+        let region_dump = format_region_debug(&r, &cfg);
+        assert!(region_dump.contains("Loop(") || region_dump.contains("If("));
     }
 }

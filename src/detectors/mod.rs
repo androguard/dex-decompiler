@@ -18,6 +18,7 @@ mod intent_spoofing;
 mod ipc_intent_validation;
 mod keystore;
 mod logcat_external;
+mod next_wave;
 mod package_context;
 mod path_traversal;
 pub mod pending_intent;
@@ -55,6 +56,7 @@ pub use intent_spoofing::scan_intent_spoofing;
 pub use ipc_intent_validation::scan_ipc_intent_validation;
 pub use keystore::scan_keystore_misuse;
 pub use logcat_external::scan_logcat_external;
+pub use next_wave::scan_next_wave;
 pub use package_context::scan_package_context_ace;
 pub use path_traversal::scan_path_traversal;
 pub use pending_intent::{scan_pending_intents, PendingIntentFinding};
@@ -261,6 +263,7 @@ pub fn run_all_detectors(
     all.extend(scan_sensitive_broadcast(owned, class_name, method_name));
     all.extend(scan_weak_host_validation(owned, class_name, method_name));
     all.extend(scan_pick_file_theft(owned, class_name, method_name));
+    all.extend(scan_next_wave(owned, class_name, method_name));
     let mut seen: HashSet<(String, String, String, u32)> = HashSet::new();
     all.into_iter()
         .filter(|f| {

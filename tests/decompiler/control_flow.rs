@@ -106,6 +106,61 @@ fn test_decompiler_loop_exit_path_two_blocks() {
     // the fall-through predecessor of the return block in then_branch.
 }
 
+/// L0-3: merge region tree (pre-simplify) must include the return block.
+#[test]
+fn merge_region_tree_includes_return_before_simplify() {
+    use dex_decompiler::decompile::cfg::MethodCfg;
+    use dex_decompiler::decompile::region::build_regions;
+    use dex_bytecode::decode_all;
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/decompiler_fixtures/classes.dex");
+    let data = std::fs::read(&path).unwrap();
+    let dex = parse_dex(&data).unwrap();
+    let class_name = "com.androguard.decompilefixtures.AlgorithmFixtures";
+    let mut code = None;
+    for class_def in dex.class_defs().flatten() {
+        let ty = dex.get_type(class_def.class_idx).unwrap();
+        if dex_decompiler::java::descriptor_to_java(&ty) != class_name {
+            continue;
+        }
+        let Some(cd) = dex.get_class_data(&class_def).unwrap() else {
+            continue;
+        };
+        for enc in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+            if dex.get_method_info(enc.method_idx).unwrap().name == "merge" {
+                code = Some(dex.get_code_item(enc.code_off).unwrap());
+                break;
+            }
+        }
+    }
+    let code = code.unwrap();
+    let insns_bytes = code.insns_slice(&*dex.data);
+    let insns = decode_all(insns_bytes, 0).unwrap();
+    let cfg = MethodCfg::build(&insns, insns_bytes, 0, &|_| "cond".into());
+    let r = build_regions(&cfg, cfg.entry).expect("regions");
+    fn has_exit(
+        r: &dex_decompiler::decompile::region::Region,
+        cfg: &MethodCfg,
+    ) -> bool {
+        use dex_decompiler::decompile::cfg::BlockEnd;
+        use dex_decompiler::decompile::region::Region;
+        match r {
+            Region::Block(b) => matches!(cfg.blocks[*b].end, BlockEnd::Exit),
+            Region::Seq(v) => v.iter().any(|c| has_exit(c, cfg)),
+            Region::If {
+                then_branch,
+                else_branch,
+                ..
+            } => has_exit(then_branch, cfg) || has_exit(else_branch, cfg),
+            Region::Loop { body, .. } => has_exit(body, cfg),
+            Region::Switch { cases, default, .. } => {
+                cases.iter().any(|(_, c)| has_exit(c, cfg)) || has_exit(default, cfg)
+            }
+        }
+    }
+    assert!(has_exit(&r, &cfg), "merge region tree must contain return block before simplify");
+}
+
 /// Classic for-loop shape: init (const/4 v0,0); header (if-eqz → exit); add-int; goto back.
 /// When the region tree is Seq([Block(init), Loop {...}]) with init/update pattern we emit for (...).
 #[test]

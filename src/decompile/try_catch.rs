@@ -216,7 +216,8 @@ pub fn looks_like_finally(handler_java: &str) -> bool {
     }
 
     // Explicit exception handling → not finally.
-    let handles = t.contains("printstacktrace")
+    let handles = t.contains("addsuppressed")
+        || t.contains("printstacktrace")
         || t.contains("log(")
         || t.contains("logger.")
         || t.contains("system.err")
@@ -241,7 +242,10 @@ pub fn looks_like_finally(handler_java: &str) -> bool {
         || t.contains("monitor-exit")
         || t.contains("finally");
 
-    if has_throw {
+    if has_throw && !cleanup {
+        return false;
+    }
+    if has_throw && cleanup {
         return true;
     }
     if cleanup && !uses_exception {
@@ -249,6 +253,168 @@ pub fn looks_like_finally(handler_java: &str) -> bool {
     }
     // Classic heuristic: no meaningful use of the exception object.
     !uses_exception
+}
+
+/// First handler entry address in bytes, if any.
+pub fn first_handler_start_byte(
+    handler: &EncodedCatchHandler,
+    handler_ranges: &[(u32, u32, u32)],
+) -> Option<u32> {
+    handler_ranges
+        .iter()
+        .map(|(_, start, _)| *start)
+        .min()
+        .or_else(|| handler.catch_all_addr.map(|a| a * 2))
+}
+
+/// When a try protects code with both `RuntimeException` and `Exception` handlers
+/// (typical javac nested-try lowering), return `(runtime_handler_idx, exception_handler_idx)`.
+pub fn nested_runtime_exception_handler_pair(type_names: &[String]) -> Option<(usize, usize)> {
+    let re_idx = type_names.iter().position(|t| t == "RuntimeException")?;
+    let ex_idx = type_names.iter().position(|t| t == "Exception")?;
+    if re_idx == ex_idx {
+        return None;
+    }
+    Some((re_idx, ex_idx))
+}
+
+/// D8/javac duplicate finally cleanup on the normal path inside the try range.
+/// Strip those trailing statements so they appear only in the `finally` block.
+pub fn peel_trailing_finally_from_try(try_body: &str, finally_cleanup: &str) -> String {
+    let finally_lines: Vec<String> = finally_cleanup
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if finally_lines.is_empty() {
+        return try_body.to_string();
+    }
+    let mut try_lines: Vec<String> = try_body.lines().map(String::from).collect();
+    while try_lines.last().is_some_and(|l| l.trim().is_empty()) {
+        try_lines.pop();
+    }
+    // D8 inlines finally cleanup on the normal path immediately before the try's return.
+    let mut return_line: Option<String> = None;
+    if try_lines
+        .last()
+        .is_some_and(|l| l.trim().starts_with("return "))
+    {
+        return_line = try_lines.pop();
+        while try_lines.last().is_some_and(|l| l.trim().is_empty()) {
+            try_lines.pop();
+        }
+    }
+    let mut fi = finally_lines.len();
+    let mut ti = try_lines.len();
+    while fi > 0 && ti > 0 {
+        let tt = try_lines[ti - 1].trim();
+        if tt.is_empty() {
+            ti -= 1;
+            continue;
+        }
+        if tt == finally_lines[fi - 1] {
+            fi -= 1;
+            ti -= 1;
+        } else {
+            break;
+        }
+    }
+    if fi != 0 {
+        return try_body.to_string();
+    }
+    try_lines.truncate(ti);
+    while try_lines.last().is_some_and(|l| l.trim().is_empty()) {
+        try_lines.pop();
+    }
+    if let Some(ret) = return_line {
+        try_lines.push(ret);
+    }
+    if try_lines.is_empty() {
+        return String::new();
+    }
+    let mut out = try_lines.join("\n");
+    if try_body.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// When d8 narrows the DEX try range, bytecode before `try {` may still belong in the try
+/// body. Keep leading local declarations outside; move the rest into the try block.
+pub fn split_pre_try_for_finally(pre_try: &str) -> (String, String) {
+    let lines: Vec<&str> = pre_try.lines().collect();
+    let mut outside: Vec<&str> = Vec::new();
+    let mut inside: Vec<&str> = Vec::new();
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if is_local_declaration_line(t) && init_stays_outside_try(t) {
+            outside.push(line);
+        } else {
+            inside.push(line);
+        }
+    }
+    (
+        join_nonempty_lines(&outside),
+        join_nonempty_lines(&inside),
+    )
+}
+
+/// Pure literal / alloc inits may stay before `try`; compound inits belong inside.
+fn init_stays_outside_try(line: &str) -> bool {
+    let t = line.trim().trim_end_matches(';');
+    let Some(eq_pos) = t.rfind(" = ") else {
+        return false;
+    };
+    let rhs = t[eq_pos + 3..].trim();
+    if rhs.starts_with("new ") {
+        return true;
+    }
+    if rhs.contains('+')
+        || rhs.contains('*')
+        || rhs.contains('/')
+        || rhs.contains('%')
+        || rhs.contains('(')
+        || rhs.contains('.')
+    {
+        return false;
+    }
+    rhs.parse::<i64>().is_ok()
+        || matches!(rhs, "null" | "true" | "false")
+        || (rhs.starts_with('"') && rhs.ends_with('"'))
+        || (rhs.starts_with('\'') && rhs.ends_with('\''))
+}
+
+fn is_local_declaration_line(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("int ")
+        || t.starts_with("long ")
+        || t.starts_with("float ")
+        || t.starts_with("double ")
+        || t.starts_with("boolean ")
+        || t.starts_with("byte ")
+        || t.starts_with("short ")
+        || t.starts_with("char ")
+        || (t.starts_with("final ") && t.contains(" = "))
+}
+
+fn join_nonempty_lines(lines: &[&str]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push_str(line);
+        if !line.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !lines.is_empty() && lines.last().is_some_and(|l| l.ends_with('\n')) && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// Pairs of (try_item, its encoded_catch_handler) for emission.
@@ -303,9 +469,10 @@ mod tests {
     };
 
     #[test]
-    fn looks_like_finally_rethrow() {
-        assert!(looks_like_finally("throw th;\n"));
-        assert!(looks_like_finally("    throw e;\n"));
+    fn looks_like_finally_rethrow_with_cleanup() {
+        assert!(looks_like_finally("    r.close();\n    throw e;\n"));
+        assert!(!looks_like_finally("throw th;\n"));
+        assert!(!looks_like_finally("    throw e;\n"));
     }
 
     #[test]
@@ -352,6 +519,120 @@ mod tests {
         assert_eq!(handler_ranges[0].0, 1);
         assert_eq!(handler_ranges[0].1, 62, "handler start 31 * 2 = 62");
         assert_eq!(handler_ranges[0].2, 128, "handler end = code_end 64*2");
+    }
+
+    #[test]
+    fn looks_like_finally_not_addsuppressed_or_bare_rethrow() {
+        assert!(!looks_like_finally("local0.addSuppressed(local1);\n"));
+        assert!(!looks_like_finally(
+            "local0.addSuppressed(local1);\n    throw local0;\n"
+        ));
+        assert!(!looks_like_finally("    throw e;\n"));
+        assert!(looks_like_finally("    r.close();\n    throw e;\n"));
+    }
+
+    #[test]
+    fn nested_try_fixture_dex_metadata() {
+        use crate::parse_dex;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/decompiler_fixtures/classes.dex");
+        let data = std::fs::read(&path).unwrap();
+        let dex = parse_dex(&data).unwrap();
+        let data = dex.data.as_ref();
+        let mut found = false;
+        for class_def in dex.class_defs().flatten() {
+            let class_type = dex.get_type(class_def.class_idx).unwrap();
+            let class_name = crate::java::descriptor_to_java(&class_type);
+            if class_name != "com.androguard.decompilefixtures.TryCatchFixtures" {
+                continue;
+            }
+            let cd = dex.get_class_data(&class_def).unwrap().unwrap();
+            for enc in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                let info = dex.get_method_info(enc.method_idx).unwrap();
+                if info.name != "nestedTry" {
+                    continue;
+                }
+                found = true;
+                let code = dex.get_code_item(enc.code_off).unwrap();
+                assert!(
+                    code.tries_size > 0,
+                    "nestedTry fixture must ship with try metadata (use 100/x body so d8 keeps handlers)"
+                );
+                let pairs = super::try_handler_pairs(data, enc.code_off, &code).unwrap();
+                assert!(!pairs.is_empty());
+                let mut types = Vec::new();
+                for (_, h) in &pairs {
+                    for th in &h.handlers {
+                        types.push(dex.get_type(th.type_idx).unwrap());
+                    }
+                }
+                let all = types.join(",");
+                assert!(all.contains("RuntimeException") && all.contains("Exception"), "{all}");
+            }
+        }
+        assert!(found, "nestedTry missing from fixtures dex");
+    }
+
+    #[test]
+    fn try_finally_fixture_has_catch_all_in_dex() {
+        use crate::parse_dex;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/decompiler_fixtures/classes.dex");
+        let data = std::fs::read(&path).unwrap();
+        let dex = parse_dex(&data).unwrap();
+        let data = dex.data.as_ref();
+        for class_def in dex.class_defs().flatten() {
+            let class_type = dex.get_type(class_def.class_idx).unwrap();
+            if crate::java::descriptor_to_java(&class_type)
+                != "com.androguard.decompilefixtures.TryCatchFixtures"
+            {
+                continue;
+            }
+            let cd = dex.get_class_data(&class_def).unwrap().unwrap();
+            for enc in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                let info = dex.get_method_info(enc.method_idx).unwrap();
+                if info.name != "tryFinally" {
+                    continue;
+                }
+                let code = dex.get_code_item(enc.code_off).unwrap();
+                assert!(code.tries_size > 0, "tryFinally needs try metadata in fixture dex");
+                let pairs = super::try_handler_pairs(data, enc.code_off, &code).unwrap();
+                let has_catch_all = pairs.iter().any(|(_, h)| h.catch_all_addr.is_some());
+                assert!(has_catch_all, "tryFinally fixture should use catch-all finally handler");
+            }
+        }
+    }
+
+    #[test]
+    fn nested_runtime_exception_handler_pair_detects_fixture_shape() {
+        let names = vec!["Exception".into(), "RuntimeException".into()];
+        let (re, ex) = super::nested_runtime_exception_handler_pair(&names).unwrap();
+        assert_eq!(re, 1);
+        assert_eq!(ex, 0);
+    }
+
+    #[test]
+    fn split_pre_try_for_finally_keeps_declarations_outside() {
+        let pre = "        int acc = 0;\n        acc = acc + x;\n";
+        let (outside, inside) = super::split_pre_try_for_finally(pre);
+        assert_eq!(outside, "        int acc = 0;\n");
+        assert_eq!(inside, "        acc = acc + x;\n");
+    }
+
+    #[test]
+    fn split_pre_try_for_finally_moves_compound_init_inside() {
+        let pre = "        int acc = 0 + x;\n";
+        let (outside, inside) = super::split_pre_try_for_finally(pre);
+        assert_eq!(outside, "");
+        assert_eq!(inside, "        int acc = 0 + x;\n");
+    }
+
+    #[test]
+    fn peel_trailing_finally_from_try_strips_inlined_cleanup() {
+        let try_body = "acc = acc + x;\ntouchFinally();\nacc = acc + 1;\nreturn acc;\n";
+        let finally = "acc = acc + 1;\n";
+        let peeled = super::peel_trailing_finally_from_try(try_body, finally);
+        assert_eq!(peeled, "acc = acc + x;\ntouchFinally();\nreturn acc;\n");
     }
 
     #[test]

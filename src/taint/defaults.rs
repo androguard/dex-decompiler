@@ -13,6 +13,7 @@ const DEFAULT_JSON: &str = r#"
     {"patterns": ["getIntent", "Activity.getIntent"], "port": "return", "kind": "ActivityUserInput", "features": ["user-controlled"]},
     {"patterns": ["getStringExtra", "getCharSequenceExtra", "getParcelableExtra", "getSerializableExtra", "getDataString", "Intent.getData", "Intent.getClipData", "getClipData"], "port": "return", "kind": "ActivityUserInput"},
     {"patterns": ["getQueryParameter", "Uri.getQueryParameter", "getLastPathSegment", "getPath"], "port": "return", "kind": "ActivityUserInput"},
+    {"patterns": ["getParcelableExtra", "getParcelableArrayExtra", "getParcelableArrayListExtra"], "port": "return", "kind": "NestedIntent"},
     {"patterns": ["EditText.getText"], "port": "return", "kind": "UserInput"},
     {"patterns": ["ClipboardManager.getPrimaryClip", "ClipboardManager.getText", "getPrimaryClip"], "port": "return", "kind": "Clipboard"},
     {"patterns": ["getDeviceId", "getImei", "getSubscriberId", "getAndroidId", "Settings$Secure.getString"], "port": "return", "kind": "DeviceId"},
@@ -37,6 +38,8 @@ const DEFAULT_JSON: &str = r#"
     {"patterns": ["openConnection", "HttpURLConnection", "OkHttpClient", "Request.Builder.url", "Call.execute", "Call.enqueue", "OutputStream.write", "URLConnection.getOutputStream", "HttpURLConnection.getOutputStream"], "port": {"argument": {"index": 0}}, "kind": "Network"},
     {"patterns": ["OutputStream.write", "BufferedWriter.write", "Writer.write", "RequestBody.create"], "port": {"argument": {"index": 1}}, "kind": "Network"},
     {"patterns": ["CookieManager.setCookie", "setCookie"], "port": {"argument": {"index": 1}}, "kind": "CookieWrite"},
+    {"patterns": ["CookieManager.getCookie", "getCookie"], "port": {"argument": {"index": 1}}, "kind": "CookieRead"},
+    {"patterns": ["CustomTabsIntent.launchUrl", "launchUrl"], "port": {"argument": {"index": 2}}, "kind": "CustomTabsLaunch"},
     {"patterns": ["ClipboardManager.setPrimaryClip", "ClipboardManager.setText", "setPrimaryClip"], "port": {"argument": {"index": 1}}, "kind": "ClipboardWrite"},
     {"patterns": ["setHostnameVerifier", "hostnameVerifier", "HostnameVerifier.verify", "checkServerTrusted"], "port": {"argument": {"index": 1}}, "kind": "SslBypass"},
     {"patterns": ["SSLContext.init"], "port": {"argument": {"index": 2}}, "kind": "SslBypass"},
@@ -161,6 +164,34 @@ const DEFAULT_JSON: &str = r#"
       "description": "Untrusted values or custom trust managers may weaken TLS hostname/certificate checks",
       "sources": ["ActivityUserInput", "UserInput", "UntrustedCodePath"],
       "sinks": ["SslBypass"]
+    },
+    {
+      "name": "Nested Intent to component launch (Q3/N1)",
+      "code": 19,
+      "description": "Parcelable/nested Intent extras may flow into startActivity/startService/bindService/sendBroadcast",
+      "sources": ["NestedIntent", "ActivityUserInput", "ReceiverUserInput"],
+      "sinks": ["LaunchingComponent", "SetResult", "UriGrant"]
+    },
+    {
+      "name": "Deeplink / extras to CookieManager (Q3/N1)",
+      "code": 20,
+      "description": "Intent/deeplink-controlled values may reach CookieManager get/setCookie",
+      "sources": ["ActivityUserInput", "NestedIntent", "UserInput"],
+      "sinks": ["CookieWrite", "CookieRead", "ExecuteJavascript"]
+    },
+    {
+      "name": "Deeplink / extras to Custom Tabs (Q3/N1)",
+      "code": 21,
+      "description": "Intent-derived URLs may reach CustomTabsIntent.launchUrl",
+      "sources": ["ActivityUserInput", "NestedIntent", "UserInput"],
+      "sinks": ["CustomTabsLaunch", "ExecuteJavascript", "Network"]
+    },
+    {
+      "name": "Receiver extras to launch / WebView / Cookie",
+      "code": 22,
+      "description": "BroadcastReceiver-controlled values may reach launch, WebView, or cookie sinks",
+      "sources": ["ReceiverUserInput", "NestedIntent"],
+      "sinks": ["LaunchingComponent", "ExecuteJavascript", "CookieWrite", "CookieRead", "UriGrant"]
     }
   ]
 }

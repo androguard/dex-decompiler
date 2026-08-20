@@ -120,6 +120,13 @@ pub fn instruction_reads_writes(mnemonic: &str, ops_resolved: &str) -> (Vec<u32>
         }
     }
 
+    // array-length: dest, array -> read array, write dest
+    if m == "array-length" {
+        if let Some((dst, src)) = parse_two_regs(ops) {
+            return (vec![src], vec![dst]);
+        }
+    }
+
     // Two-reg: e.g. move-exception, check-cast, instance-of
     if let Some((dst, src)) = parse_two_regs(ops) {
         if matches!(m, "move-exception" | "check-cast" | "instance-of") {
@@ -236,5 +243,22 @@ mod tests {
         let (r, w) = instruction_reads_writes("move-object/from16", "v0, v3");
         assert_eq!(r, vec![3]);
         assert_eq!(w, vec![0]);
+    }
+
+    #[test]
+    fn array_length_write() {
+        let (r, w) = instruction_reads_writes("array-length", "v0, v3");
+        assert_eq!(r, vec![3]);
+        assert_eq!(w, vec![0]);
+    }
+
+    #[test]
+    fn move_object16_and_move_wide16_are_copies() {
+        let (r, w) = instruction_reads_writes("move-object/16", "v0, v3");
+        assert_eq!(r, vec![3]);
+        assert_eq!(w, vec![0]);
+        let (r, w) = instruction_reads_writes("move-wide/16", "v4, v6");
+        assert_eq!(r, vec![6]);
+        assert_eq!(w, vec![4]);
     }
 }

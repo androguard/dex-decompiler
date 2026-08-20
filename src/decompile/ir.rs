@@ -154,9 +154,6 @@ fn substitute_names_in_text(s: &str, names: &HashMap<VarId, String>) -> String {
             let vid = VarId::new(reg, ver);
             if let Some(name) = names.get(&vid) {
                 out.push_str(name);
-            } else if let Some(name) = names.iter().find(|(k, _)| k.reg == reg).map(|(_, n)| n.as_str()) {
-                // Fallback: any SSA version of this register (avoids leftover vN / wrong localN).
-                out.push_str(name);
             } else {
                 out.push_str(&s[start..i]);
             }

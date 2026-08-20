@@ -8,12 +8,16 @@ use crate::java;
 
 use super::const_fields::apply_const_field_replacements;
 
-/// True if this method should be omitted from Java class dumps (bridge / access$).
+/// True if this method should be omitted from Java class dumps (bridge / access$ / R8 lambda shims).
 pub fn should_skip_method_emit(name: &str, access_flags: u32) -> bool {
     if java::is_bridge_method(access_flags) {
         return true;
     }
     if name.starts_with("access$") && java::is_synthetic(access_flags) {
+        return true;
+    }
+    // R8 lowers method references to package-private `$r8$lambda$…` static shims.
+    if name.starts_with("$r8$lambda$") {
         return true;
     }
     false
@@ -248,6 +252,15 @@ mod tests {
         assert!(should_skip_method_emit("foo", 0x40));
         assert!(should_skip_method_emit("access$000", 0x1000));
         assert!(!should_skip_method_emit("foo", 0x1));
+    }
+
+    #[test]
+    fn skips_r8_lambda_shims() {
+        assert!(should_skip_method_emit(
+            "$r8$lambda$3Y7zL6aAKGHmmofj-9_cxS0RPF4",
+            0x1009
+        ));
+        assert!(!should_skip_method_emit("lambda$identityLambda$0", 0x1008));
     }
 
     #[test]

@@ -11,6 +11,9 @@ const WEBVIEW_SOURCES: &[&str] = &[
     "getQueryParameter",
     "getIntent",
     "getParcelableExtra",
+    "getEncodedPath",
+    "getLastPathSegment",
+    "getPath",
 ];
 const WEBVIEW_SINKS: &[&str] = &[
     "loadUrl",
@@ -18,7 +21,15 @@ const WEBVIEW_SINKS: &[&str] = &[
     "loadData",
     "evaluateJavascript",
 ];
-const JAVASCRIPT_INTERFACE_PATTERNS: &[&str] = &["addJavascriptInterface"];
+const JAVASCRIPT_INTERFACE_PATTERNS: &[&str] = &[
+    "addJavascriptInterface",
+    "addJavascriptInterfaceOut",
+];
+const URI_PATH_SOURCES: &[&str] = &[
+    "getEncodedPath",
+    "getLastPathSegment",
+    "getPath",
+];
 const FILE_ACCESS_PATTERNS: &[&str] = &[
     "setAllowFileAccessFromFileURLs",
     "setAllowUniversalAccessFromFileURLs",
@@ -94,6 +105,25 @@ pub fn scan_webview_unsafe(
                 method_name,
                 "deeplink_webview_js_bridge",
                 &["addJavascriptInterface", "loadUrl", "getDataString"],
+            ));
+        }
+        let has_uri_path = owned
+            .invoke_method_map
+            .values()
+            .any(|m| method_matches_any(m, URI_PATH_SOURCES));
+        if has_uri_path {
+            out.extend(invoke_scan(
+                owned,
+                class_name,
+                method_name,
+                "deeplink_webview_path_traversal",
+                &[
+                    "addJavascriptInterface",
+                    "loadUrl",
+                    "getEncodedPath",
+                    "getLastPathSegment",
+                    "getPath",
+                ],
             ));
         }
     }

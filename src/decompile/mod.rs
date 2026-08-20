@@ -23,8 +23,9 @@ pub use simplify::restore_string_switch as simplify_restore_string_switch_for_te
 pub use simplify::simplify_method_body as simplify_method_body_for_tests;
 mod try_catch;
 use try_catch::{
-    catch_all_byte_range, looks_like_finally,
-    try_and_handler_byte_ranges_with_end, try_handler_pairs,
+    catch_all_byte_range, first_handler_start_byte, looks_like_finally,
+    nested_runtime_exception_handler_pair, peel_trailing_finally_from_try,
+    split_pre_try_for_finally, try_and_handler_byte_ranges_with_end, try_handler_pairs,
 };
 mod type_infer;
 pub mod value_flow;
@@ -32,7 +33,8 @@ pub mod value_flow;
 use cfg::{BlockEnd, BlockId, MethodCfg};
 use region::{
     as_single_if, build_regions, build_regions_filtered, for_loop_pattern,
-    loop_body_do_while_pattern, region_contains_loop, region_is_empty, region_is_empty_with_cfg,
+    loop_body_do_while_pattern, loop_body_do_while_exit_in_else, loop_exit_break_target,
+    loop_prefix_multi_exit_ifs, region_contains_loop, region_is_empty, region_is_empty_with_cfg,
     Region,
 };
 use dex_bytecode::{decode_all, Instruction};
@@ -41,11 +43,14 @@ use crate::error::{DexDecompilerError, Result};
 use crate::java;
 use std::fmt::Write;
 use ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
-use pass::{run_dead_assign_with_used_regs, ConstructorMergePass, DeadAssignPass, ExprSimplifyPass, InvokeChainPass, PassRunner, SsaRenamePass, used_regs};
+use pass::{run_dead_assign_with_used_regs, ConstructorMergePass, CopyPropPass, DeadAssignPass, ExprSimplifyPass, InlineFilledArrayPass, InvokeChainPass, Pass, PassRunner, SsaRenamePass, used_regs};
 use ssa::{apply_canonical_names, construct_ssa, phi_canonical_map, phi_registers, strip_phis};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use type_infer::{build_var_names_with_regs, enrich_types_with_register_map, infer_types, types_compatible_for_naming};
+use type_infer::{
+    build_var_names_with_regs, enrich_types_with_register_map, infer_types,
+    is_primitive_java_type, preferred_debug_type_for_reg, types_compatible_for_naming,
+};
 use value_flow::{
     build_api_return_sources, build_insn_labels, build_invoke_method_map, build_instruction_rw_map,
     ValueFlowAnalysisOwned,
@@ -184,11 +189,20 @@ fn is_synthetic_local_name(s: &str) -> bool {
     if b.len() >= 2
         && b[0].is_ascii_alphabetic()
         && b[1..].iter().all(|c| c.is_ascii_digit())
-        && matches!(b[0], b'i' | b's' | b'z' | b'j' | b'f' | b'd' | b'l' | b'b' | b'c' | b'v' | b'o' | b't' | b'a')
+        && matches!(b[0], b'i' | b's' | b'z' | b'j' | b'f' | b'd' | b'l' | b'b' | b'c' | b'v' | b'o' | b't' | b'a' | b'x')
     {
         return true;
     }
     false
+}
+
+/// Signature-style param names (`p0`, `s1`) — not debug/user names.
+fn is_signature_style_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1..].iter().all(|c| c.is_ascii_digit())
+        && matches!(b[0], b'p' | b's' | b'i' | b'z' | b'l' | b'f' | b'd' | b'c' | b'x')
 }
 
 fn is_java_ident(name: &str) -> bool {
@@ -200,6 +214,37 @@ fn is_java_ident(name: &str) -> bool {
         return false;
     }
     chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Merge `debug_info.parameter_names` with `DBG_START_LOCAL` names on param registers.
+/// Locals fill gaps so the signature matches the body (`grantResults` vs `arr2`).
+fn debug_param_names_from_tables(
+    parameter_names: &[Option<String>],
+    register_names: &HashMap<u32, String>,
+    param_base: u32,
+    is_static: bool,
+    param_types: &[String],
+) -> Vec<Option<String>> {
+    let mut slot = if is_static { 0u32 } else { 1u32 };
+    let mut out = Vec::with_capacity(param_types.len());
+    for (i, ty) in param_types.iter().enumerate() {
+        let from_table = parameter_names
+            .get(i)
+            .and_then(|p| p.as_ref())
+            .filter(|n| is_java_ident(n))
+            .cloned();
+        let from_local = register_names
+            .get(&(param_base + slot))
+            .filter(|n| is_java_ident(n) && n.as_str() != "this")
+            .cloned();
+        out.push(from_table.or(from_local));
+        slot += if matches!(ty.as_str(), "long" | "double" | "J" | "D") {
+            2
+        } else {
+            1
+        };
+    }
+    out
 }
 
 /// Names already used in an `if (` / `else if (` condition are in scope.
@@ -267,6 +312,8 @@ pub struct Decompiler<'a> {
     method_reg_types: RefCell<Option<HashMap<u32, String>>>,
     /// Register → preferred Java name for the method (stable across CFG blocks).
     method_reg_names: RefCell<Option<HashMap<u32, String>>>,
+    /// Return type of the method currently being decompiled (`long`, `double`, …).
+    method_return_type: RefCell<Option<String>>,
 }
 
 impl<'a> Decompiler<'a> {
@@ -293,6 +340,7 @@ impl<'a> Decompiler<'a> {
             extra_dexes: Vec::new(),
             method_reg_types: RefCell::new(None),
             method_reg_names: RefCell::new(None),
+            method_return_type: RefCell::new(None),
         }
     }
 
@@ -321,6 +369,7 @@ impl<'a> Decompiler<'a> {
             extra_dexes: Vec::new(),
             method_reg_types: RefCell::new(None),
             method_reg_names: RefCell::new(None),
+            method_return_type: RefCell::new(None),
         }
     }
 
@@ -1097,11 +1146,15 @@ impl<'a> Decompiler<'a> {
         } else {
             &info.name
         };
+        let debug_pnames = self.debug_parameter_display_names(encoded, &params);
         let params_str = params
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let pname = type_infer::param_display_name(i, t);
+                let pname = debug_pnames
+                    .get(i)
+                    .and_then(|p| p.clone())
+                    .unwrap_or_else(|| type_infer::param_display_name(i, t));
                 format!("{} {}", t, pname)
             })
             .collect::<Vec<_>>()
@@ -1511,6 +1564,13 @@ impl<'a> Decompiler<'a> {
             return Ok("        // (no instructions)\n".to_string());
         }
 
+        *self.method_return_type.borrow_mut() = self
+            .dex
+            .get_method_info(encoded.method_idx)
+            .ok()
+            .map(|info| java::descriptor_to_java(&info.return_type))
+            .filter(|t| t != "void");
+
         if self.mode == DecompilationMode::Fallback {
             return self.decompile_method_body_linear(
                 &instructions,
@@ -1588,7 +1648,7 @@ impl<'a> Decompiler<'a> {
         if out.is_none() {
             let mut fallback = String::new();
             let mut declared = HashSet::new();
-            self.seed_declared_from_params(&mut declared, code);
+            self.seed_declared_from_params(&mut declared, code, encoded);
             if let Some(root) = build_regions(&cfg, cfg.entry) {
                 self.emit_region(&root, &cfg, &instructions, code.insns_off, encoded, code, &mut fallback, 2, None, None, &mut declared, Some(&global_used_regs), None, class_name)?;
             }
@@ -1597,6 +1657,9 @@ impl<'a> Decompiler<'a> {
 
         let mut out = out.unwrap_or_else(|| "        // (no instructions)\n".to_string());
         if !out.trim().is_empty() && out != "        // (no instructions)\n" {
+            if std::env::var_os("DUMP_PRE_SIMPLIFY").is_some() && out.contains("bfsShortestPath") {
+                eprintln!("=== PRE-SIMPLIFY bfs ===\n{out}\n=== END PRE-SIMPLIFY ===");
+            }
             out = simplify::simplify_method_body(&out, is_constructor);
             out = simplify::restore_string_switch(&out);
             if let Some(enclosing) = class_name {
@@ -1628,10 +1691,26 @@ impl<'a> Decompiler<'a> {
         }
         const CATCH_BLOCK_MARKER: &str = "} catch (";
         const FINALLY_MARKER: &str = "} finally {";
-        if code.tries_size > 0 && !out.contains(CATCH_BLOCK_MARKER) && !out.contains(FINALLY_MARKER) {
+        const TRY_WITH_RESOURCES_MARKER: &str = "try (";
+        if code.tries_size > 0
+            && !out.contains(CATCH_BLOCK_MARKER)
+            && !out.contains(FINALLY_MARKER)
+            && !out.contains(TRY_WITH_RESOURCES_MARKER)
+        {
             out = self.wrap_body_with_try_catch(&out, encoded.code_off, code)?;
         }
         out = simplify::simplify_synchronized_blocks(&out);
+        if self.show_bytecode {
+            let rt = self.method_return_type.borrow();
+            if rt.as_deref().is_some_and(|t| t != "void")
+                && cfg.has_return_block()
+                && !out.contains("return")
+            {
+                out.push_str(
+                    "        // decompiler-note: CFG contains return block but emission has no return\n",
+                );
+            }
+        }
         Ok(out)
     }
 
@@ -2053,7 +2132,7 @@ impl<'a> Decompiler<'a> {
 
         let mut full = String::new();
         let mut declared = HashSet::new();
-        self.seed_declared_from_params(&mut declared, code);
+        self.seed_declared_from_params(&mut declared, code, encoded);
         let mut cursor: u32 = 0;
 
         for (idx, (try_item, handler)) in pairs.iter().enumerate() {
@@ -2069,8 +2148,16 @@ impl<'a> Decompiler<'a> {
                     post_end,
                 );
 
-            // Code before this try (from cursor).
+            // Code before this try (from cursor). When a catch-all handler exists, defer
+            // emission so catch-all/finally cleanup can pull pre-try statements into the try body.
+            let mut pre_try_buf = String::new();
+            let defer_pre_try = handler.catch_all_addr.is_some();
             if try_start_byte > cursor {
+                let pre_out = if defer_pre_try {
+                    &mut pre_try_buf
+                } else {
+                    &mut full
+                };
                 if let Some(entry) = cfg.block_id_at_offset(cursor.max(0)) {
                     let pre_blocks = blocks_overlapping(cursor, try_start_byte);
                     if let Some(pre_region) = build_regions_filtered(cfg, entry, &pre_blocks) {
@@ -2081,7 +2168,7 @@ impl<'a> Decompiler<'a> {
                             code.insns_off,
                             encoded,
                             code,
-                            &mut full,
+                            pre_out,
                             2,
                             None,
                             None,
@@ -2100,7 +2187,7 @@ impl<'a> Decompiler<'a> {
                             None,
                             encoded,
                             code,
-                            &mut full,
+                            pre_out,
                             2,
                             &mut declared,
                             Some(global_used_regs),
@@ -2141,17 +2228,59 @@ impl<'a> Decompiler<'a> {
                 )?;
             }
             if try_body.is_empty() {
+                let _ = self.emit_block_instructions(
+                    cfg,
+                    instructions,
+                    code.insns_off,
+                    try_entry,
+                    None,
+                    None,
+                    encoded,
+                    code,
+                    &mut try_body,
+                    2,
+                    &mut declared,
+                    Some(global_used_regs),
+                    false,
+                    Some((try_start_byte, try_end_byte)),
+                    class_name,
+                )?;
+            }
+            if try_body.is_empty() {
                 cursor = try_end_byte;
                 continue;
             }
 
-            writeln!(full, "        try {{")
-                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-            full.push_str(&try_body);
-            if !try_body.ends_with('\n') {
-                full.push('\n');
+            if let Some(hstart) = first_handler_start_byte(handler, &handler_ranges) {
+                if hstart > try_end_byte {
+                    if let Some(gap_entry) = cfg.block_id_at_offset(try_end_byte) {
+                        let _ = self.emit_block_instructions(
+                            cfg,
+                            instructions,
+                            code.insns_off,
+                            gap_entry,
+                            None,
+                            None,
+                            encoded,
+                            code,
+                            &mut try_body,
+                            2,
+                            &mut declared,
+                            Some(global_used_regs),
+                            false,
+                            Some((try_end_byte, hstart)),
+                            class_name,
+                        )?;
+                    }
+                }
             }
 
+            struct TypedHandler {
+                type_name: String,
+                body: String,
+                start_byte: u32,
+            }
+            let mut typed_handlers: Vec<TypedHandler> = Vec::new();
             for (type_idx, start_byte, end_byte) in &handler_ranges {
                 let type_name = self
                     .dex
@@ -2182,16 +2311,37 @@ impl<'a> Decompiler<'a> {
                                 class_name,
                             )?;
                         }
-                        writeln!(full, "        }} catch ({} e) {{", type_name)
-                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                        full.push_str(&handler_body);
-                        if !handler_body.ends_with('\n') {
-                            full.push('\n');
+                        if handler_body.is_empty() {
+                            let _ = self.emit_block_instructions(
+                                cfg,
+                                instructions,
+                                code.insns_off,
+                                handler_entry,
+                                None,
+                                None,
+                                encoded,
+                                code,
+                                &mut handler_body,
+                                2,
+                                &mut declared,
+                                Some(global_used_regs),
+                                false,
+                                Some((*start_byte, *end_byte)),
+                                class_name,
+                            )?;
                         }
+                        typed_handlers.push(TypedHandler {
+                            type_name,
+                            body: handler_body,
+                            start_byte: *start_byte,
+                        });
                     }
                 }
             }
+            typed_handlers.sort_by_key(|h| h.start_byte);
 
+            let mut catch_all_cleanup = String::new();
+            let mut catch_all_is_finally = false;
             if let Some((ca_start, ca_end)) =
                 catch_all_byte_range(handler, &handler_ranges, code.insns_size, post_end)
             {
@@ -2219,16 +2369,120 @@ impl<'a> Decompiler<'a> {
                                 class_name,
                             )?;
                         }
-                        let cleaned = strip_finally_exception_noise(&handler_body);
-                        let as_finally = !handler.handlers.is_empty()
-                            && (looks_like_finally(&cleaned) || cleaned.trim().is_empty());
-                        if as_finally {
-                            writeln!(full, "        }} finally {{")
-                                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                        } else {
-                            writeln!(full, "        }} catch (Throwable e) {{")
-                                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        catch_all_cleanup = strip_finally_exception_noise(&handler_body);
+                        catch_all_is_finally = looks_like_finally(&catch_all_cleanup)
+                            || catch_all_cleanup.trim().is_empty()
+                            || handler.handlers.is_empty();
+                        if catch_all_is_finally {
+                            try_body =
+                                peel_trailing_finally_from_try(&try_body, &catch_all_cleanup);
                         }
+                    }
+                }
+            }
+
+            if catch_all_is_finally && !pre_try_buf.is_empty() {
+                let (pre_outside, pre_inside) = split_pre_try_for_finally(&pre_try_buf);
+                if !pre_outside.is_empty() {
+                    full.push_str(&pre_outside);
+                }
+                if !pre_inside.is_empty() {
+                    try_body = format!("{pre_inside}{try_body}");
+                }
+            } else if !pre_try_buf.is_empty() {
+                full.push_str(&pre_try_buf);
+            }
+
+            let nest_pair = nested_runtime_exception_handler_pair(
+                &typed_handlers.iter().map(|h| h.type_name.clone()).collect::<Vec<_>>(),
+            );
+
+            if let Some((re_idx, ex_idx)) = nest_pair {
+                writeln!(full, "        try {{")
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(full, "            try {{")
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                full.push_str(&try_body);
+                if !try_body.ends_with('\n') {
+                    full.push('\n');
+                }
+                writeln!(
+                    full,
+                    "            }} catch ({} e) {{",
+                    typed_handlers[re_idx].type_name
+                )
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                full.push_str(&typed_handlers[re_idx].body);
+                if !typed_handlers[re_idx].body.ends_with('\n') {
+                    full.push('\n');
+                }
+                writeln!(full, "            }}")
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(
+                    full,
+                    "        }} catch ({} e) {{",
+                    typed_handlers[ex_idx].type_name
+                )
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                full.push_str(&typed_handlers[ex_idx].body);
+                if !typed_handlers[ex_idx].body.ends_with('\n') {
+                    full.push('\n');
+                }
+            } else {
+                writeln!(full, "        try {{")
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                full.push_str(&try_body);
+                if !try_body.ends_with('\n') {
+                    full.push('\n');
+                }
+
+                for h in &typed_handlers {
+                    writeln!(full, "        }} catch ({} e) {{", h.type_name)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    full.push_str(&h.body);
+                    if !h.body.ends_with('\n') {
+                        full.push('\n');
+                    }
+                }
+            }
+
+            if let Some((ca_start, ca_end)) =
+                catch_all_byte_range(handler, &handler_ranges, code.insns_size, post_end)
+            {
+                if catch_all_is_finally && !catch_all_cleanup.trim().is_empty() {
+                    writeln!(full, "        }} finally {{")
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    full.push_str(&catch_all_cleanup);
+                    if !catch_all_cleanup.ends_with('\n') {
+                        full.push('\n');
+                    }
+                } else if let Some(handler_entry) = cfg.block_id_at_offset(ca_start) {
+                    let handler_blocks = blocks_overlapping(ca_start, ca_end);
+                    if handler_blocks.contains(&handler_entry) {
+                        let mut handler_body = String::new();
+                        if let Some(handler_region) =
+                            build_regions_filtered(cfg, handler_entry, &handler_blocks)
+                        {
+                            self.emit_region(
+                                &handler_region,
+                                cfg,
+                                instructions,
+                                code.insns_off,
+                                encoded,
+                                code,
+                                &mut handler_body,
+                                2,
+                                None,
+                                None,
+                                &mut declared,
+                                Some(global_used_regs),
+                                Some((ca_start, ca_end)),
+                                class_name,
+                            )?;
+                        }
+                        let cleaned = strip_finally_exception_noise(&handler_body);
+                        writeln!(full, "        }} catch (Throwable e) {{")
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                         full.push_str(&cleaned);
                         if !cleaned.ends_with('\n') {
                             full.push('\n');
@@ -2354,7 +2608,7 @@ impl<'a> Decompiler<'a> {
 
         let mut out = String::new();
         let mut declared = HashSet::new();
-        self.seed_declared_from_params(&mut declared, code);
+        self.seed_declared_from_params(&mut declared, code, encoded);
         let global_used_regs = self.method_used_regs(cfg, instructions, code.insns_off, code_insns);
         for bid in 0..cfg.block_count() {
             let block = &cfg.blocks[bid];
@@ -2365,6 +2619,7 @@ impl<'a> Decompiler<'a> {
             )
             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             let stmts = block_ir.remove(&bid).unwrap_or_default();
+            let stmts = CopyPropPass.run(stmts);
             let stmts = run_dead_assign_with_used_regs(stmts, &global_used_regs);
             let type_map = infer_types(self.dex, encoded, code, &stmts);
             let registers_size = code.registers_size as u32;
@@ -2374,6 +2629,7 @@ impl<'a> Decompiler<'a> {
                 build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
             apply_canonical_names(&mut name_map, &canonical);
             self.apply_debug_names_to_name_map(&mut name_map, &type_map, code, encoded);
+            self.apply_signature_param_names(&mut name_map, encoded, code);
             self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
             for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), &mut declared)
             {
@@ -2478,6 +2734,7 @@ impl<'a> Decompiler<'a> {
         let is_static = (encoded.access_flags & 0x8) != 0;
         let mut name_map = build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
         self.apply_debug_names_to_name_map(&mut name_map, &type_map, code, encoded);
+        self.apply_signature_param_names(&mut name_map, encoded, code);
         self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
         let mut declared = HashSet::new();
         for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), &mut declared) {
@@ -2522,7 +2779,11 @@ impl<'a> Decompiler<'a> {
             }
             out = kotlin::restore_kotlin_idioms(&out);
         }
-        if code.tries_size > 0 {
+        if code.tries_size > 0
+            && !out.contains("} catch (")
+            && !out.contains("} finally {")
+            && !out.contains("try (")
+        {
             out = self.wrap_body_with_try_catch(&out, encoded.code_off, code)?;
         }
         Ok(out)
@@ -2725,7 +2986,99 @@ impl<'a> Decompiler<'a> {
                 Ok(false)
             }
             Region::Loop { header, body } => {
-                // Prefer do-while when body has work before a trailing exit-if.
+                let mut loop_emitted = false;
+                if let Some((continue_cond, do_body, exit_tail)) =
+                    region::loop_body_do_while_exit_in_else(body, *header)
+                {
+                    let mis_peeled = !region::loop_has_substantial_body(&do_body, *header, cfg)
+                        && !region_is_empty_with_cfg(exit_tail, cfg)
+                        && region::region_has_non_return_work(exit_tail, cfg)
+                        && !region::region_contains_loop(exit_tail)
+                        && !region::region_contains_if(exit_tail);
+                    if mis_peeled {
+                        if let Some((condition, else_branch, then_branch)) =
+                            region::loop_body_break_pattern_trailing(body, *header)
+                        {
+                            let exit_block = region::first_block(then_branch);
+                            let while_cond = negate_condition(&condition);
+                            writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&while_cond)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                            let _ = self.emit_block_instructions(cfg, instructions, base_off, *header, Some(*header), None, encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range, class_name)?;
+                            if let Some(middle) = region::loop_body_break_middle(body, *header) {
+                                if !region_is_empty_with_cfg(&middle, cfg) {
+                                    let _ = self.emit_region(
+                                        &middle,
+                                        cfg,
+                                        instructions,
+                                        base_off,
+                                        encoded,
+                                        code,
+                                        out,
+                                        indent + 1,
+                                        Some(*header),
+                                        exit_block,
+                                        declared,
+                                        global_used_regs,
+                                        emit_range,
+                                        class_name,
+                                    )?;
+                                }
+                            }
+                            let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), exit_block, declared, global_used_regs, emit_range, class_name)?;
+                            writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                            if !region_is_empty_with_cfg(then_branch, cfg) {
+                                let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
+                            }
+                            loop_emitted = true;
+                        }
+                    }
+                    if !loop_emitted {
+                        writeln!(out, "{}do {{", ind)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        let _ = self.emit_region(
+                            &do_body,
+                            cfg,
+                            instructions,
+                            base_off,
+                            encoded,
+                            code,
+                            out,
+                            indent + 1,
+                            Some(*header),
+                            region::first_block(exit_tail),
+                            declared,
+                            global_used_regs,
+                            emit_range,
+                            class_name,
+                        )?;
+                        writeln!(
+                            out,
+                            "{}}} while ({});",
+                            ind,
+                            shorten_java_names(continue_cond)
+                        )
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        if !region_is_empty_with_cfg(exit_tail, cfg) {
+                            let _ = self.emit_region(
+                                exit_tail,
+                                cfg,
+                                instructions,
+                                base_off,
+                                encoded,
+                                code,
+                                out,
+                                indent,
+                                skip_goto_to,
+                                break_target,
+                                declared,
+                                global_used_regs,
+                                emit_range,
+                                class_name,
+                            )?;
+                        }
+                        loop_emitted = true;
+                    }
+                }
+                if !loop_emitted {
                 if let Some((exit_cond, do_body, then_branch)) =
                     region::loop_body_do_while_loose(body, *header)
                         .or_else(|| loop_body_do_while_pattern(body, *header))
@@ -2774,6 +3127,7 @@ impl<'a> Decompiler<'a> {
                             class_name,
                         )?;
                     }
+                    loop_emitted = true;
                 } else if let Some((condition, else_branch, then_branch)) =
                     region::loop_body_break_pattern(body, *header)
                 {
@@ -2781,15 +3135,121 @@ impl<'a> Decompiler<'a> {
                     let while_cond = negate_condition(&condition);
                     writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&while_cond)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     let _ = self.emit_block_instructions(cfg, instructions, base_off, *header, Some(*header), None, encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range, class_name)?;
+                    if let Some(middle) = region::loop_body_break_middle(body, *header) {
+                        if !region_is_empty_with_cfg(&middle, cfg) {
+                            let _ = self.emit_region(
+                                &middle,
+                                cfg,
+                                instructions,
+                                base_off,
+                                encoded,
+                                code,
+                                out,
+                                indent + 1,
+                                Some(*header),
+                                exit_block,
+                                declared,
+                                global_used_regs,
+                                emit_range,
+                                class_name,
+                            )?;
+                        }
+                    }
                     let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), exit_block, declared, global_used_regs, emit_range, class_name)?;
                     writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     if !region_is_empty_with_cfg(then_branch, cfg) {
                         let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
                     }
-                } else {
-                    writeln!(out, "{}while (true) {{", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    let _ = self.emit_region(body, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), None, declared, global_used_regs, emit_range, class_name)?;
-                    writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    loop_emitted = true;
+                } else if let Some((condition, else_branch, then_branch)) =
+                    region::loop_body_break_pattern_trailing(body, *header)
+                {
+                    // Nested trailing exit-if (merge tail loops): require a non-empty exit `then`.
+                    if !region_is_empty_with_cfg(then_branch, cfg) {
+                        let exit_block = region::first_block(then_branch);
+                        let while_cond = negate_condition(&condition);
+                        writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&while_cond)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        let _ = self.emit_block_instructions(cfg, instructions, base_off, *header, Some(*header), None, encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range, class_name)?;
+                        if let Some(middle) = region::loop_body_break_middle(body, *header) {
+                            if !region_is_empty_with_cfg(&middle, cfg) {
+                                let _ = self.emit_region(
+                                    &middle,
+                                    cfg,
+                                    instructions,
+                                    base_off,
+                                    encoded,
+                                    code,
+                                    out,
+                                    indent + 1,
+                                    Some(*header),
+                                    exit_block,
+                                    declared,
+                                    global_used_regs,
+                                    emit_range,
+                                    class_name,
+                                )?;
+                            }
+                        }
+                        let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), exit_block, declared, global_used_regs, emit_range, class_name)?;
+                        writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        if !region_is_empty_with_cfg(then_branch, cfg) {
+                            let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
+                        }
+                        loop_emitted = true;
+                    }
+                }
+                }
+                if !loop_emitted {
+                    let loop_break = region::loop_exit_break_target(body, *header, cfg);
+                    let multi_exits = region::loop_prefix_multi_exit_ifs(body, *header);
+                    if multi_exits.len() >= 2 {
+                        writeln!(out, "{}while (true) {{", ind)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        let _ = self.emit_block_instructions(
+                            cfg, instructions, base_off, *header, Some(*header), loop_break,
+                            encoded, code, out, indent + 1, declared, global_used_regs, true,
+                            emit_range, class_name,
+                        )?;
+                        if let Some(middle) = region::loop_body_break_middle(body, *header) {
+                            if !region_is_empty_with_cfg(&middle, cfg) {
+                                let _ = self.emit_region(
+                                    &middle, cfg, instructions, base_off, encoded, code, out,
+                                    indent + 1, Some(*header), loop_break, declared,
+                                    global_used_regs, emit_range, class_name,
+                                )?;
+                            }
+                        }
+                        for (i, (cond, exit_r)) in multi_exits.iter().enumerate() {
+                            if i == 0 {
+                                writeln!(out, "{}if ({}) {{", ind, shorten_java_names(cond))
+                                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                            } else {
+                                writeln!(out, "{} else if ({}) {{", ind, shorten_java_names(cond))
+                                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                            }
+                            let _ = self.emit_region(
+                                exit_r, cfg, instructions, base_off, encoded, code, out,
+                                indent + 2, Some(*header), loop_break, declared,
+                                global_used_regs, emit_range, class_name,
+                            )?;
+                        }
+                        if !multi_exits.is_empty() {
+                            writeln!(out, "{}}}", ind)
+                                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        }
+                        writeln!(out, "{}}}", ind)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    } else {
+                        writeln!(out, "{}while (true) {{", ind)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        let _ = self.emit_region(
+                            body, cfg, instructions, base_off, encoded, code, out, indent + 1,
+                            Some(*header), loop_break, declared, global_used_regs, emit_range,
+                            class_name,
+                        )?;
+                        writeln!(out, "{}}}", ind)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    }
                 }
                 Ok(false)
             }
@@ -2851,28 +3311,116 @@ impl<'a> Decompiler<'a> {
         }
     }
 
-    /// Fold numeric constants from instructions immediately before conditionals into the condition string.
-    /// E.g., `const/4 v2, 12; if-ne v0, v2` → condition becomes "v0 != 12" instead of "v0 != v2".
+    /// Fold numeric constants and param copies from instructions immediately before
+    /// conditionals into the condition string.
+    /// E.g. `const/16 v0, 1002; if-ne v4, v0` → `v4 != 1002`,
+    /// `move v4, v5; if-eq v4, v0` → `v5 == v0`.
+    ///
+    /// On loop headers only, skip registers mutated later (`add-int/lit8 v0, v0, 1`)
+    /// so `while (i < n)` does not become `while (0 < n)`.
     fn fold_constants_into_conditions(cfg: &mut MethodCfg, instructions: &[Instruction]) {
-        for block in &mut cfg.blocks {
+        let mut mutated = HashSet::new();
+        for ins in instructions {
+            let m = ins.mnemonic();
+            if matches!(
+                m,
+                "const/4"
+                    | "const/16"
+                    | "const"
+                    | "const/high16"
+                    | "const-wide"
+                    | "const-wide/16"
+                    | "const-wide/32"
+                    | "const-wide/high16"
+                    | "const-string"
+                    | "const-string/jumbo"
+                    | "const-class"
+            ) {
+                continue;
+            }
+            let (_reads, writes) = read_write::instruction_reads_writes(m, ins.operands());
+            mutated.extend(writes);
+        }
+        let loop_headers = cfg.loop_headers.clone();
+        let mut folded: HashSet<u32> = HashSet::new();
+        for (bid, block) in cfg.blocks.iter_mut().enumerate() {
             if let BlockEnd::Conditional { ref mut condition, .. } = block.end {
-                let offs = &block.instruction_offsets;
-                if offs.len() < 2 { continue; }
+                let offs = block.instruction_offsets.clone();
+                if offs.len() < 2 {
+                    continue;
+                }
                 let find_ins = |off: u32| -> Option<&Instruction> {
                     instructions.iter().find(|i| i.offset as u32 == off)
                 };
+                let is_loop = loop_headers.contains(&bid);
                 for &off in offs.iter().rev().skip(1).take(3) {
                     let Some(ins) = find_ins(off) else { continue };
                     let m = ins.mnemonic();
                     if m == "const/4" || m == "const/16" || m == "const" || m == "const/high16" {
                         let parts: Vec<&str> = ins.operands().split(',').map(|s| s.trim()).collect();
-                        if parts.len() >= 2 && condition.contains(parts[0]) {
-                            *condition = condition.replace(parts[0], parts[1]);
+                        if parts.len() >= 2 {
+                            if let Some(reg) = parse_one_reg(parts[0]) {
+                                if is_loop && mutated.contains(&reg) {
+                                    continue;
+                                }
+                                let mut map = HashMap::new();
+                                map.insert(reg, parts[1].to_string());
+                                let next = replace_register_names(condition, &map);
+                                if next != *condition {
+                                    *condition = next;
+                                    folded.insert(off);
+                                }
+                            }
+                        }
+                    } else if matches!(
+                        m,
+                        "move"
+                            | "move/from16"
+                            | "move/16"
+                            | "move-object"
+                            | "move-object/from16"
+                            | "move-object/16"
+                            | "move-wide"
+                            | "move-wide/from16"
+                            | "move-wide/16"
+                    ) {
+                        if let Some((dst, src)) = parse_two_regs(ins.operands()) {
+                            if is_loop && mutated.contains(&dst) {
+                                continue;
+                            }
+                            let mut map = HashMap::new();
+                            map.insert(dst, format!("v{}", src));
+                            let next = replace_register_names(condition, &map);
+                            if next != *condition {
+                                *condition = next;
+                                folded.insert(off);
+                            }
+                        }
+                    } else if m == "instance-of" {
+                        let parts: Vec<&str> = ins.operands().split(',').map(|s| s.trim()).collect();
+                        if parts.len() >= 3 {
+                            if let Some(dst) = parse_one_reg(parts[0]) {
+                                if is_loop && mutated.contains(&dst) {
+                                    continue;
+                                }
+                                let src = parse_one_reg(parts[1])
+                                    .map(|s| format!("v{}", s))
+                                    .unwrap_or_else(|| parts[1].to_string());
+                                let expr = format!("{} instanceof {}", src, parts[2]);
+                                let mut map = HashMap::new();
+                                map.insert(dst, expr);
+                                let next = replace_register_names(condition, &map);
+                                if next != *condition {
+                                    *condition = next;
+                                    folded.insert(off);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+        cfg.folded_const_offsets = folded;
     }
 
     /// Emit `} else if (…) { … }` chains when the else region is a single nested If;
@@ -2954,6 +3502,85 @@ impl<'a> Decompiler<'a> {
         }
     }
 
+    /// Predecessor blocks that can reach `target` (for naming values tested by if-*).
+    fn is_fall_through_edge(cfg: &MethodCfg, from: BlockId, to: BlockId) -> bool {
+        match &cfg.blocks[from].end {
+            BlockEnd::FallThrough => cfg.fall_through_block(from) == Some(to),
+            BlockEnd::Conditional { fall_through, .. } => *fall_through == to,
+            _ => false,
+        }
+    }
+
+    fn is_conditional_branch_edge(cfg: &MethodCfg, from: BlockId, to: BlockId) -> bool {
+        matches!(
+            &cfg.blocks[from].end,
+            BlockEnd::Conditional { branch_target, .. } if *branch_target == to
+        )
+    }
+
+    /// Fall-through predecessors only (at most two hops).
+    ///
+    /// Recursive back-edge walking pulled in unrelated loop-body blocks and
+    /// poisoned SSA naming (e.g. `binarySearch` compared against stale `i7`
+    /// instead of `target`). We only need the immediate fall-through pred
+    /// (and one extra hop for `invoke; move-result` in the prior block).
+    fn predecessor_blocks_for_condition_naming(cfg: &MethodCfg, target: BlockId) -> Vec<BlockId> {
+        let mut out = Vec::new();
+        let mut frontier = vec![target];
+        let mut seen = HashSet::from([target]);
+        for _ in 0..2 {
+            let mut next = Vec::new();
+            for &t in &frontier {
+                for (from, to) in cfg.successor_edges() {
+                    if to != t || seen.contains(&from) {
+                        continue;
+                    }
+                    if !Self::is_fall_through_edge(cfg, from, to) {
+                        continue;
+                    }
+                    seen.insert(from);
+                    out.push(from);
+                    next.push(from);
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        // Else-if arm: `if-ne` taken target block (e.g. binarySearch `arr[mid] < target`).
+        for (from, to) in cfg.successor_edges() {
+            if to != target || seen.contains(&from) {
+                continue;
+            }
+            if Self::is_conditional_branch_edge(cfg, from, to) {
+                seen.insert(from);
+                out.push(from);
+            }
+        }
+        out.sort_by_key(|bid| cfg.blocks[*bid].start_offset);
+        out
+    }
+
+    /// Instructions whose defs reach an if-* at the end of `block_id` (includes fall-through preds).
+    fn block_instruction_seq_for_condition_naming(
+        &self,
+        cfg: &MethodCfg,
+        instructions: &[Instruction],
+        block_id: BlockId,
+    ) -> Vec<Instruction> {
+        let mut seq = self.block_instruction_seq(cfg, instructions, block_id, None, true, None);
+        // `invoke; move-result` in the fall-through predecessor block.
+        for pred in Self::predecessor_blocks_for_condition_naming(cfg, block_id) {
+            let pred_seq =
+                self.block_instruction_seq(cfg, instructions, pred, None, false, None);
+            if pred_seq.iter().any(|i| i.mnemonic().starts_with("invoke")) {
+                seq.splice(0..0, pred_seq);
+            }
+        }
+        seq
+    }
+
     /// Rename raw register references (vN) in condition strings.
     /// Prefer the name of the SSA value that reaches the branch in *this* block
     /// (so a reused register does not pick up a later View name like `view0`
@@ -2978,10 +3605,13 @@ impl<'a> Decompiler<'a> {
                 continue;
             }
 
-            // Instructions in this block excluding the terminating if-* (same as emit).
-            let seq = self.block_instruction_seq(cfg, instructions, block_id, None, true, None);
+            // Include fall-through predecessor blocks so `invoke; move-result` + `if-nez`
+            // in adjacent blocks still names the tested value as `obj1`, not stale `obj0`.
+            let seq =
+                self.block_instruction_seq_for_condition_naming(cfg, instructions, block_id);
             let mut local_names: HashMap<u32, String> = HashMap::new();
             let mut local_types: HashMap<u32, String> = HashMap::new();
+            let mut name_map: HashMap<ir::VarId, String> = HashMap::new();
             if !seq.is_empty() {
                 let stmts = self
                     .instructions_to_ir(&seq, base_off, code_insns, Some(instructions))
@@ -2989,13 +3619,16 @@ impl<'a> Decompiler<'a> {
                 let mut runner = PassRunner::new();
                 runner.add(InvokeChainPass);
                 runner.add(SsaRenamePass);
+                runner.add(CopyPropPass);
                 runner.add(ConstructorMergePass);
                 runner.add(ExprSimplifyPass);
+                runner.add(InlineFilledArrayPass);
                 let stmts = runner.run(stmts);
                 let types = infer_types(self.dex, encoded, code, &stmts);
-                let mut name_map =
+                name_map =
                     build_var_names_with_regs(&stmts, &types, registers_size, ins_size, is_static);
                 self.apply_debug_names_to_name_map(&mut name_map, &types, code, encoded);
+                self.apply_signature_param_names(&mut name_map, encoded, code);
 
                 // Highest SSA version per register in this block = value reaching the condition.
                 let mut best_ver: HashMap<u32, u32> = HashMap::new();
@@ -3011,13 +3644,24 @@ impl<'a> Decompiler<'a> {
                 }
             }
 
-            // Prefer block-local names; fall back to method-wide only when types agree.
+            // Prefer reaching-def names; fall back to method-wide only when types agree.
             let mut merged = method_names.clone();
             for (reg, name) in &local_names {
+                if local_types.get(reg).map(|s| s.as_str()) == Some("boolean") {
+                    merged.insert(*reg, name.clone());
+                    continue;
+                }
+                if let Some(method) = method_names.get(reg) {
+                    // One method-wide name per register — keep it for conditions so
+                    // `int i5 = arr[mid]; if (i5 != target)` stays consistent.
+                    if is_synthetic_local_name(name) && is_synthetic_local_name(method) {
+                        continue;
+                    }
+                }
                 merged.insert(*reg, name.clone());
             }
-            // Drop method-wide names that conflict with the local type at the branch
-            // (e.g. method-wide `view0` for a boolean condition).
+            // Drop stale method-wide names when the reaching def has a different type
+            // (e.g. method-wide `obj0` for Object reuse, branch tests `obj1` ConnectivityManager).
             if let Some(reg_types) = self.method_reg_types.borrow().as_ref() {
                 for (reg, local_ty) in &local_types {
                     let method_ty = reg_types.get(reg).map(|s| s.as_str());
@@ -3029,6 +3673,34 @@ impl<'a> Decompiler<'a> {
                         } else {
                             merged.remove(reg);
                         }
+                    }
+                }
+                // Registers tested by this branch: never keep method-wide name when local type differs.
+                for reg in condition_regs_in_block(cfg, block_id, instructions) {
+                    let Some(local_ty) = local_types.get(&reg) else {
+                        continue;
+                    };
+                    let method_ty = reg_types.get(&reg).map(|s| s.as_str());
+                    if method_ty.is_some()
+                        && !types_compatible_for_naming(Some(local_ty.as_str()), method_ty)
+                    {
+                        if let Some(local_name) = local_names.get(&reg) {
+                            merged.insert(reg, local_name.clone());
+                        } else {
+                            merged.remove(&reg);
+                        }
+                    }
+                }
+            }
+
+            let cond_regs = condition_regs_in_block(cfg, block_id, instructions);
+            if let Some(reg_types) = self.method_reg_types.borrow().as_ref() {
+                for reg in &cond_regs {
+                    if let Some(mt) = reg_types.get(reg) {
+                        local_types.entry(*reg).or_insert_with(|| mt.clone());
+                    }
+                    if let Some(name) = merged.get(reg) {
+                        local_names.entry(*reg).or_insert_with(|| name.clone());
                     }
                 }
             }
@@ -3047,6 +3719,8 @@ impl<'a> Decompiler<'a> {
         let mut runner = PassRunner::new();
         runner.add(InvokeChainPass);
         runner.add(SsaRenamePass);
+        runner.add(CopyPropPass);
+        runner.add(InlineFilledArrayPass);
         let stmts = self.instructions_to_ir(instructions, base_off, code_insns, None).unwrap_or_default();
         let stmts = runner.run(stmts);
         let mut regs = used_regs(&stmts);
@@ -3078,8 +3752,10 @@ impl<'a> Decompiler<'a> {
         let mut runner = PassRunner::new();
         runner.add(InvokeChainPass);
         runner.add(SsaRenamePass);
+        runner.add(CopyPropPass);
         runner.add(ConstructorMergePass);
         runner.add(ExprSimplifyPass);
+        runner.add(InlineFilledArrayPass);
         let stmts = runner.run(stmts);
         let types = infer_types(self.dex, encoded, code, &stmts);
         let mut by_reg: HashMap<u32, String> = HashMap::new();
@@ -3106,6 +3782,7 @@ impl<'a> Decompiler<'a> {
         let mut name_map =
             build_var_names_with_regs(&stmts, &types, registers_size, ins_size, is_static);
         self.apply_debug_names_to_name_map(&mut name_map, &types, code, encoded);
+        self.apply_signature_param_names(&mut name_map, encoded, code);
         // Bake user variable renames into method-wide names (conditions / cross-block).
         self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
 
@@ -3128,12 +3805,21 @@ impl<'a> Decompiler<'a> {
                 {
                     continue;
                 }
-                let score = if !is_synthetic_local_name(name) {
-                    100
+                let score = if name == "length" {
+                    // Role name for array-length dest only — do not win the whole register
+                    // (D8 reuses that register for `const/16 …, 1002` / PERMISSIONS_CODE).
+                    5 + vid.ver as i32
+                } else if ty.is_some_and(is_primitive_java_type)
+                    && !is_synthetic_local_name(name)
+                    && types.iter().any(|(v, t)| v.reg == reg && !is_primitive_java_type(t))
+                {
+                    // Debug name `host` on a reused int (`const/4 0` for resolveActivity flags).
+                    5 + vid.ver as i32
+                } else if !is_synthetic_local_name(name) {
+                    100 + vid.ver as i32
                 } else {
-                    10
+                    10 + vid.ver as i32
                 };
-                let score = score + vid.ver as i32;
                 match &best {
                     None => best = Some((score, name.clone())),
                     Some((s, _)) if score > *s => best = Some((score, name.clone())),
@@ -3155,6 +3841,25 @@ impl<'a> Decompiler<'a> {
                 }
                 used_names.insert(name.clone());
                 names_by_reg.insert(reg, name);
+            }
+        }
+        // Parameters only referenced by branch conditions may be absent from name_map.
+        let sig = self.signature_param_names(encoded, code);
+        for (reg, name) in sig {
+            names_by_reg.entry(reg).or_insert(name);
+        }
+        if self.use_debug_names && code.debug_info_off != 0 {
+            if let Ok(dbg) = self.dex.debug_info_for_code(code) {
+                let param_base = registers_size.saturating_sub(ins_size);
+                let param_name_offset = if is_static { 0usize } else { 1usize };
+                for (i, pname) in dbg.parameter_names.iter().enumerate() {
+                    let Some(name) = pname.as_ref() else { continue };
+                    if !is_java_ident(name) {
+                        continue;
+                    }
+                    let reg = param_base + param_name_offset as u32 + i as u32;
+                    names_by_reg.insert(reg, name.clone());
+                }
             }
         }
         *self.method_reg_names.borrow_mut() = Some(names_by_reg);
@@ -3204,6 +3909,9 @@ impl<'a> Decompiler<'a> {
                 break;
             }
             if let Some(ins) = instructions.iter().find(|ins| (ins.offset as u32) == off) {
+                if cfg.folded_const_offsets.contains(&off) {
+                    continue;
+                }
                 if skip_switch_ins && (ins.mnemonic() == "packed-switch" || ins.mnemonic() == "sparse-switch") {
                     continue;
                 }
@@ -3257,7 +3965,17 @@ impl<'a> Decompiler<'a> {
 
     /// Treat incoming Dalvik parameter registers as already declared so a later
     /// SSA assign (`b = b + 1`) does not emit `int b = ...` after `if (b == 10)`.
-    fn seed_declared_from_params(&self, declared: &mut HashSet<String>, code: &CodeItem) {
+    fn seed_declared_from_params(
+        &self,
+        declared: &mut HashSet<String>,
+        code: &CodeItem,
+        encoded: &EncodedMethod,
+    ) {
+        for n in self.signature_param_names(encoded, code).values() {
+            if n != "this" {
+                declared.insert(n.clone());
+            }
+        }
         let registers_size = code.registers_size as u32;
         let ins_size = code.ins_size as u32;
         let param_base = registers_size.saturating_sub(ins_size);
@@ -3268,6 +3986,89 @@ impl<'a> Decompiler<'a> {
                         declared.insert(n.clone());
                     }
                 }
+            }
+        }
+    }
+
+    /// DEX debug names for each declared parameter (`None` = unnamed).
+    /// Prefers `debug_info.parameter_names`, then `DBG_START_LOCAL` on the param register
+    /// so the signature matches the body (`grantResults` vs `arr2`).
+    fn debug_parameter_display_names(
+        &self,
+        encoded: &EncodedMethod,
+        param_types: &[String],
+    ) -> Vec<Option<String>> {
+        if !self.use_debug_names || encoded.code_off == 0 {
+            return vec![None; param_types.len()];
+        }
+        let Ok(code) = self.dex.get_code_item(encoded.code_off) else {
+            return vec![None; param_types.len()];
+        };
+        if code.debug_info_off == 0 {
+            return vec![None; param_types.len()];
+        }
+        let Ok(dbg) = self.dex.debug_info_for_code(&code) else {
+            return vec![None; param_types.len()];
+        };
+        let is_static = (encoded.access_flags & 0x8) != 0;
+        let param_base = (code.registers_size as u32).saturating_sub(code.ins_size as u32);
+        debug_param_names_from_tables(
+            &dbg.parameter_names,
+            &dbg.register_names,
+            param_base,
+            is_static,
+            param_types,
+        )
+    }
+
+    /// Dalvik param register → signature display name (`this`, `p0`, `s1`, …).
+    fn signature_param_names(
+        &self,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+    ) -> HashMap<u32, String> {
+        let Ok(info) = self.dex.get_method_info(encoded.method_idx) else {
+            return HashMap::new();
+        };
+        let is_static = (encoded.access_flags & 0x8) != 0;
+        let param_types: Vec<String> = info
+            .params
+            .iter()
+            .map(|p| java::descriptor_to_java(p))
+            .collect();
+        type_infer::param_names_by_register(
+            code.registers_size as u32,
+            code.ins_size as u32,
+            is_static,
+            &param_types,
+        )
+    }
+
+    /// Keep body names for parameter registers in sync with the method signature.
+    /// Temps (`v0`, `x0`, `s0`) are replaced; debug/user names (`email`) are kept.
+    fn apply_signature_param_names(
+        &self,
+        name_map: &mut HashMap<VarId, String>,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+    ) {
+        let sig = self.signature_param_names(encoded, code);
+        if sig.is_empty() {
+            return;
+        }
+        for (vid, name) in name_map.iter_mut() {
+            let Some(sig_name) = sig.get(&vid.reg) else {
+                continue;
+            };
+            if name.as_str() == "this" {
+                continue;
+            }
+            if sig_name == "this" {
+                *name = "this".to_string();
+                continue;
+            }
+            if is_synthetic_local_name(name) || is_signature_style_name(name) {
+                *name = sig_name.clone();
             }
         }
     }
@@ -3307,14 +4108,14 @@ impl<'a> Decompiler<'a> {
             }
         }
 
-        // Highest SSA version per register (latest definition).
-        let mut max_ver: HashMap<u32, u32> = HashMap::new();
-        for var in name_map.keys() {
-            let e = max_ver.entry(var.reg).or_insert(0);
-            if var.ver > *e {
-                *e = var.ver;
-            }
-        }
+        let latest_ver_by_reg: HashMap<u32, u32> = name_map
+            .keys()
+            .fold(HashMap::new(), |mut m, v| {
+                m.entry(v.reg)
+                    .and_modify(|ver| *ver = (*ver).max(v.ver))
+                    .or_insert(v.ver);
+                m
+            });
 
         for (var, display) in name_map.iter_mut() {
             if display.as_str() == "this" {
@@ -3324,12 +4125,15 @@ impl<'a> Decompiler<'a> {
             if !is_java_ident(n) {
                 continue;
             }
-            let Some(&max_v) = max_ver.get(&var.reg) else { continue };
-            // Type of the latest version is the debug local's intended type (e.g. String email).
-            let latest = VarId::new(var.reg, max_v);
-            let target_ty = type_map.get(&latest).map(|s| s.as_str());
+            // Debug names describe the final live range on a register — do not paint
+            // earlier SSA versions (`const/4 4` reused later as `int dist = bfs(...)`).
+            if latest_ver_by_reg.get(&var.reg) != Some(&var.ver) {
+                continue;
+            }
+            // Prefer a reference type on this register over the latest SSA version.
+            // D8 reuses `host` (String) for `const/4 0` flags — that int must not be named `host`.
+            let target_ty = preferred_debug_type_for_reg(var.reg, type_map);
             let this_ty = type_map.get(var).map(|s| s.as_str());
-            // Only paint versions compatible with the final local type.
             if types_compatible_for_naming(this_ty, target_ty) {
                 *display = n.to_string();
             }
@@ -3405,8 +4209,10 @@ impl<'a> Decompiler<'a> {
             let mut runner = PassRunner::new();
             runner.add(InvokeChainPass);
             runner.add(SsaRenamePass);
+            runner.add(CopyPropPass);
             runner.add(ConstructorMergePass);
             runner.add(ExprSimplifyPass);
+            runner.add(InlineFilledArrayPass);
             run_dead_assign_with_used_regs(runner.run(stmts), used_regs)
         } else {
             self.default_pass_runner().run(stmts)
@@ -3435,15 +4241,34 @@ impl<'a> Decompiler<'a> {
                     .map(|s| s.as_str());
                 // Only share method-wide names when types agree. Do not apply a
                 // method-wide String name onto a boolean SSA version (or vice versa).
+                // `length` is an array-length role — never paint a prior const on the
+                // same register (`int length = 1002`).
+                if method_name == "length" && name.as_str() != "length" {
+                    continue;
+                }
+                // Do not rename primitive temps to later array/graph locals on the same register.
+                if is_synthetic_local_name(name)
+                    && !is_synthetic_local_name(method_name)
+                    && ty.is_some_and(type_infer::is_primitive_java_type)
+                    && method_ty.is_some_and(|t| !type_infer::is_primitive_java_type(t))
+                {
+                    continue;
+                }
                 if ty.is_some() && method_ty.is_some() {
                     if types_compatible_for_naming(ty, method_ty) {
                         *name = method_name.clone();
                     }
+                } else if ty.is_some_and(type_infer::is_primitive_java_type)
+                    && method_ty.is_some_and(|t| t.ends_with("[]"))
+                {
+                    // Keep `i4` for `const/4 4` — do not paint with later `int[] arr4`.
+                    continue;
                 } else if ty.is_none() && method_ty.is_none() {
                     *name = method_name.clone();
                 }
             }
         }
+        self.apply_signature_param_names(&mut name_map, encoded, code);
         // User renames must win over method-wide / debug names.
         self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
         for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), declared) {
@@ -3514,6 +4339,61 @@ impl<'a> Decompiler<'a> {
     /// Convert a sequence of Dalvik instructions into method IR (raw form).
     /// InvokeChainPass is run by the pipeline to merge invoke+move-result+return.
     /// When `instructions` is a block subset, pass `full_instructions` so bytecode hex is correct for single-instruction blocks.
+    fn format_const_wide_rhs(
+        &self,
+        dst_reg: u32,
+        bits_str: &str,
+        instructions: &[Instruction],
+        idx: usize,
+    ) -> String {
+        let java_ty = self
+            .wide_const_java_type(dst_reg, instructions, idx)
+            .unwrap_or_else(|| "long".to_string());
+        format_java_wide_literal(bits_str, &java_ty)
+    }
+
+    fn wide_const_java_type(
+        &self,
+        dst_reg: u32,
+        instructions: &[Instruction],
+        idx: usize,
+    ) -> Option<String> {
+        if let Some(reg_types) = self.method_reg_types.borrow().as_ref() {
+            if let Some(ty) = reg_types.get(&dst_reg) {
+                if matches!(ty.as_str(), "long" | "double") {
+                    return Some(ty.clone());
+                }
+            }
+        }
+        if self.is_wide_const_returned(dst_reg, instructions, idx) {
+            if let Some(ret_ty) = self.method_return_type.borrow().as_ref() {
+                if matches!(ret_ty.as_str(), "long" | "double") {
+                    return Some(ret_ty.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn is_wide_const_returned(
+        &self,
+        dst_reg: u32,
+        instructions: &[Instruction],
+        idx: usize,
+    ) -> bool {
+        for ins in instructions.iter().skip(idx + 1) {
+            let m = ins.mnemonic();
+            if m == "return-wide" {
+                let ops = self.resolve_operands(ins.operands());
+                return parse_one_reg(&ops) == Some(dst_reg);
+            }
+            if m != "nop" && !m.starts_with("const-wide") {
+                return false;
+            }
+        }
+        false
+    }
+
     fn instructions_to_ir(
         &self,
         instructions: &[Instruction],
@@ -3665,6 +4545,11 @@ impl<'a> Decompiler<'a> {
             // Emit Assign IR for const and binary ops so type inference and naming apply.
             if let Some((dst_reg, rhs_str)) = parse_assign_rhs(m, &ops_resolved) {
                 flush_pending_invoke(&mut out, &mut pending_invoke);
+                let rhs_str = if m.starts_with("const-wide") {
+                    self.format_const_wide_rhs(dst_reg, &rhs_str, instructions, idx)
+                } else {
+                    rhs_str
+                };
                 out.push(IrStmt::Assign {
                     dst: ir::VarId::new(dst_reg, 0),
                     rhs: IrExpr::Raw(rhs_str),
@@ -3687,8 +4572,10 @@ impl<'a> Decompiler<'a> {
         let mut runner = PassRunner::new();
         runner.add(InvokeChainPass);
         runner.add(SsaRenamePass);
+        runner.add(CopyPropPass);
         runner.add(ConstructorMergePass);
         runner.add(ExprSimplifyPass);
+        runner.add(InlineFilledArrayPass);
         runner.add(DeadAssignPass);
         runner
     }
@@ -4546,8 +5433,8 @@ fn strip_finally_exception_noise(body: &str) -> String {
         if t.is_empty() {
             continue;
         }
-        // Skip `Throwable e = …` / `throw e;` boilerplate often left in catch-all finally.
-        if t.starts_with("throw e") || t.contains("move-exception") {
+        // Skip exception rethrow boilerplate often left in catch-all finally handlers.
+        if t.starts_with("throw ") || t.contains("move-exception") {
             continue;
         }
         if (t.starts_with("Throwable ") || t.starts_with("Exception "))
@@ -4688,6 +5575,26 @@ fn is_reference_java_type(ty: &str) -> bool {
         ty.trim(),
         "boolean" | "byte" | "short" | "int" | "long" | "float" | "double" | "char" | "void"
     ) && !ty.trim().is_empty()
+}
+
+/// Registers tested by the terminating if-* in a conditional block.
+fn condition_regs_in_block(
+    cfg: &MethodCfg,
+    block_id: BlockId,
+    instructions: &[Instruction],
+) -> Vec<u32> {
+    let offs = &cfg.blocks[block_id].instruction_offsets;
+    let Some(&off) = offs.last() else {
+        return Vec::new();
+    };
+    let Some(ins) = instructions.iter().find(|i| i.offset as u32 == off) else {
+        return Vec::new();
+    };
+    let m = ins.mnemonic();
+    if m.starts_with("if-") {
+        return regs_mentioned_in_operands(ins.operands());
+    }
+    Vec::new()
 }
 
 /// Register numbers mentioned as `vN` / `vN_k` in an operands string.
@@ -5090,6 +5997,93 @@ pub(crate) fn parse_static_field_operands(ops: &str) -> Option<(u32, String)> {
     Some((reg, field_ref))
 }
 
+/// Format a `const-wide` bit pattern as a readable Java `long` or `double` literal.
+pub(crate) fn format_java_wide_literal(bits_str: &str, java_type: &str) -> String {
+    let trimmed = bits_str.trim();
+    let negative = trimmed.starts_with('-');
+    let digits = trimmed.strip_prefix('-').unwrap_or(trimmed);
+    let Ok(bits) = digits.parse::<u64>() else {
+        return bits_str.to_string();
+    };
+    let signed = if negative {
+        -(bits as i128) as i64
+    } else {
+        bits as i64
+    };
+    match java_type {
+        "double" | "java.lang.Double" => format_java_double(f64::from_bits(bits)),
+        "float" | "java.lang.Float" => format_java_float(f32::from_bits(bits as u32)),
+        _ => format_java_long(signed),
+    }
+}
+
+fn format_java_double(v: f64) -> String {
+    if v.is_nan() {
+        return "Double.NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_positive() {
+            "Double.POSITIVE_INFINITY".to_string()
+        } else {
+            "Double.NEGATIVE_INFINITY".to_string()
+        };
+    }
+    shorten_float_literal(v, &format!("{:.17}", v))
+}
+
+fn shorten_float_literal(v: f64, s: &str) -> String {
+    let mut best = trim_float_trailing_zeros(s);
+    let mut candidate = s.to_string();
+    while candidate.contains('.') {
+        if let Ok(parsed) = candidate.parse::<f64>() {
+            if parsed == v {
+                best = trim_float_trailing_zeros(&candidate);
+            }
+        }
+        if !candidate.as_bytes().last().is_some_and(|b| b.is_ascii_digit()) {
+            break;
+        }
+        candidate.pop();
+    }
+    best
+}
+
+fn format_java_float(v: f32) -> String {
+    if v.is_nan() {
+        return "Float.NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_positive() {
+            "Float.POSITIVE_INFINITY".to_string()
+        } else {
+            "Float.NEGATIVE_INFINITY".to_string()
+        };
+    }
+    let mut s = trim_float_trailing_zeros(&format!("{:.9}", v));
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        s.push_str(".0");
+    }
+    format!("{}f", s)
+}
+
+fn format_java_long(v: i64) -> String {
+    if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+        return format!("{}L", v);
+    }
+    format!("0x{:X}L", v as u64)
+}
+
+fn trim_float_trailing_zeros(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    let mut out = s.trim_end_matches('0').to_string();
+    if out.ends_with('.') {
+        out.push('0');
+    }
+    out
+}
+
 pub(crate) fn parse_const_into_reg(ops: &str) -> Option<String> {
     let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
     if parts.len() < 2 {
@@ -5178,7 +6172,7 @@ fn parse_assign_rhs(m: &str, ops: &str) -> Option<(u32, String)> {
             let op = if m.starts_with("neg") { "-" } else { "~" };
             parse_two_regs(ops).map(|(a, b)| (a, format!("{}{}", op, format!("v{}", b))))
         }
-        "move" | "move/from16" | "move/16" | "move-object" | "move-wide" | "move-wide/from16" | "move-object/from16" => {
+        "move" | "move/from16" | "move/16" | "move-object" | "move-wide" | "move-wide/from16" | "move-wide/16" | "move-object/from16" | "move-object/16" => {
             parse_two_regs(ops).map(|(d, s)| (d, format!("v{}", s)))
         }
         // Int-to-* casts
@@ -5828,6 +6822,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_assign_rhs_move_object16_and_move_wide16() {
+        assert_eq!(
+            super::parse_assign_rhs("move-object/16", "v0, v3"),
+            Some((0, "v3".into()))
+        );
+        assert_eq!(
+            super::parse_assign_rhs("move-wide/16", "v4, v6"),
+            Some((4, "v6".into()))
+        );
+        assert_eq!(
+            super::parse_assign_rhs("array-length", "v0, v8"),
+            Some((0, "v8.length".into()))
+        );
+    }
+
+    #[test]
+    fn synthetic_local_names_include_x_temps() {
+        assert!(is_synthetic_local_name("x0"));
+        assert!(is_synthetic_local_name("x12"));
+        assert!(is_synthetic_local_name("v0"));
+        assert!(is_synthetic_local_name("i0"));
+        assert!(!is_synthetic_local_name("email"));
+        assert!(!is_synthetic_local_name("grantResults"));
+        assert!(!is_synthetic_local_name("length"));
+        assert!(is_signature_style_name("p0"));
+        assert!(is_signature_style_name("s1"));
+        assert!(is_signature_style_name("x2"));
+        assert!(!is_signature_style_name("grantResults"));
+    }
+
+    #[test]
     fn format_array_length_aget_aput() {
         assert_eq!(super::format_array_length("v0, v1"), "v0 = v1.length;");
         assert_eq!(super::format_aget("v0, v1, v2"), "v0 = v1[v2];");
@@ -5891,6 +6916,18 @@ mod tests {
     #[test]
     fn parse_const_into_reg_invalid() {
         assert_eq!(parse_const_into_reg("v0"), None);
+    }
+
+    #[test]
+    fn format_java_wide_literal_double_and_long() {
+        assert_eq!(
+            format_java_wide_literal("4614256656552045848", "double"),
+            "3.141592653589793"
+        );
+        assert_eq!(
+            format_java_wide_literal("1311768467294899695", "long"),
+            "0x1234567890ABCDEFL"
+        );
     }
 
     #[test]
@@ -6107,5 +7144,154 @@ mod tests {
             &["long".into()],
         );
         assert_eq!(args, "System.currentTimeMillis(), \"x\"");
+    }
+
+    #[test]
+    fn debug_param_names_prefer_table_then_start_local() {
+        let types = vec![
+            "int".into(),
+            "java.lang.String[]".into(),
+            "int[]".into(),
+        ];
+        let mut locals = HashMap::new();
+        // instance: slot 0 = this, 1 = requestCode, 2 = permissions, 3 = grantResults
+        locals.insert(4, "grantResults".to_string());
+        let unnamed = vec![None, None, None];
+        let names = debug_param_names_from_tables(&unnamed, &locals, 1, false, &types);
+        assert_eq!(names[0], None);
+        assert_eq!(names[1], None);
+        assert_eq!(names[2], Some("grantResults".into()));
+
+        let table = vec![
+            Some("requestCode".into()),
+            Some("permissions".into()),
+            Some("grantResults".into()),
+        ];
+        let names = debug_param_names_from_tables(&table, &HashMap::new(), 1, false, &types);
+        assert_eq!(
+            names,
+            vec![
+                Some("requestCode".into()),
+                Some("permissions".into()),
+                Some("grantResults".into())
+            ]
+        );
+
+        // Table wins over a later START_LOCAL on the same register.
+        locals.insert(2, "length".to_string());
+        let names = debug_param_names_from_tables(&table, &locals, 1, false, &types);
+        assert_eq!(names[0], Some("requestCode".into()));
+    }
+
+    #[test]
+    fn debug_param_names_skip_this_and_wide_slots() {
+        let types = vec!["long".into(), "java.lang.String".into()];
+        let mut locals = HashMap::new();
+        locals.insert(0, "this".to_string());
+        locals.insert(1, "count".to_string());
+        locals.insert(3, "name".to_string());
+        let names = debug_param_names_from_tables(&[None, None], &locals, 0, false, &types);
+        assert_eq!(names[0], Some("count".into()));
+        assert_eq!(names[1], Some("name".into()));
+    }
+
+    fn fold_cfg(
+        offsets: Vec<u32>,
+        condition: &str,
+        loop_header: bool,
+        instructions: Vec<Instruction>,
+    ) -> MethodCfg {
+        let mut loop_headers = HashSet::new();
+        if loop_header {
+            loop_headers.insert(0);
+        }
+        let mut cfg = MethodCfg {
+            blocks: vec![cfg::CfgBlock {
+                start_offset: 0,
+                end_offset: offsets.last().copied().unwrap_or(0) + 4,
+                end: BlockEnd::Conditional {
+                    condition: condition.to_string(),
+                    branch_target: 0,
+                    fall_through: 0,
+                },
+                instruction_offsets: offsets,
+            }],
+            block_by_start: HashMap::new(),
+            loop_headers,
+            entry: 0,
+            folded_const_offsets: HashSet::new(),
+        };
+        Decompiler::fold_constants_into_conditions(&mut cfg, &instructions);
+        cfg
+    }
+
+    /// `instance-of v0, v1, Number; if-eqz v0` → `v1 instanceof Number == 0`.
+    #[test]
+    fn fold_instance_of_into_if_eqz() {
+        let ins = vec![
+            Instruction::new(0, 4, 0x20, "instance-of", "v0, v1, java.lang.Number".into()),
+            Instruction::new(4, 4, 0x38, "if-eqz", "v0, +008h".into()),
+        ];
+        let cfg = fold_cfg(vec![0, 4], "v0 == 0", false, ins);
+        assert_eq!(cond_of(&cfg), "v1 instanceof java.lang.Number == 0");
+        assert!(cfg.folded_const_offsets.contains(&0));
+    }
+
+    fn cond_of(cfg: &MethodCfg) -> &str {
+        match &cfg.blocks[0].end {
+            BlockEnd::Conditional { condition, .. } => condition.as_str(),
+            other => panic!("expected conditional, got {other:?}"),
+        }
+    }
+
+    /// `const/16 v0, 1002; if-ne v4, v0` → `v4 != 1002` (OVAA PERMISSIONS_CODE).
+    #[test]
+    fn fold_const16_permissions_code_into_if() {
+        let ins = vec![
+            Instruction::new(0, 4, 0x13, "const/16", "v0, 1002".into()),
+            Instruction::new(4, 4, 0x33, "if-ne", "v4, v0".into()),
+        ];
+        let cfg = fold_cfg(vec![0, 4], "v4 != v0", false, ins);
+        assert_eq!(cond_of(&cfg), "v4 != 1002");
+        assert!(cfg.folded_const_offsets.contains(&0));
+    }
+
+    /// D8 copies `requestCode` into v4 before the compare; fold the move so v4 is not left undefined.
+    #[test]
+    fn fold_move_into_if_ne() {
+        let ins = vec![
+            Instruction::new(0, 2, 0x01, "move", "v4, v5".into()),
+            Instruction::new(2, 4, 0x13, "const/16", "v0, 1002".into()),
+            Instruction::new(6, 4, 0x33, "if-ne", "v4, v0".into()),
+        ];
+        let cfg = fold_cfg(vec![0, 2, 6], "v4 != v0", false, ins);
+        assert_eq!(cond_of(&cfg), "v5 != 1002");
+        assert!(cfg.folded_const_offsets.contains(&0));
+        assert!(cfg.folded_const_offsets.contains(&2));
+    }
+
+    /// Loop header `const/4 v0, 0; if-lt v0, v2` must not become `0 < v2` when v0 is incremented.
+    #[test]
+    fn fold_skips_loop_index_const_on_header() {
+        let ins = vec![
+            Instruction::new(0, 2, 0x12, "const/4", "v0, 0".into()),
+            Instruction::new(2, 4, 0x34, "if-lt", "v0, v2".into()),
+            Instruction::new(8, 4, 0xd8, "add-int/lit8", "v0, v0, 1".into()),
+        ];
+        let cfg = fold_cfg(vec![0, 2], "v0 < v2", true, ins);
+        assert_eq!(cond_of(&cfg), "v0 < v2");
+        assert!(cfg.folded_const_offsets.is_empty());
+    }
+
+    /// Same const on a non-loop if *is* folded (one-shot index).
+    #[test]
+    fn fold_zero_into_non_loop_if() {
+        let ins = vec![
+            Instruction::new(0, 2, 0x12, "const/4", "v0, 0".into()),
+            Instruction::new(2, 4, 0x34, "if-lt", "v0, v2".into()),
+        ];
+        let cfg = fold_cfg(vec![0, 2], "v0 < v2", false, ins);
+        assert_eq!(cond_of(&cfg), "0 < v2");
+        assert!(cfg.folded_const_offsets.contains(&0));
     }
 }

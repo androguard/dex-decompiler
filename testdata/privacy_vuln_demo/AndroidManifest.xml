@@ -41,6 +41,18 @@
             </intent-filter>
         </activity>
         <activity
+            android:name="com.androguard.demohunt.LynxDeepLinkActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="demohunt"
+                    android:host="lynx" />
+            </intent-filter>
+        </activity>
+        <activity
             android:name="com.androguard.demohunt.ResultPassthroughActivity"
             android:exported="true" />
         <activity

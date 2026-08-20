@@ -512,6 +512,122 @@ impl MethodCfg {
         }
         false
     }
+
+    /// Blocks in the natural loop for `header` (back-edge targets → header, excluding exit paths).
+    pub fn natural_loop_blocks(&self, header: BlockId) -> HashSet<BlockId> {
+        let mut body = HashSet::new();
+        body.insert(header);
+        let back_edges: Vec<BlockId> = self
+            .successor_edges()
+            .iter()
+            .filter(|(_, to)| *to == header)
+            .map(|(from, _)| *from)
+            .collect();
+        for tail in back_edges {
+            let mut stack = vec![tail];
+            let mut visited = HashSet::new();
+            while let Some(bid) = stack.pop() {
+                if bid == header || !visited.insert(bid) {
+                    continue;
+                }
+                body.insert(bid);
+                for (pred, succ) in self.successor_edges() {
+                    if succ == bid {
+                        stack.push(pred);
+                    }
+                }
+            }
+        }
+        body
+    }
+
+    /// True when `target` is outside the natural loop for `loop_header` (exit / tail code).
+    pub fn is_loop_exit_target(&self, target: BlockId, loop_header: Option<BlockId>) -> bool {
+        let Some(header) = loop_header else {
+            return false;
+        };
+        if target == header {
+            return false;
+        }
+        !self.natural_loop_blocks(header).contains(&target)
+    }
+
+    /// All blocks targeted by edges leaving the natural loop body (exit edge targets).
+    pub fn loop_exit_targets(&self, header: BlockId) -> HashSet<BlockId> {
+        let body = self.natural_loop_blocks(header);
+        let mut exits = HashSet::new();
+        for (from, to) in self.successor_edges() {
+            if body.contains(&from) && !body.contains(&to) {
+                exits.insert(to);
+            }
+        }
+        exits
+    }
+
+    /// Walk fall-through predecessors outside the loop to include multi-block exit chains
+    /// (e.g. `const/4; return` where the branch targets the return block).
+    pub fn exit_chain_head(
+        &self,
+        exit: BlockId,
+        loop_header: Option<BlockId>,
+        emitted: &HashSet<BlockId>,
+    ) -> BlockId {
+        let mut head = exit;
+        loop {
+            let mut extended = None;
+            for (pred, succ) in self.successor_edges() {
+                if succ != head || emitted.contains(&pred) {
+                    continue;
+                }
+                if loop_header == Some(pred) {
+                    continue;
+                }
+                if self.fall_through_block(pred) != Some(head) {
+                    continue;
+                }
+                if self.is_loop_exit_target(head, loop_header)
+                    && !self.is_loop_exit_target(pred, loop_header)
+                {
+                    continue;
+                }
+                extended = Some(pred);
+                break;
+            }
+            match extended {
+                Some(p) => head = p,
+                None => break,
+            }
+        }
+        head
+    }
+
+    /// Pretty-print CFG blocks, edges, and loop headers (L0-1 debug helper).
+    pub fn format_debug(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out, "blocks={} loop_headers={:?}", self.block_count(), self.loop_headers);
+        for (i, b) in self.blocks.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "  block {i}: off={} end={:?} ins={}",
+                b.start_offset,
+                b.end,
+                b.instruction_offsets.len()
+            );
+        }
+        let _ = writeln!(out, "edges={:?}", self.successor_edges());
+        for &h in &self.loop_headers {
+            let _ = writeln!(out, "  loop {h} exits={:?}", self.loop_exit_targets(h));
+        }
+        out
+    }
+
+    /// True if any block ends with return/throw.
+    pub fn has_return_block(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|b| matches!(b.end, BlockEnd::Exit))
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +667,24 @@ mod tests {
         assert!(cfg.block_count() >= 2);
         let has_conditional = cfg.blocks.iter().any(|b| matches!(&b.end, BlockEnd::Conditional { .. }));
         assert!(has_conditional, "expected at least one conditional block (if-eqz)");
+    }
+
+    /// natural_loop_blocks for merge-style CFG: main loop is blocks 1-10, not tail headers 11/15/19.
+    #[test]
+    fn natural_loop_blocks_merge_shape() {
+        // Minimal back-edge loop: header at block 0, body 1, back from 1 to 0; exit block 2.
+        let bytecode: &[u8] = &[
+            0x38, 0x00, 0x04, 0x00, // 0: if-eqz -> 8 (exit block 2)
+            0x12, 0x00,             // 4: body
+            0x28, 0xfc,             // 6: goto -4 -> 0
+            0x0e, 0x00,             // 8: return-void (outside loop)
+        ];
+        let instructions = decode_all(bytecode, 0).unwrap();
+        let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_for);
+        let header = cfg.entry;
+        let body = cfg.natural_loop_blocks(header);
+        assert!(body.contains(&header));
+        assert!(!body.contains(&(header + 2)), "return block should not be in loop body");
     }
 
     /// Loop: const/4; if-eqz (exit); goto back to if-eqz block. Back edge target is loop header.

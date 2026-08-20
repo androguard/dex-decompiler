@@ -33,7 +33,29 @@ fn known_api_return_type(target: &str) -> Option<&'static str> {
         "toCharArray" => Some("char[]"),
         "getBytes" => Some("byte[]"),
         "split" => Some("java.lang.String[]"),
-        "valueOf" | "copyValueOf" => Some("java.lang.String"),
+        "valueOf" | "copyValueOf" => {
+            // String.valueOf vs Integer/Long/… boxing — disambiguate by receiver type.
+            let t = target;
+            if t.contains("Integer") {
+                Some("java.lang.Integer")
+            } else if t.contains("Long") {
+                Some("java.lang.Long")
+            } else if t.contains("Boolean") {
+                Some("java.lang.Boolean")
+            } else if t.contains("Double") {
+                Some("java.lang.Double")
+            } else if t.contains("Float") {
+                Some("java.lang.Float")
+            } else if t.contains("Character") {
+                Some("java.lang.Character")
+            } else if t.contains("Short") {
+                Some("java.lang.Short")
+            } else if t.contains("Byte") {
+                Some("java.lang.Byte")
+            } else {
+                Some("java.lang.String")
+            }
+        }
         _ => None,
     }
 }
@@ -113,6 +135,23 @@ pub fn infer_types(
         }) {
             types.insert(return_var, return_type_java.clone());
         }
+        if return_type_java == "long" || return_type_java == "double" {
+            if let Some(return_reg) = stmts.iter().find_map(|s| {
+                if let IrStmt::Return { value: Some(IrExpr::Var(v)), .. } = s {
+                    Some(v.reg)
+                } else {
+                    None
+                }
+            }) {
+                for stmt in stmts {
+                    if let IrStmt::Assign { dst, rhs: IrExpr::Raw(s), .. } = stmt {
+                        if dst.reg == return_reg && looks_like_wide_bits_literal(s) {
+                            types.insert(*dst, return_type_java.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Propagate: Assign(dst, rhs) from Var, Call, or Raw (literal / first var in text). Fixpoint.
@@ -160,6 +199,13 @@ pub fn infer_types(
     types
 }
 
+fn looks_like_wide_bits_literal(s: &str) -> bool {
+    let s = s.trim();
+    let s = s.strip_suffix('L').or_else(|| s.strip_suffix('l')).unwrap_or(s);
+    let s = s.strip_prefix('-').unwrap_or(s);
+    s.chars().all(|c| c.is_ascii_digit()) && s.len() > 10
+}
+
 /// Fill missing SSA types from a whole-method register→type map, then re-propagate
 /// Assign RHS types (so `aget` can pick up array element types across blocks).
 pub fn enrich_types_with_register_map(
@@ -168,11 +214,21 @@ pub fn enrich_types_with_register_map(
     stmts: &[IrStmt],
 ) {
     for stmt in stmts {
-        for v in vars_in_stmt(stmt) {
-            if !type_map.contains_key(&v) {
-                if let Some(ty) = reg_types.get(&v.reg) {
-                    type_map.insert(v, ty.clone());
+        if let IrStmt::Assign { dst, rhs, .. } = stmt {
+            if !type_map.contains_key(dst) {
+                if let IrExpr::Raw(r) = rhs {
+                    if let Some(ty) = infer_type_from_raw(r, type_map) {
+                        type_map.insert(*dst, ty);
+                    }
                 }
+            }
+        }
+        for v in vars_in_stmt(stmt) {
+            if type_map.contains_key(&v) {
+                continue;
+            }
+            if let Some(ty) = reg_types.get(&v.reg) {
+                type_map.insert(v, ty.clone());
             }
         }
     }
@@ -225,6 +281,10 @@ fn infer_type_from_raw(s: &str, types: &HashMap<VarId, String>) -> Option<String
     let s = s.trim();
     if s.is_empty() {
         return None;
+    }
+    // instance-of: `v0 instanceof Type` → boolean (must not be treated as a reference).
+    if s.contains(" instanceof ") {
+        return Some("boolean".to_string());
     }
     if s.starts_with("new ") {
         // filled-new-array / array literal: "new Type[]{ ... }" → Type[]
@@ -292,6 +352,20 @@ fn infer_type_from_raw(s: &str, types: &HashMap<VarId, String>) -> Option<String
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '[' || c == ']')
         {
             return Some("java.lang.Class".to_string());
+        }
+    }
+    // Static field / enum constant: com.foo.Bar.BAZ → com.foo.Bar
+    if s.contains('.') && !s.contains('(') && !s.contains(' ') && !s.contains('[') {
+        if let Some((type_part, field)) = s.rsplit_once('.') {
+            if !type_part.is_empty()
+                && !field.is_empty()
+                && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && type_part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$')
+            {
+                return Some(type_part.to_string());
+            }
         }
     }
     // Integer literal (optional minus, digits, optional L)
@@ -593,9 +667,17 @@ fn unify_names_by_register(names: &mut HashMap<VarId, String>, type_map: &HashMa
             }
             let ta = type_map.get(&a).map(|s| s.as_str());
             let tb = type_map.get(&b).map(|s| s.as_str());
-            if types_compatible_for_naming(ta, tb) {
-                union(&mut parent, a, b);
+            if !types_compatible_for_naming(ta, tb) {
+                continue;
             }
+            // `const/16 v0, 1002` then `array-length v0, arr` share a register and `int`
+            // type. Do not collapse the constant onto the name `length`.
+            let na = names.get(&a).map(|s| s.as_str()).unwrap_or("");
+            let nb = names.get(&b).map(|s| s.as_str()).unwrap_or("");
+            if (na == "length") != (nb == "length") {
+                continue;
+            }
+            union(&mut parent, a, b);
         }
     }
 
@@ -650,6 +732,36 @@ pub(crate) fn types_compatible_for_naming(a: Option<&str>, b: Option<&str>) -> b
         (None, None) => true,
         (Some(x), Some(y)) => normalize_type_name(x) == normalize_type_name(y),
     }
+}
+
+pub(crate) fn is_primitive_java_type(t: &str) -> bool {
+    matches!(
+        normalize_type_name(t).as_str(),
+        "int" | "boolean" | "byte" | "short" | "char" | "long" | "float" | "double" | "void"
+    )
+}
+
+/// Debug names belong to the object local on a register, not a later D8 reuse
+/// (`String host` then `const/4 0` as `resolveActivity` flags).
+pub(crate) fn preferred_debug_type_for_reg<'a>(
+    reg: u32,
+    type_map: &'a HashMap<VarId, String>,
+) -> Option<&'a str> {
+    let mut latest: Option<(u32, &'a str)> = None;
+    let mut object_ty: Option<&'a str> = None;
+    for (var, ty) in type_map {
+        if var.reg != reg {
+            continue;
+        }
+        let t = ty.as_str();
+        if latest.map(|(v, _)| var.ver >= v).unwrap_or(true) {
+            latest = Some((var.ver, t));
+        }
+        if !is_primitive_java_type(t) {
+            object_ty = Some(t);
+        }
+    }
+    object_ty.or(latest.map(|(_, t)| t))
 }
 
 fn name_quality(name: &str, typ: Option<&str>) -> i32 {
@@ -824,6 +936,35 @@ pub fn param_display_name(param_idx: usize, typ: &str) -> String {
     }
 }
 
+/// Map Dalvik parameter registers → signature display names (`this`, `p0`, `s1`, …).
+/// Accounts for wide (`long`/`double`) params occupying two incoming slots.
+pub fn param_names_by_register(
+    registers_size: u32,
+    ins_size: u32,
+    is_static: bool,
+    param_types: &[String],
+) -> HashMap<u32, String> {
+    let param_base = registers_size.saturating_sub(ins_size);
+    let mut map = HashMap::new();
+    let mut slot = 0u32;
+    if !is_static {
+        map.insert(param_base, "this".to_string());
+        slot = 1;
+    }
+    let mut param_idx = 0usize;
+    while slot < ins_size && param_idx < param_types.len() {
+        let ty = param_types[param_idx].as_str();
+        map.insert(param_base + slot, param_display_name(param_idx, ty));
+        slot += if matches!(ty, "long" | "double" | "J" | "D") {
+            2
+        } else {
+            1
+        };
+        param_idx += 1;
+    }
+    map
+}
+
 fn count_args(args: &str) -> usize {
     let s = args.trim();
     if s.is_empty() {
@@ -979,5 +1120,110 @@ mod tests {
         assert_eq!(names.get(&VarId::new(1, 0)), Some(&"arr0".to_string()));
         assert_eq!(names.get(&VarId::new(2, 0)), Some(&"i".to_string()));
         assert_eq!(names.get(&VarId::new(3, 0)), Some(&"length".to_string()));
+    }
+
+    #[test]
+    fn param_names_by_register_static_accessor() {
+        let names = param_names_by_register(
+            6,
+            3,
+            true,
+            &[
+                "oversecured.ovaa.activities.LoginActivity".into(),
+                "java.lang.String".into(),
+                "java.lang.String".into(),
+            ],
+        );
+        assert_eq!(names.get(&3), Some(&"p0".to_string()));
+        assert_eq!(names.get(&4), Some(&"s1".to_string()));
+        assert_eq!(names.get(&5), Some(&"s2".to_string()));
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn param_names_by_register_instance_skips_this_and_wide() {
+        let names = param_names_by_register(5, 4, false, &["long".into(), "java.lang.String".into()]);
+        assert_eq!(names.get(&1), Some(&"this".to_string()));
+        assert_eq!(names.get(&2), Some(&"l0".to_string()));
+        assert_eq!(names.get(&4), Some(&"s1".to_string()));
+        assert!(!names.contains_key(&3));
+    }
+
+    /// OVAA `onRequestPermissionsResult(int, String[], int[])` without debug names.
+    #[test]
+    fn param_names_by_register_on_request_permissions_result() {
+        let names = param_names_by_register(
+            6,
+            4,
+            false,
+            &[
+                "int".into(),
+                "java.lang.String[]".into(),
+                "int[]".into(),
+            ],
+        );
+        assert_eq!(names.get(&2), Some(&"this".to_string()));
+        assert_eq!(names.get(&3), Some(&"i0".to_string()));
+        assert_eq!(names.get(&4), Some(&"arr1".to_string()));
+        assert_eq!(names.get(&5), Some(&"arr2".to_string()));
+    }
+
+    /// D8 reuses v0 for `const/16 …, 1002` then `array-length`. Both are `int`;
+    /// unifying would emit `int length = 1002`.
+    #[test]
+    fn unify_names_does_not_collapse_const_onto_length() {
+        use crate::decompile::ir::VarId;
+        let mut names = std::collections::HashMap::new();
+        names.insert(VarId::new(0, 1), "i0".into());
+        names.insert(VarId::new(0, 2), "length".into());
+        let mut types = std::collections::HashMap::new();
+        types.insert(VarId::new(0, 1), "int".into());
+        types.insert(VarId::new(0, 2), "int".into());
+        unify_names_by_register(&mut names, &types);
+        assert_eq!(names.get(&VarId::new(0, 1)), Some(&"i0".to_string()));
+        assert_eq!(names.get(&VarId::new(0, 2)), Some(&"length".to_string()));
+    }
+
+    #[test]
+    fn unify_names_still_shares_length_across_ssa_versions() {
+        use crate::decompile::ir::VarId;
+        let mut names = std::collections::HashMap::new();
+        names.insert(VarId::new(0, 1), "length".into());
+        names.insert(VarId::new(0, 2), "length".into());
+        let mut types = std::collections::HashMap::new();
+        types.insert(VarId::new(0, 1), "int".into());
+        types.insert(VarId::new(0, 2), "int".into());
+        unify_names_by_register(&mut names, &types);
+        assert_eq!(names.get(&VarId::new(0, 1)), Some(&"length".to_string()));
+        assert_eq!(names.get(&VarId::new(0, 2)), Some(&"length".to_string()));
+    }
+
+    #[test]
+    fn preferred_debug_type_prefers_string_over_later_int() {
+        let mut types = std::collections::HashMap::new();
+        types.insert(VarId::new(0, 1), "java.lang.String".into());
+        types.insert(VarId::new(0, 2), "int".into());
+        assert_eq!(
+            preferred_debug_type_for_reg(0, &types),
+            Some("java.lang.String")
+        );
+        assert!(types_compatible_for_naming(
+            Some("java.lang.String"),
+            preferred_debug_type_for_reg(0, &types)
+        ));
+        assert!(!types_compatible_for_naming(
+            Some("int"),
+            preferred_debug_type_for_reg(0, &types)
+        ));
+    }
+
+    #[test]
+    fn substitute_names_prefers_latest_ssa_version() {
+        use crate::decompile::ir::{substitute_names_in_text_pub, VarId};
+        let mut names = HashMap::new();
+        names.insert(VarId::new(3, 1), "obj0".into());
+        names.insert(VarId::new(3, 2), "obj1".into());
+        let out = substitute_names_in_text_pub("v3 != 0", &names);
+        assert_eq!(out, "obj1 != 0");
     }
 }
