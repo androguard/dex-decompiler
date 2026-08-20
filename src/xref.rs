@@ -55,7 +55,6 @@ const METHOD_CALLERS_CAP: usize = 500;
 /// - `0x74..=0x78` — same `/range` forms (F3rc)
 /// - `0xfa`, `0xfb` — invoke-polymorphic{,/range} (method + proto)
 ///
-/// `invoke-custom` (`0xfc`/`0xfd`) uses call_site_ids and is intentionally skipped.
 fn invoke_method_index(insns: &[u8], offset: u32, opcode: u8) -> Option<u32> {
     let o = offset as usize;
     let is_method_invoke = matches!(
@@ -66,6 +65,28 @@ fn invoke_method_index(insns: &[u8], offset: u32, opcode: u8) -> Option<u32> {
         return None;
     }
     Some(u16::from_le_bytes([insns[o + 2], insns[o + 3]]) as u32)
+}
+
+/// Resolve normal invokes and invoke-custom lambda implementation handles.
+fn resolved_invoke_method_index(
+    dex: &DexFile,
+    insns: &[u8],
+    offset: u32,
+    opcode: u8,
+) -> Option<u32> {
+    if let Some(method_idx) = invoke_method_index(insns, offset, opcode) {
+        return Some(method_idx);
+    }
+    if !matches!(opcode, 0xfc | 0xfd) {
+        return None;
+    }
+    let o = offset as usize;
+    if o + 4 > insns.len() {
+        return None;
+    }
+    let callsite_idx = u16::from_le_bytes([insns[o + 2], insns[o + 3]]) as u32;
+    let callsite = dex.get_call_site(callsite_idx).ok()?;
+    dex_parser::DexCallSites::impl_method_id(&callsite).map(u32::from)
 }
 
 fn invoke_kind_name(opcode: u8) -> &'static str {
@@ -82,6 +103,8 @@ fn invoke_kind_name(opcode: u8) -> &'static str {
         0x78 => "invoke-interface/range",
         0xfa => "invoke-polymorphic",
         0xfb => "invoke-polymorphic/range",
+        0xfc => "invoke-custom",
+        0xfd => "invoke-custom/range",
         _ => "invoke",
     }
 }
@@ -124,10 +147,16 @@ pub fn find_method_callers(dex: &DexFile, callee_method_idx: u32) -> Result<Meth
     let mut truncated = false;
 
     'classes: for (class_idx, class_result) in dex.class_defs().enumerate() {
-        let Ok(class_def) = class_result else { continue };
-        let Ok(class_type) = dex.get_type(class_def.class_idx) else { continue };
+        let Ok(class_def) = class_result else {
+            continue;
+        };
+        let Ok(class_type) = dex.get_type(class_def.class_idx) else {
+            continue;
+        };
         let class_name = java::descriptor_to_java(&class_type);
-        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else {
+            continue;
+        };
 
         let all_methods: Vec<&EncodedMethod> = class_data
             .direct_methods
@@ -154,7 +183,8 @@ pub fn find_method_callers(dex: &DexFile, callee_method_idx: u32) -> Result<Meth
             };
             let insns_base = code.insns_off as u32;
             for ins in decoded {
-                let Some(midx) = invoke_method_index(insns, ins.offset, ins.opcode) else {
+                let Some(midx) = resolved_invoke_method_index(dex, insns, ins.offset, ins.opcode)
+                else {
                     continue;
                 };
                 if midx != callee_method_idx {
@@ -259,8 +289,12 @@ pub fn find_method_callees(dex: &DexFile, caller_method_idx: u32) -> Result<Meth
     let mut seen = std::collections::HashSet::new();
 
     'classes: for class_result in dex.class_defs() {
-        let Ok(class_def) = class_result else { continue };
-        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+        let Ok(class_def) = class_result else {
+            continue;
+        };
+        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else {
+            continue;
+        };
         for encoded in class_data
             .direct_methods
             .iter()
@@ -277,7 +311,8 @@ pub fn find_method_callees(dex: &DexFile, caller_method_idx: u32) -> Result<Meth
                 continue;
             };
             for ins in decoded {
-                let Some(midx) = invoke_method_index(insns, ins.offset, ins.opcode) else {
+                let Some(midx) = resolved_invoke_method_index(dex, insns, ins.offset, ins.opcode)
+                else {
                     continue;
                 };
                 if !seen.insert(midx) {
@@ -288,9 +323,8 @@ pub fn find_method_callees(dex: &DexFile, caller_method_idx: u32) -> Result<Meth
                     break 'classes;
                 }
                 let (class_name, method_name, method_descriptor) =
-                    method_descriptor_from_dex(dex, midx).unwrap_or_else(|_| {
-                        ("?".into(), "?".into(), "()".into())
-                    });
+                    method_descriptor_from_dex(dex, midx)
+                        .unwrap_or_else(|_| ("?".into(), "?".into(), "()".into()));
                 callees.push(MethodCallee {
                     method_idx: midx,
                     class_name,
@@ -335,9 +369,9 @@ pub fn find_method_callees_by_class_method(
             .iter()
             .chain(class_data.virtual_methods.iter())
             .collect();
-        let encoded = all.get(method_idx_in_class).ok_or_else(|| {
-            DexDecompilerError::Parse("method_idx out of range".into())
-        })?;
+        let encoded = all
+            .get(method_idx_in_class)
+            .ok_or_else(|| DexDecompilerError::Parse("method_idx out of range".into()))?;
         let _ = callers;
         return find_method_callees(dex, encoded.method_idx);
     }
@@ -477,8 +511,12 @@ fn build_reverse_call_index(
             on_progress(done, total);
             last_report = done;
         }
-        let Ok(class_def) = class_result else { continue };
-        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+        let Ok(class_def) = class_result else {
+            continue;
+        };
+        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else {
+            continue;
+        };
         let all: Vec<&EncodedMethod> = class_data
             .direct_methods
             .iter()
@@ -496,7 +534,8 @@ fn build_reverse_call_index(
                 continue;
             };
             for ins in decoded {
-                let Some(callee) = invoke_method_index(insns, ins.offset, ins.opcode) else {
+                let Some(callee) = resolved_invoke_method_index(dex, insns, ins.offset, ins.opcode)
+                else {
                     continue;
                 };
                 let entry = rev.entry(callee).or_default();
@@ -531,10 +570,8 @@ fn frame_from_method(
     offset: Option<u32>,
     invoke_kind: Option<String>,
 ) -> CallTraceFrame {
-    let (class_name, method_name, method_descriptor) =
-        method_descriptor_from_dex(dex, method_idx).unwrap_or_else(|_| {
-            ("?".into(), "?".into(), "()".into())
-        });
+    let (class_name, method_name, method_descriptor) = method_descriptor_from_dex(dex, method_idx)
+        .unwrap_or_else(|_| ("?".into(), "?".into(), "()".into()));
     CallTraceFrame {
         class_name,
         method_name,
@@ -579,8 +616,12 @@ pub fn find_method_call_traces_with_index(
     let (target_class_idx, target_method_idx_in_class) = {
         let mut found = (0usize, 0usize);
         'outer: for (ci, class_result) in dex.class_defs().enumerate() {
-            let Ok(class_def) = class_result else { continue };
-            let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+            let Ok(class_def) = class_result else {
+                continue;
+            };
+            let Ok(Some(class_data)) = dex.get_class_data(&class_def) else {
+                continue;
+            };
             for (mi, encoded) in class_data
                 .direct_methods
                 .iter()
@@ -781,10 +822,16 @@ pub fn find_field_xrefs(dex: &DexFile, field_idx: u32) -> Result<FieldXrefsInfo>
     let mut xrefs = Vec::new();
     let mut truncated = false;
     'classes: for (class_idx, class_result) in dex.class_defs().enumerate() {
-        let Ok(class_def) = class_result else { continue };
-        let Ok(class_type) = dex.get_type(class_def.class_idx) else { continue };
+        let Ok(class_def) = class_result else {
+            continue;
+        };
+        let Ok(class_type) = dex.get_type(class_def.class_idx) else {
+            continue;
+        };
         let class_name = java::descriptor_to_java(&class_type);
-        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else {
+            continue;
+        };
         let all: Vec<&EncodedMethod> = class_data
             .direct_methods
             .iter()

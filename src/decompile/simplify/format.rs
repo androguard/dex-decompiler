@@ -161,7 +161,9 @@ pub fn simplify_synchronized_blocks(body: &str) -> String {
                     k += 1;
                 }
                 let catch_start = k;
-                if catch_start < lines.len() && lines[catch_start].trim().starts_with("} catch (Throwable") {
+                if catch_start < lines.len()
+                    && lines[catch_start].trim().starts_with("} catch (Throwable")
+                {
                     let mut brace_count = 0;
                     let mut catch_end = catch_start;
                     for (idx, l) in lines[catch_start..].iter().enumerate() {
@@ -196,5 +198,3 @@ pub fn simplify_synchronized_blocks(body: &str) -> String {
     }
     out
 }
-
-

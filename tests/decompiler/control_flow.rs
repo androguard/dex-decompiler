@@ -33,15 +33,18 @@ fn test_decompiler_return_value() {
 fn test_decompiler_if_else_pattern() {
     let bytecode: &[u8] = &[
         0x38, 0x00, 0x04, 0x00, // if-eqz v0, +4 -> target byte 8
-        0x28, 0x02,             // goto +2 -> target byte 8
-        0x0e, 0x00,             // return-void at 6
-        0x0e, 0x00,             // return-void at 8
+        0x28, 0x02, // goto +2 -> target byte 8
+        0x0e, 0x00, // return-void at 6
+        0x0e, 0x00, // return-void at 8
     ];
     let dex_bytes = minimal_dex_with_method_code(bytecode);
     let dex = parse_dex(&dex_bytes).unwrap();
     let dc = Decompiler::new(&dex);
     let java = dc.decompile().unwrap();
-    assert!(java.contains("if ("), "decompiled if/else should contain 'if ('");
+    assert!(
+        java.contains("if ("),
+        "decompiled if/else should contain 'if ('"
+    );
     assert!(
         java.contains("} else {"),
         "decompiled if/else should contain '}} else {{'"
@@ -52,11 +55,11 @@ fn test_decompiler_if_else_pattern() {
 #[test]
 fn test_decompiler_while_loop_pattern() {
     let bytecode: &[u8] = &[
-        0x12, 0x00,             // const/4 v0, 0
+        0x12, 0x00, // const/4 v0, 0
         0x38, 0x00, 0x05, 0x00, // if-eqz v0, +5 -> target 12
-        0x28, 0xfe,             // goto -2 -> target 2
+        0x28, 0xfe, // goto -2 -> target 2
         0x00, 0x00, 0x00, 0x00, // nop, nop
-        0x0e, 0x00,             // return-void at 12
+        0x0e, 0x00, // return-void at 12
     ];
     let dex_bytes = minimal_dex_with_method_code(bytecode);
     let dex = parse_dex(&dex_bytes).unwrap();
@@ -85,21 +88,18 @@ fn test_decompiler_loop_exit_path_two_blocks() {
     // 10: const/4 v0, 1   <- exit block 1 (must be emitted)
     // 12: return v0      <- exit block 2
     let bytecode: &[u8] = &[
-        0x12, 0x00,             // const/4 v0, 0
+        0x12, 0x00, // const/4 v0, 0
         0x38, 0x00, 0x05, 0x00, // if-eqz v0, +5 -> target 12
-        0x28, 0xfe,             // goto -2 -> target 2
-        0x00, 0x00,             // nop
-        0x12, 0x01,             // const/4 v0, 1  (exit path block 1)
-        0x0f, 0x00,             // return v0     (exit path block 2)
+        0x28, 0xfe, // goto -2 -> target 2
+        0x00, 0x00, // nop
+        0x12, 0x01, // const/4 v0, 1  (exit path block 1)
+        0x0f, 0x00, // return v0     (exit path block 2)
     ];
     let dex_bytes = minimal_dex_with_method_code(bytecode);
     let dex = parse_dex(&dex_bytes).unwrap();
     let dc = Decompiler::new(&dex);
     let java = dc.decompile().unwrap();
-    assert!(
-        java.contains("return"),
-        "exit path must contain return"
-    );
+    assert!(java.contains("return"), "exit path must contain return");
     // Region tree must include BOTH exit blocks (see region::tests::region_loop_exit_path_two_blocks).
     // Decompiled output may still drop the first block if the instruction is optimized out
     // (e.g. const/4 into unused register). The important fix is that build_regions_rec includes
@@ -109,9 +109,9 @@ fn test_decompiler_loop_exit_path_two_blocks() {
 /// L0-3: merge region tree (pre-simplify) must include the return block.
 #[test]
 fn merge_region_tree_includes_return_before_simplify() {
+    use dex_bytecode::decode_all;
     use dex_decompiler::decompile::cfg::MethodCfg;
     use dex_decompiler::decompile::region::build_regions;
-    use dex_bytecode::decode_all;
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("testdata/decompiler_fixtures/classes.dex");
     let data = std::fs::read(&path).unwrap();
@@ -138,10 +138,7 @@ fn merge_region_tree_includes_return_before_simplify() {
     let insns = decode_all(insns_bytes, 0).unwrap();
     let cfg = MethodCfg::build(&insns, insns_bytes, 0, &|_| "cond".into());
     let r = build_regions(&cfg, cfg.entry).expect("regions");
-    fn has_exit(
-        r: &dex_decompiler::decompile::region::Region,
-        cfg: &MethodCfg,
-    ) -> bool {
+    fn has_exit(r: &dex_decompiler::decompile::region::Region, cfg: &MethodCfg) -> bool {
         use dex_decompiler::decompile::cfg::BlockEnd;
         use dex_decompiler::decompile::region::Region;
         match r {
@@ -158,7 +155,10 @@ fn merge_region_tree_includes_return_before_simplify() {
             }
         }
     }
-    assert!(has_exit(&r, &cfg), "merge region tree must contain return block before simplify");
+    assert!(
+        has_exit(&r, &cfg),
+        "merge region tree must contain return block before simplify"
+    );
 }
 
 /// Classic for-loop shape: init (const/4 v0,0); header (if-eqz → exit); add-int; goto back.
@@ -167,11 +167,11 @@ fn merge_region_tree_includes_return_before_simplify() {
 fn test_decompiler_for_loop_pattern() {
     // 0: const/4 v0, 0; 2: if-eqz v0, +6 (exit at 14); 6: add-int/lit8 v0,v0,1; 10: goto -4 (back); 14: return
     let bytecode: &[u8] = &[
-        0x12, 0x00,             // const/4 v0, 0
+        0x12, 0x00, // const/4 v0, 0
         0x38, 0x00, 0x06, 0x00, // if-eqz v0, +6 (target 14)
         0xd8, 0x00, 0x00, 0x01, // add-int/lit8 v0, v0, 1
-        0x28, 0xfc,             // goto -4 (back to 2)
-        0x0e, 0x00,             // return-void at 14
+        0x28, 0xfc, // goto -4 (back to 2)
+        0x0e, 0x00, // return-void at 14
     ];
     let dex_bytes = minimal_dex_with_method_code(bytecode);
     let dex = parse_dex(&dex_bytes).unwrap();

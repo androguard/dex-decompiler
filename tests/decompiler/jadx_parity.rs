@@ -134,12 +134,7 @@ fn jadx_loops_TestBreakInLoop_style() {
 /// jadx: `switches/TestSwitchSimple` — packed switch cases 1..5 with breaks.
 #[test]
 fn jadx_switches_TestSwitchSimple() {
-    let java = decompile_excluding(&[
-        "android",
-        "androidx",
-        "android.support",
-        "tests.androguard",
-    ]);
+    let java = decompile_excluding(&["android", "androidx", "android.support", "tests.androguard"]);
     assert!(
         java.contains("class TestDefaultPackage"),
         "expected TestDefaultPackage; got prefix:\n{}",
@@ -301,12 +296,7 @@ fn jadx_generics_nested_Bridge_type_param() {
 /// jadx: `inner/TestInnerClass` — named inners nested under outer.
 #[test]
 fn jadx_inner_TestInnerClass_nested() {
-    let java = decompile_excluding(&[
-        "android",
-        "androidx",
-        "android.support",
-        "tests.androguard",
-    ]);
+    let java = decompile_excluding(&["android", "androidx", "android.support", "tests.androguard"]);
     assert!(java.contains("class TestDefaultPackage"));
     assert!(
         java.contains("class TestInnerClass"),
@@ -384,7 +374,8 @@ fn jadx_conditions_short_circuit_or() {
 #[test]
 fn jadx_ternary_assign() {
     use dex_decompiler::decompile::simplify_method_body_for_tests as simplify;
-    let body = "        if (c) {\n            x = a;\n        } else {\n            x = b;\n        }\n";
+    let body =
+        "        if (c) {\n            x = a;\n        } else {\n            x = b;\n        }\n";
     let out = simplify(body, false);
     assert!(out.contains("x = c ? a : b;"), "got:\n{out}");
     assert!(!out.contains("} else {"), "got:\n{out}");
@@ -461,7 +452,8 @@ fn jadx_try_with_resources_multi() {
 #[test]
 fn jadx_strip_redundant_cast() {
     use dex_decompiler::decompile::simplify_method_body_for_tests as simplify;
-    let body = "        String s = (String) new String(\"x\");\n        Object o = (String) (String) y;\n";
+    let body =
+        "        String s = (String) new String(\"x\");\n        Object o = (String) (String) y;\n";
     let out = simplify(body, false);
     assert!(out.contains("String s = new String(\"x\")"), "got:\n{out}");
     assert!(out.contains("Object o = (String) y"), "got:\n{out}");

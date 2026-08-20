@@ -94,9 +94,8 @@ pub fn looks_like_text_xml(bytes: &[u8]) -> bool {
 
 /// Load one path as DEX or APK (auto-detect by magic / extension).
 pub fn load_dexes_from_path(path: &Path) -> Result<Vec<DexFile>> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        DexDecompilerError::Parse(format!("read {}: {e}", path.display()))
-    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| DexDecompilerError::Parse(format!("read {}: {e}", path.display())))?;
     load_dexes_from_bytes(&bytes, path)
 }
 
@@ -119,9 +118,8 @@ pub fn load_dexes_from_bytes(bytes: &[u8], hint_path: &Path) -> Result<Vec<DexFi
         let entries = extract_dex_entries_from_apk(bytes)?;
         let mut dexes = Vec::with_capacity(entries.len());
         for (name, data) in entries {
-            let dex = parse_dex(&data).map_err(|e| {
-                DexDecompilerError::Parse(format!("parse DEX entry {name}: {e}"))
-            })?;
+            let dex = parse_dex(&data)
+                .map_err(|e| DexDecompilerError::Parse(format!("parse DEX entry {name}: {e}")))?;
             dexes.push(dex);
         }
         return Ok(dexes);
@@ -166,7 +164,9 @@ mod tests {
     #[test]
     fn text_xml_detection() {
         assert!(looks_like_text_xml(b"<?xml version=\"1.0\"?><manifest/>"));
-        assert!(looks_like_text_xml(b"<manifest package=\"a.b\"></manifest>"));
+        assert!(looks_like_text_xml(
+            b"<manifest package=\"a.b\"></manifest>"
+        ));
         assert!(!looks_like_text_xml(&[0x03, 0x00, 0x08, 0x00, 0x00, 0x00]));
     }
 

@@ -1,8 +1,8 @@
 //! Type inference for method IR: seed from params and return, propagate from Assign(Var), Assign(Call), and Raw literals.
 
-use dex_parser::{CodeItem, DexFile, EncodedMethod};
 use crate::decompile::ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
 use crate::java;
+use dex_parser::{CodeItem, DexFile, EncodedMethod};
 use std::collections::HashMap;
 
 /// Well-known JDK / Android API return types when the method isn't resolved from DEX ids.
@@ -106,7 +106,11 @@ pub fn infer_types(
     let registers_size = code.registers_size as u32;
     let is_static = (encoded.access_flags & 0x8) != 0;
     let class_java = java::descriptor_to_java(&info.class);
-    let param_types: Vec<String> = info.params.iter().map(|p| java::descriptor_to_java(p)).collect();
+    let param_types: Vec<String> = info
+        .params
+        .iter()
+        .map(|p| java::descriptor_to_java(p))
+        .collect();
     let return_type_java = java::descriptor_to_java(&info.return_type);
 
     // Seed param registers (version 0) at the high end of the Dalvik frame.
@@ -117,7 +121,11 @@ pub fn infer_types(
         if !is_static && i == 0 {
             types.insert(vid, class_java.clone());
         } else {
-            let param_idx = if is_static { i as usize } else { (i as usize).saturating_sub(1) };
+            let param_idx = if is_static {
+                i as usize
+            } else {
+                (i as usize).saturating_sub(1)
+            };
             if param_idx < param_types.len() {
                 types.insert(vid, param_types[param_idx].clone());
             }
@@ -127,7 +135,11 @@ pub fn infer_types(
     // Seed return variable with method return type (so e.g. "result" gets "int").
     if return_type_java != "void" {
         if let Some(return_var) = stmts.iter().find_map(|s| {
-            if let IrStmt::Return { value: Some(IrExpr::Var(v)), .. } = s {
+            if let IrStmt::Return {
+                value: Some(IrExpr::Var(v)),
+                ..
+            } = s
+            {
                 Some(*v)
             } else {
                 None
@@ -137,14 +149,23 @@ pub fn infer_types(
         }
         if return_type_java == "long" || return_type_java == "double" {
             if let Some(return_reg) = stmts.iter().find_map(|s| {
-                if let IrStmt::Return { value: Some(IrExpr::Var(v)), .. } = s {
+                if let IrStmt::Return {
+                    value: Some(IrExpr::Var(v)),
+                    ..
+                } = s
+                {
                     Some(v.reg)
                 } else {
                     None
                 }
             }) {
                 for stmt in stmts {
-                    if let IrStmt::Assign { dst, rhs: IrExpr::Raw(s), .. } = stmt {
+                    if let IrStmt::Assign {
+                        dst,
+                        rhs: IrExpr::Raw(s),
+                        ..
+                    } = stmt
+                    {
                         if dst.reg == return_reg && looks_like_wide_bits_literal(s) {
                             types.insert(*dst, return_type_java.clone());
                         }
@@ -165,10 +186,9 @@ pub fn infer_types(
                 }
                 let ty = match rhs {
                     IrExpr::Var(v) => types.get(v).cloned(),
-                IrExpr::Call { target, args } => {
-                    let n = count_args(args);
-                    find_method_return_type_java(target, n)
-                        .or_else(|| {
+                    IrExpr::Call { target, args } => {
+                        let n = count_args(args);
+                        find_method_return_type_java(target, n).or_else(|| {
                             // receiver-style: "v0.method" -> reconstruct "Class.method" from receiver type
                             if let Some(dot) = target.rfind('.') {
                                 let receiver_part = &target[..dot];
@@ -182,7 +202,7 @@ pub fn infer_types(
                             }
                             None
                         })
-                }
+                    }
                     IrExpr::Raw(s) => infer_type_from_raw(s, &types),
                     IrExpr::PendingResult => None,
                 };
@@ -201,7 +221,10 @@ pub fn infer_types(
 
 fn looks_like_wide_bits_literal(s: &str) -> bool {
     let s = s.trim();
-    let s = s.strip_suffix('L').or_else(|| s.strip_suffix('l')).unwrap_or(s);
+    let s = s
+        .strip_suffix('L')
+        .or_else(|| s.strip_suffix('l'))
+        .unwrap_or(s);
     let s = s.strip_prefix('-').unwrap_or(s);
     s.chars().all(|c| c.is_ascii_digit()) && s.len() > 10
 }
@@ -299,7 +322,11 @@ fn infer_type_from_raw(s: &str, types: &HashMap<VarId, String>) -> Option<String
             let element_and_brackets = s[4..bracket].trim();
             if !element_and_brackets.is_empty() {
                 let ty = element_and_brackets.to_string();
-                return Some(if ty.ends_with(']') { ty } else { format!("{}[]", ty) });
+                return Some(if ty.ends_with(']') {
+                    ty
+                } else {
+                    format!("{}[]", ty)
+                });
             }
         }
         // new-instance: "new Foo()" or "new Foo(args)" -> type is Foo
@@ -347,9 +374,14 @@ fn infer_type_from_raw(s: &str, types: &HashMap<VarId, String>) -> Option<String
     if let Some(ty) = s.strip_suffix(".class") {
         let ty = ty.trim();
         if !ty.is_empty()
-            && ty
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '[' || c == ']')
+            && ty.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || c == '_'
+                    || c == '.'
+                    || c == '$'
+                    || c == '['
+                    || c == ']'
+            })
         {
             return Some("java.lang.Class".to_string());
         }
@@ -451,7 +483,11 @@ fn collect_semantic_roles(stmts: &[IrStmt]) -> HashMap<VarId, SemanticRole> {
     let mut roles = HashMap::new();
     for s in stmts {
         let (assign_dst, raw) = match s {
-            IrStmt::Assign { dst, rhs: IrExpr::Raw(r), .. } => (Some(*dst), r.as_str()),
+            IrStmt::Assign {
+                dst,
+                rhs: IrExpr::Raw(r),
+                ..
+            } => (Some(*dst), r.as_str()),
             IrStmt::Raw(r) => (None, r.as_str()),
             _ => continue,
         };
@@ -588,7 +624,11 @@ pub fn build_var_names_with_regs(
     is_static: bool,
 ) -> HashMap<VarId, String> {
     let return_var = stmts.iter().find_map(|s| {
-        if let IrStmt::Return { value: Some(IrExpr::Var(v)), .. } = s {
+        if let IrStmt::Return {
+            value: Some(IrExpr::Var(v)),
+            ..
+        } = s
+        {
             Some(*v)
         } else {
             None
@@ -616,12 +656,38 @@ pub fn build_var_names_with_regs(
         };
         for v in &uses {
             if !names.contains_key(v) {
-                names.insert(*v, name_for_var(*v, type_map, return_var, param_base, ins_size, is_static, &roles, &mut counters, &mut index_counter));
+                names.insert(
+                    *v,
+                    name_for_var(
+                        *v,
+                        type_map,
+                        return_var,
+                        param_base,
+                        ins_size,
+                        is_static,
+                        &roles,
+                        &mut counters,
+                        &mut index_counter,
+                    ),
+                );
             }
         }
         if let Some(d) = def {
             if !names.contains_key(&d) {
-                names.insert(d, name_for_var(d, type_map, return_var, param_base, ins_size, is_static, &roles, &mut counters, &mut index_counter));
+                names.insert(
+                    d,
+                    name_for_var(
+                        d,
+                        type_map,
+                        return_var,
+                        param_base,
+                        ins_size,
+                        is_static,
+                        &roles,
+                        &mut counters,
+                        &mut index_counter,
+                    ),
+                );
             }
         }
     }
@@ -852,7 +918,11 @@ fn name_for_var(
         if !is_static && param_offset == 0 {
             return "this".to_string();
         }
-        let param_idx = if is_static { param_offset } else { param_offset.saturating_sub(1) };
+        let param_idx = if is_static {
+            param_offset
+        } else {
+            param_offset.saturating_sub(1)
+        };
         let typ = type_map.get(&v).map(|s| s.as_str()).unwrap_or("");
         return param_display_name(param_idx as usize, typ);
     }
@@ -1035,7 +1105,8 @@ mod tests {
         let n_typed = names.get(&VarId::new(0, 1)).cloned();
         let n_old = names.get(&VarId::new(0, 0)).cloned();
         assert!(
-            n_typed.as_deref() == Some("arr0") || n_typed.as_ref().is_some_and(|s| s.starts_with("arr")),
+            n_typed.as_deref() == Some("arr0")
+                || n_typed.as_ref().is_some_and(|s| s.starts_with("arr")),
             "typed array version should be arr*: {:?}",
             n_typed
         );
@@ -1095,8 +1166,16 @@ mod tests {
         let n1 = names.get(&VarId::new(0, 1)).cloned();
         let n4 = names.get(&VarId::new(0, 4)).cloned();
         assert_eq!(n0.as_deref(), Some("this"));
-        assert_ne!(n1, n4, "View and String must not share a name: {:?} vs {:?}", n1, n4);
-        assert_ne!(n0, n4, "this/Activity must not become email: {:?} vs {:?}", n0, n4);
+        assert_ne!(
+            n1, n4,
+            "View and String must not share a name: {:?} vs {:?}",
+            n1, n4
+        );
+        assert_ne!(
+            n0, n4,
+            "this/Activity must not become email: {:?} vs {:?}",
+            n0, n4
+        );
     }
 
     #[test]
@@ -1142,7 +1221,8 @@ mod tests {
 
     #[test]
     fn param_names_by_register_instance_skips_this_and_wide() {
-        let names = param_names_by_register(5, 4, false, &["long".into(), "java.lang.String".into()]);
+        let names =
+            param_names_by_register(5, 4, false, &["long".into(), "java.lang.String".into()]);
         assert_eq!(names.get(&1), Some(&"this".to_string()));
         assert_eq!(names.get(&2), Some(&"l0".to_string()));
         assert_eq!(names.get(&4), Some(&"s1".to_string()));
@@ -1156,11 +1236,7 @@ mod tests {
             6,
             4,
             false,
-            &[
-                "int".into(),
-                "java.lang.String[]".into(),
-                "int[]".into(),
-            ],
+            &["int".into(), "java.lang.String[]".into(), "int[]".into()],
         );
         assert_eq!(names.get(&2), Some(&"this".to_string()));
         assert_eq!(names.get(&3), Some(&"i0".to_string()));

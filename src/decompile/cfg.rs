@@ -139,7 +139,7 @@ pub struct CfgBlock {
 }
 
 /// Method-level CFG: blocks, entry, loop headers.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MethodCfg {
     pub blocks: Vec<CfgBlock>,
     /// Map: byte offset (block start) -> BlockId.
@@ -193,7 +193,9 @@ impl MethodCfg {
                 .collect();
 
             let last_ins = instruction_offsets.last().and_then(|&off| {
-                instructions.iter().find(|ins| (ins.offset as usize) + base_offset == off as usize)
+                instructions
+                    .iter()
+                    .find(|ins| (ins.offset as usize) + base_offset == off as usize)
             });
 
             // Prefer BasicBlock.fallthrough_to (absent for goto / exit).
@@ -222,8 +224,12 @@ impl MethodCfg {
                 let m = ins.mnemonic();
                 // Look for packed/sparse-switch anywhere in the block (e.g. block may be const, packed-switch, goto).
                 let switch_ins = instruction_offsets.iter().find_map(|&off| {
-                    let ins_here = instructions.iter().find(|i| (i.offset as usize) + base_offset == off as usize)?;
-                    if ins_here.mnemonic() == "packed-switch" || ins_here.mnemonic() == "sparse-switch" {
+                    let ins_here = instructions
+                        .iter()
+                        .find(|i| (i.offset as usize) + base_offset == off as usize)?;
+                    if ins_here.mnemonic() == "packed-switch"
+                        || ins_here.mnemonic() == "sparse-switch"
+                    {
                         Some((ins_here, (off as usize).saturating_sub(base_offset)))
                     } else {
                         None
@@ -236,7 +242,9 @@ impl MethodCfg {
                         let default_id = if instruction_offsets.contains(&next_off_abs) {
                             instructions
                                 .iter()
-                                .find(|i| (i.offset as usize) + base_offset == next_off_abs as usize)
+                                .find(|i| {
+                                    (i.offset as usize) + base_offset == next_off_abs as usize
+                                })
                                 .and_then(|i| {
                                     if i.mnemonic().starts_with("goto") {
                                         branch_target_ids.first().copied()
@@ -288,7 +296,9 @@ impl MethodCfg {
                     }
                 }
                 match m {
-                    "return-void" | "return" | "return-wide" | "return-object" | "throw" => BlockEnd::Exit,
+                    "return-void" | "return" | "return-wide" | "return-object" | "throw" => {
+                        BlockEnd::Exit
+                    }
                     "goto" | "goto/16" | "goto/32" => {
                         // Prefer the last instruction's own target (not other branches in the block).
                         let goto_tid = last_ins.and_then(|gi| {
@@ -304,7 +314,8 @@ impl MethodCfg {
                                             } else {
                                                 b.end_offset as usize
                                             };
-                                            (b.start_offset as usize..b_end).contains(&(toff as usize))
+                                            (b.start_offset as usize..b_end)
+                                                .contains(&(toff as usize))
                                         })
                                     })
                                 })
@@ -312,11 +323,13 @@ impl MethodCfg {
                         if let Some(tid) = goto_tid.or_else(|| branch_target_ids.first().copied()) {
                             BlockEnd::Goto(tid)
                         } else {
-                            fall_through_id.map(|_| BlockEnd::FallThrough).unwrap_or(BlockEnd::Exit)
+                            fall_through_id
+                                .map(|_| BlockEnd::FallThrough)
+                                .unwrap_or(BlockEnd::Exit)
                         }
                     }
-                    "if-eq" | "if-ne" | "if-lt" | "if-ge" | "if-gt" | "if-le"
-                    | "if-eqz" | "if-nez" | "if-ltz" | "if-gez" | "if-gtz" | "if-lez" => {
+                    "if-eq" | "if-ne" | "if-lt" | "if-ge" | "if-gt" | "if-le" | "if-eqz"
+                    | "if-nez" | "if-ltz" | "if-gez" | "if-gtz" | "if-lez" => {
                         let cond = condition_for_offset(ins);
                         let then_id = branch_target_ids.first().copied().unwrap_or(entry);
                         let else_id = fall_through_id.unwrap_or(entry);
@@ -351,7 +364,8 @@ impl MethodCfg {
                                                 } else {
                                                     b.end_offset as usize
                                                 };
-                                                (b.start_offset as usize..end).contains(&(off as usize))
+                                                (b.start_offset as usize..end)
+                                                    .contains(&(off as usize))
                                             })
                                             .map(|i| i as BlockId)
                                     })?;
@@ -420,6 +434,98 @@ impl MethodCfg {
         self.blocks.len()
     }
 
+    /// Split existing blocks at instruction-aligned offsets (notably catch entries).
+    ///
+    /// The bytecode branch CFG cannot discover exception-handler leaders on its own.
+    /// This preserves normal successors while making each handler address targetable.
+    pub fn split_at_offsets(&mut self, offsets: &[u32]) {
+        if self.blocks.is_empty() || offsets.is_empty() {
+            return;
+        }
+        let old_blocks = self.blocks.clone();
+        let old_entry = self.entry;
+        let old_loops = self.loop_headers.clone();
+        let mut old_to_first = vec![0usize; old_blocks.len()];
+        let mut old_to_last = vec![0usize; old_blocks.len()];
+        let mut blocks = Vec::new();
+
+        for (old_id, block) in old_blocks.iter().enumerate() {
+            let mut cuts: Vec<u32> = offsets
+                .iter()
+                .copied()
+                .filter(|offset| {
+                    *offset > block.start_offset
+                        && *offset < block.end_offset
+                        && block.instruction_offsets.contains(offset)
+                })
+                .collect();
+            cuts.sort_unstable();
+            cuts.dedup();
+            let mut starts = vec![block.start_offset];
+            starts.extend(cuts);
+            old_to_first[old_id] = blocks.len();
+            for (index, start) in starts.iter().copied().enumerate() {
+                let end = starts.get(index + 1).copied().unwrap_or(block.end_offset);
+                let instruction_offsets = block
+                    .instruction_offsets
+                    .iter()
+                    .copied()
+                    .filter(|offset| *offset >= start && *offset < end)
+                    .collect();
+                blocks.push(CfgBlock {
+                    start_offset: start,
+                    end_offset: end,
+                    end: if index + 1 == starts.len() {
+                        block.end.clone()
+                    } else {
+                        BlockEnd::FallThrough
+                    },
+                    instruction_offsets,
+                });
+            }
+            old_to_last[old_id] = blocks.len() - 1;
+        }
+
+        let remap = |old: BlockId| old_to_first.get(old).copied().unwrap_or(old);
+        for old_id in 0..old_blocks.len() {
+            let last = old_to_last[old_id];
+            blocks[last].end = match blocks[last].end.clone() {
+                BlockEnd::Goto(target) => BlockEnd::Goto(remap(target)),
+                BlockEnd::Conditional {
+                    condition,
+                    branch_target,
+                    fall_through,
+                } => BlockEnd::Conditional {
+                    condition,
+                    branch_target: remap(branch_target),
+                    fall_through: remap(fall_through),
+                },
+                BlockEnd::Switch {
+                    condition,
+                    cases,
+                    default_block,
+                } => BlockEnd::Switch {
+                    condition,
+                    cases: cases
+                        .into_iter()
+                        .map(|(value, target)| (value, remap(target)))
+                        .collect(),
+                    default_block: remap(default_block),
+                },
+                other => other,
+            };
+        }
+
+        self.entry = remap(old_entry);
+        self.loop_headers = old_loops.into_iter().map(remap).collect();
+        self.block_by_start = blocks
+            .iter()
+            .enumerate()
+            .map(|(id, block)| (block.start_offset, id))
+            .collect();
+        self.blocks = blocks;
+    }
+
     /// All (from_block_id, to_block_id) edges for graph visualization.
     pub fn successor_edges(&self) -> Vec<(BlockId, BlockId)> {
         let mut edges = Vec::new();
@@ -431,17 +537,54 @@ impl MethodCfg {
                     }
                 }
                 BlockEnd::Goto(t) => edges.push((from_id, *t)),
-                BlockEnd::Conditional { branch_target, fall_through, .. } => {
+                BlockEnd::Conditional {
+                    branch_target,
+                    fall_through,
+                    ..
+                } => {
                     edges.push((from_id, *branch_target));
                     edges.push((from_id, *fall_through));
                 }
-                BlockEnd::Switch { cases, default_block, .. } => {
+                BlockEnd::Switch {
+                    cases,
+                    default_block,
+                    ..
+                } => {
                     for (_, bid) in cases {
                         edges.push((from_id, *bid));
                     }
                     edges.push((from_id, *default_block));
                 }
                 BlockEnd::Exit => {}
+            }
+        }
+        edges
+    }
+
+    /// Conservative edges from every protected block to each applicable catch handler.
+    ///
+    /// DEX does not encode which instruction throws, so all blocks overlapping the try
+    /// interval are connected. Reaching-definitions then preserves values across catch paths.
+    pub fn exceptional_edges_for_range(
+        &self,
+        try_start: u32,
+        try_end: u32,
+        handler_starts: &[u32],
+    ) -> Vec<(BlockId, BlockId)> {
+        let handlers: Vec<BlockId> = handler_starts
+            .iter()
+            .filter_map(|offset| self.block_id_at_offset(*offset))
+            .collect();
+        let mut edges = Vec::new();
+        for (from, block) in self.blocks.iter().enumerate() {
+            let overlaps = block.start_offset < try_end && block.end_offset > try_start;
+            if !overlaps {
+                continue;
+            }
+            for &to in &handlers {
+                if from != to && !edges.contains(&(from, to)) {
+                    edges.push((from, to));
+                }
             }
         }
         edges
@@ -477,7 +620,12 @@ impl MethodCfg {
     }
 
     /// True if `target` is reachable from `start` without entering `exclude` (e.g. loop header).
-    pub fn reachable_from(&self, start: BlockId, target: BlockId, exclude: Option<BlockId>) -> bool {
+    pub fn reachable_from(
+        &self,
+        start: BlockId,
+        target: BlockId,
+        exclude: Option<BlockId>,
+    ) -> bool {
         use std::collections::HashSet;
         let mut visited = HashSet::new();
         let mut stack = vec![start];
@@ -497,11 +645,19 @@ impl MethodCfg {
                     }
                 }
                 BlockEnd::Goto(t) => stack.push(*t),
-                BlockEnd::Conditional { branch_target, fall_through, .. } => {
+                BlockEnd::Conditional {
+                    branch_target,
+                    fall_through,
+                    ..
+                } => {
                     stack.push(*branch_target);
                     stack.push(*fall_through);
                 }
-                BlockEnd::Switch { cases, default_block, .. } => {
+                BlockEnd::Switch {
+                    cases,
+                    default_block,
+                    ..
+                } => {
                     for (_, bid) in cases {
                         stack.push(*bid);
                     }
@@ -605,7 +761,12 @@ impl MethodCfg {
     pub fn format_debug(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
-        let _ = writeln!(out, "blocks={} loop_headers={:?}", self.block_count(), self.loop_headers);
+        let _ = writeln!(
+            out,
+            "blocks={} loop_headers={:?}",
+            self.block_count(),
+            self.loop_headers
+        );
         for (i, b) in self.blocks.iter().enumerate() {
             let _ = writeln!(
                 out,
@@ -624,9 +785,7 @@ impl MethodCfg {
 
     /// True if any block ends with return/throw.
     pub fn has_return_block(&self) -> bool {
-        self.blocks
-            .iter()
-            .any(|b| matches!(b.end, BlockEnd::Exit))
+        self.blocks.iter().any(|b| matches!(b.end, BlockEnd::Exit))
     }
 }
 
@@ -658,15 +817,21 @@ mod tests {
         // if-eqz v0, +4 (21t: target = 0+4*2 = 8); goto +2 (target 4+2*2 = 8); return-void at 6; return-void at 8
         let bytecode: &[u8] = &[
             0x38, 0x00, 0x04, 0x00, // if-eqz v0, +4 -> target byte 8
-            0x28, 0x02,             // goto +2 -> target byte 8
-            0x0e, 0x00,             // return-void at 6
-            0x0e, 0x00,             // return-void at 8
+            0x28, 0x02, // goto +2 -> target byte 8
+            0x0e, 0x00, // return-void at 6
+            0x0e, 0x00, // return-void at 8
         ];
         let instructions = decode_all(bytecode, 0).unwrap();
         let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_for);
         assert!(cfg.block_count() >= 2);
-        let has_conditional = cfg.blocks.iter().any(|b| matches!(&b.end, BlockEnd::Conditional { .. }));
-        assert!(has_conditional, "expected at least one conditional block (if-eqz)");
+        let has_conditional = cfg
+            .blocks
+            .iter()
+            .any(|b| matches!(&b.end, BlockEnd::Conditional { .. }));
+        assert!(
+            has_conditional,
+            "expected at least one conditional block (if-eqz)"
+        );
     }
 
     /// natural_loop_blocks for merge-style CFG: main loop is blocks 1-10, not tail headers 11/15/19.
@@ -675,16 +840,19 @@ mod tests {
         // Minimal back-edge loop: header at block 0, body 1, back from 1 to 0; exit block 2.
         let bytecode: &[u8] = &[
             0x38, 0x00, 0x04, 0x00, // 0: if-eqz -> 8 (exit block 2)
-            0x12, 0x00,             // 4: body
-            0x28, 0xfc,             // 6: goto -4 -> 0
-            0x0e, 0x00,             // 8: return-void (outside loop)
+            0x12, 0x00, // 4: body
+            0x28, 0xfc, // 6: goto -4 -> 0
+            0x0e, 0x00, // 8: return-void (outside loop)
         ];
         let instructions = decode_all(bytecode, 0).unwrap();
         let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_for);
         let header = cfg.entry;
         let body = cfg.natural_loop_blocks(header);
         assert!(body.contains(&header));
-        assert!(!body.contains(&(header + 2)), "return block should not be in loop body");
+        assert!(
+            !body.contains(&(header + 2)),
+            "return block should not be in loop body"
+        );
     }
 
     /// Loop: const/4; if-eqz (exit); goto back to if-eqz block. Back edge target is loop header.
@@ -692,15 +860,18 @@ mod tests {
     fn cfg_loop_back_edge() {
         // const/4 v0,0 (0..2); if-eqz v0,+5 (2..6) target 12; goto -2 (6..8) target 2; nop nop (8..12); return-void (12..14)
         let bytecode: &[u8] = &[
-            0x12, 0x00,             // const/4 v0, 0
+            0x12, 0x00, // const/4 v0, 0
             0x38, 0x00, 0x05, 0x00, // if-eqz v0, +5 -> target byte 12
-            0x28, 0xfe,             // goto -2 -> target byte 2
+            0x28, 0xfe, // goto -2 -> target byte 2
             0x00, 0x00, 0x00, 0x00, // nop, nop
-            0x0e, 0x00,             // return-void at 12
+            0x0e, 0x00, // return-void at 12
         ];
         let instructions = decode_all(bytecode, 0).unwrap();
         let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_for);
-        assert!(!cfg.loop_headers.is_empty(), "goto back to earlier block should create loop header");
+        assert!(
+            !cfg.loop_headers.is_empty(),
+            "goto back to earlier block should create loop header"
+        );
     }
 
     /// Linear sequence: const/4, return (value-return). At least one block ends in Exit.
@@ -714,6 +885,9 @@ mod tests {
         let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_for);
         assert!(cfg.block_count() >= 1);
         let has_exit = cfg.blocks.iter().any(|b| matches!(b.end, BlockEnd::Exit));
-        assert!(has_exit, "linear method with return should have an Exit block");
+        assert!(
+            has_exit,
+            "linear method with return should have an Exit block"
+        );
     }
 }

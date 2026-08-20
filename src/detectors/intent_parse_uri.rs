@@ -3,11 +3,7 @@
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
 use crate::detectors::types::{source_sink_scan, VulnFinding};
 
-const SOURCES: &[&str] = &[
-    "Intent.parseUri",
-    "parseUri",
-    "Uri.parse",
-];
+const SOURCES: &[&str] = &["Intent.parseUri", "parseUri", "Uri.parse"];
 const SINKS: &[&str] = &[
     "startActivity",
     "startActivityForResult",
@@ -32,7 +28,10 @@ pub fn scan_intent_parse_uri(
     findings.retain(|f| {
         f.source_desc.contains("parseUri")
             || f.sink_desc.contains("parseUri")
-            || owned.invoke_method_map.values().any(|m| m.contains("parseUri"))
+            || owned
+                .invoke_method_map
+                .values()
+                .any(|m| m.contains("parseUri"))
     });
     if findings.is_empty() {
         let has_parse = owned

@@ -17,7 +17,8 @@ fn general_rules_path() -> PathBuf {
 }
 
 fn androguard_dex() -> DexFile {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/androguard_test_classes.dex");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/androguard_test_classes.dex");
     assert!(path.exists(), "missing {}", path.display());
     let data = std::fs::read(&path).expect("read androguard_test_classes.dex");
     parse_dex(&data).expect("parse androguard_test_classes.dex")
@@ -39,7 +40,8 @@ fn builtin_includes_general_and_mastg() {
     assert!(ids.contains(&"android.intent.redirect"));
     assert!(ids.contains(&"android.ssl.bypass-handler-proceed"));
     assert!(
-        ids.iter().any(|id| id.starts_with("mastg-android-") || id.starts_with("detect-")),
+        ids.iter()
+            .any(|id| id.starts_with("mastg-android-") || id.starts_with("detect-")),
         "expected OWASP MASTG rule ids, sample={:?}",
         &ids[..ids.len().min(8)]
     );
@@ -49,9 +51,17 @@ fn builtin_includes_general_and_mastg() {
 fn default_android_rule_paths_exist() {
     let paths = default_android_rule_paths();
     assert!(!paths.is_empty(), "expected default rule paths");
-    assert!(paths[0].is_file(), "primary rules YAML missing: {}", paths[0].display());
+    assert!(
+        paths[0].is_file(),
+        "primary rules YAML missing: {}",
+        paths[0].display()
+    );
     if paths.len() >= 2 {
-        assert!(paths[1].is_dir(), "MASTG dir missing: {}", paths[1].display());
+        assert!(
+            paths[1].is_dir(),
+            "MASTG dir missing: {}",
+            paths[1].display()
+        );
     }
 }
 
@@ -69,7 +79,9 @@ fn load_android_rules_none_file_and_dir() {
 
     let from_dir = load_android_rules(Some(&mastg_dir())).unwrap();
     assert!(from_dir.len() >= 40);
-    assert!(from_dir.iter().all(|r| !r.id.starts_with("android.webview.")));
+    assert!(from_dir
+        .iter()
+        .all(|r| !r.id.starts_with("android.webview.")));
 }
 
 #[test]
@@ -116,12 +128,17 @@ fn mastg_dir_loads_every_yaml_file() {
         "MASTG YAML parse failures:\n{}",
         failed.join("\n")
     );
-    assert!(rule_count >= 40, "expected >=40 MASTG rules, got {rule_count}");
+    assert!(
+        rule_count >= 40,
+        "expected >=40 MASTG rules, got {rule_count}"
+    );
 
     let rules = load_rules_from_dir(&dir).expect("load MASTG dir");
     assert_eq!(rules.len(), rule_count);
     assert!(rules.iter().any(|r| r.applies_to_xml()));
-    assert!(rules.iter().any(|r| r.applies_to_java() && !r.applies_to_xml()));
+    assert!(rules
+        .iter()
+        .any(|r| r.applies_to_java() && !r.applies_to_xml()));
 }
 
 #[test]
@@ -179,9 +196,15 @@ rules:
 "#;
     let rules = load_rules_from_str(yaml).unwrap();
     assert_eq!(rules.len(), 2);
-    assert_eq!(rules[0].pattern_regexes(), vec!["PTRACE_(ATTACH|SEIZE)".to_string()]);
+    assert_eq!(
+        rules[0].pattern_regexes(),
+        vec!["PTRACE_(ATTACH|SEIZE)".to_string()]
+    );
     assert!(rule_matches_source(&rules[0], "x = PTRACE_ATTACH;").is_some());
-    assert_eq!(rule_matches_source(&rules[0], "x = PTRACE_ATTACH;"), Some("java_regex"));
+    assert_eq!(
+        rule_matches_source(&rules[0], "x = PTRACE_ATTACH;"),
+        Some("java_regex")
+    );
     assert!(rule_matches_source(&rules[0], "no match here").is_none());
 
     assert!(!rules[1].patterns_are_conjunction());
@@ -242,7 +265,10 @@ fn java_pattern_js_interface_rule() {
         .pattern_strings()
         .iter()
         .any(|p| java_matches_pattern(java, p));
-    assert!(matched, "JS interface pattern should match decompiled-like Java");
+    assert!(
+        matched,
+        "JS interface pattern should match decompiled-like Java"
+    );
 }
 
 #[test]
@@ -391,8 +417,7 @@ fn semgrep_skips_android_platform_classes() {
         findings
             .iter()
             .filter(|f| {
-                f.class_name.starts_with("android.")
-                    || f.class_name.starts_with("androidx.")
+                f.class_name.starts_with("android.") || f.class_name.starts_with("androidx.")
             })
             .take(5)
             .map(|f| (&f.rule_id, &f.class_name))
@@ -423,7 +448,9 @@ rules:
         !findings.is_empty(),
         "expected native invoke findings for TestInvoke1"
     );
-    assert!(findings.iter().all(|f| f.rule_id == "test.dex.invoke-testinvoke1"));
+    assert!(findings
+        .iter()
+        .all(|f| f.rule_id == "test.dex.invoke-testinvoke1"));
     assert!(findings.iter().all(|f| f.match_kind == "native"));
     assert!(findings.iter().any(|f| f.class_name.contains("TestInvoke")));
     assert!(findings.iter().any(|f| f.sink_offset.is_some()));

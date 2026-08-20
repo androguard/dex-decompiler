@@ -50,8 +50,8 @@ pub fn decompile_fixtures_dex() -> String {
 
 pub fn decompile_fixtures_apk() -> String {
     let path = fixtures_apk_path();
-    let dexes = load_dexes_from_path(&path)
-        .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+    let dexes =
+        load_dexes_from_path(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
     assert!(!dexes.is_empty(), "APK produced no DEX");
     decompile_dex_file(&dexes[0])
 }
@@ -117,21 +117,99 @@ pub fn normalize_java_text(s: &str) -> String {
 }
 
 const JAVA_KEYWORDS: &[&str] = &[
-    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const",
-    "continue", "default", "do", "double", "else", "enum", "extends", "final", "finally",
-    "float", "for", "goto", "if", "implements", "import", "instanceof", "int", "interface",
-    "long", "native", "new", "null", "package", "private", "protected", "public", "return",
-    "short", "static", "strictfp", "super", "switch", "synchronized", "this", "throw", "throws",
-    "transient", "try", "void", "volatile", "while", "true", "false",
+    "abstract",
+    "assert",
+    "boolean",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extends",
+    "final",
+    "finally",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "implements",
+    "import",
+    "instanceof",
+    "int",
+    "interface",
+    "long",
+    "native",
+    "new",
+    "null",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "short",
+    "static",
+    "strictfp",
+    "super",
+    "switch",
+    "synchronized",
+    "this",
+    "throw",
+    "throws",
+    "transient",
+    "try",
+    "void",
+    "volatile",
+    "while",
+    "true",
+    "false",
 ];
 
 const JAVA_TYPES: &[&str] = &[
-    "String", "Object", "Integer", "List", "Arrays", "Math", "Runnable", "Closeable", "IOException",
-    "IllegalStateException", "ArithmeticException", "RuntimeException", "Exception",
-    "NullPointerException", "ClassCastException", "StubResource", "Color", "Token", "Context",
-    "ContextLike", "Outer", "Inner", "StaticInner", "IntUnaryOperator", "MessageDigest", "Mac",
-    "Cipher", "SecretKeySpec", "IvParameterSpec", "SecureRandom", "PBEKeySpec", "SecretKeyFactory",
-    "NoSuchAlgorithmException", "Queue", "ArrayDeque", "System", "Override",
+    "String",
+    "Object",
+    "Integer",
+    "List",
+    "Arrays",
+    "Math",
+    "Runnable",
+    "Closeable",
+    "IOException",
+    "IllegalStateException",
+    "ArithmeticException",
+    "RuntimeException",
+    "Exception",
+    "NullPointerException",
+    "ClassCastException",
+    "StubResource",
+    "Color",
+    "Token",
+    "Context",
+    "ContextLike",
+    "Outer",
+    "Inner",
+    "StaticInner",
+    "IntUnaryOperator",
+    "MessageDigest",
+    "Mac",
+    "Cipher",
+    "SecretKeySpec",
+    "IvParameterSpec",
+    "SecureRandom",
+    "PBEKeySpec",
+    "SecretKeyFactory",
+    "NoSuchAlgorithmException",
+    "Queue",
+    "ArrayDeque",
+    "System",
+    "Override",
 ];
 
 const JAVA_MISC: &[&str] = &["println", "out"];
@@ -220,9 +298,7 @@ impl FixtureMethodSpec {
         }
         for needle in self.must_not_contain {
             if decompiled.contains(needle) {
-                errors.push(format!(
-                    "{ctx}: must not contain `{needle}`:\n{decompiled}"
-                ));
+                errors.push(format!("{ctx}: must not contain `{needle}`:\n{decompiled}"));
             }
         }
 
@@ -272,8 +348,7 @@ impl FixtureMethodSpec {
 
 /// Run all manifest entries against decompiled output.
 pub fn check_all_fixtures(decompiled: &str, manifest: &[FixtureMethodSpec]) {
-    let mut by_class: std::collections::HashMap<&str, String> =
-        std::collections::HashMap::new();
+    let mut by_class: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     for spec in manifest {
         by_class
             .entry(spec.class)

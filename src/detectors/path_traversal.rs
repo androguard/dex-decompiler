@@ -54,14 +54,9 @@ pub fn scan_path_traversal(
                 "Uri.getPath",
             ],
         )
-    }) || owned
-        .api_return_sources
-        .iter()
-        .any(|(_, s)| {
-            s.contains("getLastPathSegment")
-                || s.contains("getPath")
-                || s.contains("getEncodedPath")
-        });
+    }) || owned.api_return_sources.iter().any(|(_, s)| {
+        s.contains("getLastPathSegment") || s.contains("getPath") || s.contains("getEncodedPath")
+    });
     let has_file = owned.invoke_method_map.values().any(|m| {
         m.contains("File.<init>")
             || m.contains("FileInputStream")
@@ -69,9 +64,7 @@ pub fn scan_path_traversal(
             || m.contains("ParcelFileDescriptor.open")
     });
     let has_canon = owned.invoke_method_map.values().any(|m| {
-        m.contains("getCanonicalPath")
-            || m.contains("getCanonicalFile")
-            || m.contains("toRealPath")
+        m.contains("getCanonicalPath") || m.contains("getCanonicalFile") || m.contains("toRealPath")
     });
 
     if is_provider_open && has_uri_path && has_file && !has_canon && findings.is_empty() {

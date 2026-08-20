@@ -62,8 +62,7 @@ pub const ANDROID_GENERAL_RULES_YAML: &str =
 
 /// Embedded **all** Android rules: general (MobHunt-style) + OWASP MASTG.
 /// Single-file include so WASM / droid2web get the full set without a filesystem.
-pub const ANDROID_ALL_RULES_YAML: &str =
-    include_str!("../../rules/semgrep/android/all.yml");
+pub const ANDROID_ALL_RULES_YAML: &str = include_str!("../../rules/semgrep/android/all.yml");
 
 fn mastg_rules_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules/semgrep/android/mastg")
@@ -80,9 +79,7 @@ fn all_rules_path() -> PathBuf {
 /// Built-in Android rules: general native rules + OWASP MASTG Semgrep rules.
 pub fn builtin_android_rules() -> Vec<SemgrepRule> {
     load_rules_from_str(ANDROID_ALL_RULES_YAML).unwrap_or_else(|e| {
-        eprintln!(
-            "warning: embedded all.yml failed ({e}); falling back to general + mastg dir"
-        );
+        eprintln!("warning: embedded all.yml failed ({e}); falling back to general + mastg dir");
         let mut rules = load_rules_from_str(ANDROID_GENERAL_RULES_YAML)
             .expect("embedded general rules must parse");
         let mastg = mastg_rules_dir();
@@ -90,7 +87,11 @@ pub fn builtin_android_rules() -> Vec<SemgrepRule> {
             match load_rules_from_dir(&mastg) {
                 Ok(mut rs) => rules.append(&mut rs),
                 Err(e) => {
-                    eprintln!("warning: could not load MASTG rules from {}: {}", mastg.display(), e)
+                    eprintln!(
+                        "warning: could not load MASTG rules from {}: {}",
+                        mastg.display(),
+                        e
+                    )
                 }
             }
         }
@@ -200,7 +201,8 @@ impl<'a> PreparedRule<'a> {
             return Some("java_pattern");
         }
         if !self.conjunction
-            && ((regex_ok && !self.regexes.is_empty()) || (patterns_ok && !self.patterns.is_empty()))
+            && ((regex_ok && !self.regexes.is_empty())
+                || (patterns_ok && !self.patterns.is_empty()))
         {
             if !self.regexes.is_empty() && self.regexes.iter().any(|re| re.is_match(src)) {
                 return Some("java_regex");
@@ -345,13 +347,7 @@ fn scan_method_prepared(
                             }
                         }
                         if !native_hit && prep.needs_java {
-                            ensure_java(
-                                decompiler,
-                                encoded,
-                                class_name,
-                                &mut java,
-                                &mut java_tok,
-                            );
+                            ensure_java(decompiler, encoded, class_name, &mut java, &mut java_tok);
                             if let (Some(src), Some(tok)) = (java.as_ref(), java_tok.as_ref()) {
                                 if let Some(kind) = prep.matches_tokenized(src, tok) {
                                     findings.push(finding_from_rule(
@@ -369,13 +365,7 @@ fn scan_method_prepared(
                 }
                 let _ = native_hit;
             } else if prep.needs_java {
-                ensure_java(
-                    decompiler,
-                    encoded,
-                    class_name,
-                    &mut java,
-                    &mut java_tok,
-                );
+                ensure_java(decompiler, encoded, class_name, &mut java, &mut java_tok);
                 if let (Some(src), Some(tok)) = (java.as_ref(), java_tok.as_ref()) {
                     if let Some(kind) = prep.matches_tokenized(src, tok) {
                         findings.push(finding_from_rule(
@@ -393,13 +383,7 @@ fn scan_method_prepared(
         }
 
         if prep.needs_java {
-            ensure_java(
-                decompiler,
-                encoded,
-                class_name,
-                &mut java,
-                &mut java_tok,
-            );
+            ensure_java(decompiler, encoded, class_name, &mut java, &mut java_tok);
             if let (Some(src), Some(tok)) = (java.as_ref(), java_tok.as_ref()) {
                 if let Some(kind) = prep.matches_tokenized(src, tok) {
                     findings.push(finding_from_rule(
@@ -488,8 +472,12 @@ fn collect_method_jobs(dex: &DexFile) -> Vec<MethodJob> {
 fn collect_method_jobs_scoped(dex: &DexFile, prefixes: Option<&[String]>) -> Vec<MethodJob> {
     let mut jobs = Vec::new();
     for class_result in dex.class_defs() {
-        let Ok(class_def) = class_result else { continue };
-        let Ok(class_type) = dex.get_type(class_def.class_idx) else { continue };
+        let Ok(class_def) = class_result else {
+            continue;
+        };
+        let Ok(class_type) = dex.get_type(class_def.class_idx) else {
+            continue;
+        };
         let class_name = descriptor_to_java(&class_type);
         if is_platform_class(&class_name) {
             continue;
@@ -499,7 +487,9 @@ fn collect_method_jobs_scoped(dex: &DexFile, prefixes: Option<&[String]>) -> Vec
                 continue;
             }
         }
-        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else {
+            continue;
+        };
         for encoded in class_data
             .direct_methods
             .iter()
@@ -508,7 +498,9 @@ fn collect_method_jobs_scoped(dex: &DexFile, prefixes: Option<&[String]>) -> Vec
             if encoded.code_off == 0 {
                 continue;
             }
-            let Ok(info) = dex.get_method_info(encoded.method_idx) else { continue };
+            let Ok(info) = dex.get_method_info(encoded.method_idx) else {
+                continue;
+            };
             jobs.push(MethodJob {
                 class_name: class_name.clone(),
                 method_name: info.name.to_string(),
@@ -527,7 +519,11 @@ pub fn scan_dex_semgrep(dex: &DexFile, rules: &[SemgrepRule]) -> Vec<SemgrepFind
 /// Sequential Semgrep scan (WASM / single-threaded friendly — no rayon).
 /// Caps work on huge DEXes so browser scans finish (Facebook-scale APKs).
 pub fn scan_dex_semgrep_sequential(dex: &DexFile, rules: &[SemgrepRule]) -> Vec<SemgrepFinding> {
-    scan_dex_semgrep_sequential_with_progress(dex, rules, None::<fn(usize, usize, &[SemgrepFinding])>)
+    scan_dex_semgrep_sequential_with_progress(
+        dex,
+        rules,
+        None::<fn(usize, usize, &[SemgrepFinding])>,
+    )
 }
 
 /// Soft cap for sequential WASM / UI scans. Full CLI parallel scan is uncapped.

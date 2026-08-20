@@ -100,22 +100,22 @@ pub(crate) fn repair_ssa_temp_increments(body: &str) -> String {
         t = t.strip_suffix(';').unwrap_or(t);
         let mut current = line.to_string();
         if !t.starts_with("for (") {
-        if let Some(eq) = t.find(" = ") {
-            let lhs = t[..eq].trim();
-            let var = lhs.rsplit(' ').next().unwrap_or(lhs);
-            let rhs = t[eq + 3..].trim();
-            let compact = rhs.replace(' ', "");
-            if compact.ends_with("+1") {
-                let base = &compact[..compact.len() - 2];
-                if is_ssa_temp_of(base, var)
-                    && (declared.contains(var) || matches!(var, "i" | "j" | "k"))
-                {
-                    let indent = leading_indent(line);
-                    let comment = line.get(binding.len()..).unwrap_or("");
-                    current = format!("{indent}{var}++;{comment}");
+            if let Some(eq) = t.find(" = ") {
+                let lhs = t[..eq].trim();
+                let var = lhs.rsplit(' ').next().unwrap_or(lhs);
+                let rhs = t[eq + 3..].trim();
+                let compact = rhs.replace(' ', "");
+                if compact.ends_with("+1") {
+                    let base = &compact[..compact.len() - 2];
+                    if is_ssa_temp_of(base, var)
+                        && (declared.contains(var) || matches!(var, "i" | "j" | "k"))
+                    {
+                        let indent = leading_indent(line);
+                        let comment = line.get(binding.len()..).unwrap_or("");
+                        current = format!("{indent}{var}++;{comment}");
+                    }
                 }
             }
-        }
         }
         out.push_str(&current);
         if idx < lines.len().saturating_sub(1) {
@@ -167,54 +167,57 @@ pub(crate) fn repair_register_reuse_scalars(body: &str) -> String {
         let stmt = binding.trim();
         // For-loop headers contain `var = init; cond; update` — not SSA reuse assigns.
         if !stmt.starts_with("for (") {
-        if let Some(eq) = stmt.find(" = ") {
-            let lhs = stmt[..eq].trim();
-            let lhs_var = lhs.rsplit(' ').next().unwrap_or(lhs);
-            let rhs = stmt[eq + 3..].trim_end_matches(';').trim();
-            // Skip typed array declarations (`int[] out = new int[n]`).
-            if !(lhs.contains('[') && rhs.starts_with("new ")) {
-                if rhs.replace(' ', "").ends_with("+1") {
-                    let base = rhs.trim().strip_suffix("+ 1").or_else(|| rhs.trim().strip_suffix("+1"));
-                    if let Some(base) = base {
-                        let base = base.trim();
-                        if is_ssa_temp_of(base, lhs_var)
-                            && (assigned.contains(lhs_var)
-                                || matches!(lhs_var, "i" | "j" | "k"))
-                        {
-                            let indent = leading_indent(line);
-                            let comment = line.get(binding.len()..).unwrap_or("");
-                            current = format!("{indent}{lhs_var}++;{comment}");
+            if let Some(eq) = stmt.find(" = ") {
+                let lhs = stmt[..eq].trim();
+                let lhs_var = lhs.rsplit(' ').next().unwrap_or(lhs);
+                let rhs = stmt[eq + 3..].trim_end_matches(';').trim();
+                // Skip typed array declarations (`int[] out = new int[n]`).
+                if !(lhs.contains('[') && rhs.starts_with("new ")) {
+                    if rhs.replace(' ', "").ends_with("+1") {
+                        let base = rhs
+                            .trim()
+                            .strip_suffix("+ 1")
+                            .or_else(|| rhs.trim().strip_suffix("+1"));
+                        if let Some(base) = base {
+                            let base = base.trim();
+                            if is_ssa_temp_of(base, lhs_var)
+                                && (assigned.contains(lhs_var)
+                                    || matches!(lhs_var, "i" | "j" | "k"))
+                            {
+                                let indent = leading_indent(line);
+                                let comment = line.get(binding.len()..).unwrap_or("");
+                                current = format!("{indent}{lhs_var}++;{comment}");
+                            }
                         }
-                    }
-                } else if is_temp_like_name(lhs_var)
-                    && ident_occurs(rhs, lhs_var)
-                    && !is_simple_arith_expr(rhs)
-                {
-                    let lit = preceding_same_var_literal(&lines, idx, lhs_var).or_else(|| {
-                        let mut other_lits: Vec<&str> = literal_by_temp
-                            .iter()
-                            .filter(|(v, _)| *v != lhs_var)
-                            .map(|(_, l)| l.as_str())
-                            .collect();
-                        other_lits.sort_unstable();
-                        other_lits.dedup();
-                        if other_lits.len() == 1 {
-                            other_lits.first().copied().map(str::to_string)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(lit) = lit {
-                        let patched = replace_ident_as_expr(rhs, lhs_var, &lit);
-                        if patched != rhs && !patched.contains(';') {
-                            let indent = leading_indent(line);
-                            let comment = line.get(binding.len()..).unwrap_or("");
-                            current = format!("{indent}{lhs} = {patched};{comment}");
+                    } else if is_temp_like_name(lhs_var)
+                        && ident_occurs(rhs, lhs_var)
+                        && !is_simple_arith_expr(rhs)
+                    {
+                        let lit = preceding_same_var_literal(&lines, idx, lhs_var).or_else(|| {
+                            let mut other_lits: Vec<&str> = literal_by_temp
+                                .iter()
+                                .filter(|(v, _)| *v != lhs_var)
+                                .map(|(_, l)| l.as_str())
+                                .collect();
+                            other_lits.sort_unstable();
+                            other_lits.dedup();
+                            if other_lits.len() == 1 {
+                                other_lits.first().copied().map(str::to_string)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(lit) = lit {
+                            let patched = replace_ident_as_expr(rhs, lhs_var, &lit);
+                            if patched != rhs && !patched.contains(';') {
+                                let indent = leading_indent(line);
+                                let comment = line.get(binding.len()..).unwrap_or("");
+                                current = format!("{indent}{lhs} = {patched};{comment}");
+                            }
                         }
                     }
                 }
             }
-        }
         }
         out.push_str(&current);
         if idx < lines.len().saturating_sub(1) {
@@ -261,38 +264,38 @@ pub(crate) fn repair_self_referential_call_args(body: &str) -> String {
         let t = binding.trim();
         let mut current = line.to_string();
         if !t.starts_with("for (") {
-        if let Some(eq) = t.find(" = ") {
-            let lhs = t[..eq].trim();
-            let lhs_var = lhs.rsplit(' ').next().unwrap_or(lhs);
-            let rhs = t[eq + 3..].trim_end_matches(';').trim();
-            if is_temp_like_name(lhs_var)
-                && ident_occurs(rhs, lhs_var)
-                && !is_simple_arith_expr(rhs)
-            {
-                let lit = preceding_same_var_literal(&lines, idx, lhs_var).or_else(|| {
-                    let mut other_lits: Vec<&str> = literal_temps
-                        .iter()
-                        .filter(|(v, _)| *v != lhs_var)
-                        .map(|(_, l)| l.as_str())
-                        .collect();
-                    other_lits.sort_unstable();
-                    other_lits.dedup();
-                    if other_lits.len() == 1 {
-                        other_lits.first().copied().map(str::to_string)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(lit) = lit {
-                    let patched = replace_ident_as_expr(rhs, lhs_var, &lit);
-                    if patched != rhs && !patched.contains(';') {
-                        let indent = leading_indent(line);
-                        let comment = line.get(binding.len()..).unwrap_or("");
-                        current = format!("{indent}{lhs} = {patched};{comment}");
+            if let Some(eq) = t.find(" = ") {
+                let lhs = t[..eq].trim();
+                let lhs_var = lhs.rsplit(' ').next().unwrap_or(lhs);
+                let rhs = t[eq + 3..].trim_end_matches(';').trim();
+                if is_temp_like_name(lhs_var)
+                    && ident_occurs(rhs, lhs_var)
+                    && !is_simple_arith_expr(rhs)
+                {
+                    let lit = preceding_same_var_literal(&lines, idx, lhs_var).or_else(|| {
+                        let mut other_lits: Vec<&str> = literal_temps
+                            .iter()
+                            .filter(|(v, _)| *v != lhs_var)
+                            .map(|(_, l)| l.as_str())
+                            .collect();
+                        other_lits.sort_unstable();
+                        other_lits.dedup();
+                        if other_lits.len() == 1 {
+                            other_lits.first().copied().map(str::to_string)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(lit) = lit {
+                        let patched = replace_ident_as_expr(rhs, lhs_var, &lit);
+                        if patched != rhs && !patched.contains(';') {
+                            let indent = leading_indent(line);
+                            let comment = line.get(binding.len()..).unwrap_or("");
+                            current = format!("{indent}{lhs} = {patched};{comment}");
+                        }
                     }
                 }
             }
-        }
         }
         out.push_str(&current);
         if idx < lines.len().saturating_sub(1) {
@@ -301,7 +304,6 @@ pub(crate) fn repair_self_referential_call_args(body: &str) -> String {
     }
     out
 }
-
 
 /// Recognize `out[idx] = arr[i];` plus nearby `idx++;` / `i++;` → `out[idx++] = arr[i++];`.
 pub(crate) fn restore_array_store_postincrement(body: &str) -> String {
@@ -314,7 +316,9 @@ pub(crate) fn restore_array_store_postincrement(body: &str) -> String {
             i += skip;
             continue;
         }
-        if let Some((replacement, skip, indent, comment)) = try_ssa_copy_postincrement_store(&lines, i) {
+        if let Some((replacement, skip, indent, comment)) =
+            try_ssa_copy_postincrement_store(&lines, i)
+        {
             out.push_str(&format!("{indent}{replacement};{comment}\n"));
             i += skip;
             continue;

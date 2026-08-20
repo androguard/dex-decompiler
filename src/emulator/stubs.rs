@@ -18,14 +18,14 @@ pub struct StubResult {
 /// `method_sig` is the resolved method reference (e.g. `java.io.PrintStream.println(java.lang.String)`).
 /// `arg_regs` is the list of register numbers passed to the invoke.
 /// Returns `Some(StubResult)` if handled, `None` if not a known stub.
-pub fn try_stub(
-    emu: &mut Emulator,
-    method_sig: &str,
-    arg_regs: &[u32],
-) -> Option<StubResult> {
+pub fn try_stub(emu: &mut Emulator, method_sig: &str, arg_regs: &[u32]) -> Option<StubResult> {
     // Normalize: strip parameter types to get "Class.method" for matching.
     let paren_pos = method_sig.find('(');
-    let base = if let Some(p) = paren_pos { &method_sig[..p] } else { method_sig };
+    let base = if let Some(p) = paren_pos {
+        &method_sig[..p]
+    } else {
+        method_sig
+    };
 
     match base {
         // ---- java.io.PrintStream ----
@@ -101,7 +101,9 @@ pub fn try_stub(
         // ---- android.content.Intent ----
         "android.content.Intent.<init>" => Some(stub_intent_init(emu, arg_regs)),
         "android.content.Intent.putExtra" => Some(stub_intent_put_extra(emu, arg_regs)),
-        "android.content.Intent.getStringExtra" => Some(stub_intent_get_string_extra(emu, arg_regs)),
+        "android.content.Intent.getStringExtra" => {
+            Some(stub_intent_get_string_extra(emu, arg_regs))
+        }
 
         _ => None,
     }
@@ -153,10 +155,18 @@ fn stub_print(emu: &mut Emulator, base: &str, args: &[u32]) -> StubResult {
     } else {
         String::new()
     };
-    let line = if newline { format!("{}\n", text) } else { text.clone() };
+    let line = if newline {
+        format!("{}\n", text)
+    } else {
+        text.clone()
+    };
     StubResult {
         result: None,
-        description: format!("{}(\"{}\")", base.rsplit('.').next().unwrap_or("print"), text),
+        description: format!(
+            "{}(\"{}\")",
+            base.rsplit('.').next().unwrap_or("print"),
+            text
+        ),
         console_line: Some(line),
     }
 }
@@ -174,7 +184,11 @@ fn stub_sb_init(emu: &mut Emulator, args: &[u32]) -> StubResult {
             };
         }
     }
-    StubResult { result: None, description: "StringBuilder.<init>()".into(), console_line: None }
+    StubResult {
+        result: None,
+        description: "StringBuilder.<init>()".into(),
+        console_line: None,
+    }
 }
 
 fn stub_sb_append(emu: &mut Emulator, args: &[u32]) -> StubResult {
@@ -196,7 +210,11 @@ fn stub_sb_append(emu: &mut Emulator, args: &[u32]) -> StubResult {
             };
         }
     }
-    StubResult { result: None, description: "StringBuilder.append(?)".into(), console_line: None }
+    StubResult {
+        result: None,
+        description: "StringBuilder.append(?)".into(),
+        console_line: None,
+    }
 }
 
 fn stub_sb_to_string(emu: &Emulator, args: &[u32]) -> StubResult {
@@ -210,7 +228,11 @@ fn stub_sb_to_string(emu: &Emulator, args: &[u32]) -> StubResult {
             };
         }
     }
-    StubResult { result: Some(Value::Str(String::new())), description: "StringBuilder.toString()".into(), console_line: None }
+    StubResult {
+        result: Some(Value::Str(String::new())),
+        description: "StringBuilder.toString()".into(),
+        console_line: None,
+    }
 }
 
 fn stub_sb_length(emu: &Emulator, args: &[u32]) -> StubResult {
@@ -224,155 +246,391 @@ fn stub_sb_length(emu: &Emulator, args: &[u32]) -> StubResult {
             };
         }
     }
-    StubResult { result: Some(Value::Int(0)), description: "StringBuilder.length() → 0".into(), console_line: None }
+    StubResult {
+        result: Some(Value::Int(0)),
+        description: "StringBuilder.length() → 0".into(),
+        console_line: None,
+    }
 }
 
 // ========== String ==========
 
 fn stub_string_length(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if let Some(&r) = args.first() { read_string(emu, r) } else { String::new() };
+    let s = if let Some(&r) = args.first() {
+        read_string(emu, r)
+    } else {
+        String::new()
+    };
     let len = s.len() as i32;
-    StubResult { result: Some(Value::Int(len)), description: format!("String.length() → {}", len), console_line: None }
+    StubResult {
+        result: Some(Value::Int(len)),
+        description: format!("String.length() → {}", len),
+        console_line: None,
+    }
 }
 
 fn stub_string_equals(emu: &Emulator, args: &[u32]) -> StubResult {
-    let a = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
-    let b = if args.len() >= 2 { read_string(emu, args[1]) } else { String::new() };
+    let a = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
+    let b = if args.len() >= 2 {
+        read_string(emu, args[1])
+    } else {
+        String::new()
+    };
     let eq = a == b;
-    StubResult { result: Some(Value::Int(if eq { 1 } else { 0 })), description: format!("String.equals({}, {}) → {}", a, b, eq), console_line: None }
+    StubResult {
+        result: Some(Value::Int(if eq { 1 } else { 0 })),
+        description: format!("String.equals({}, {}) → {}", a, b, eq),
+        console_line: None,
+    }
 }
 
 fn stub_string_charat(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
-    let idx = if args.len() >= 2 { read_int(emu, args[1]) } else { 0 };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
+    let idx = if args.len() >= 2 {
+        read_int(emu, args[1])
+    } else {
+        0
+    };
     let ch = s.chars().nth(idx as usize).map(|c| c as i32).unwrap_or(0);
-    StubResult { result: Some(Value::Int(ch)), description: format!("String.charAt({}) → '{}'", idx, ch as u8 as char), console_line: None }
+    StubResult {
+        result: Some(Value::Int(ch)),
+        description: format!("String.charAt({}) → '{}'", idx, ch as u8 as char),
+        console_line: None,
+    }
 }
 
 fn stub_string_substring(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
-    let begin = if args.len() >= 2 { read_int(emu, args[1]) as usize } else { 0 };
-    let end = if args.len() >= 3 { read_int(emu, args[2]) as usize } else { s.len() };
-    let sub: String = s.chars().skip(begin).take(end.saturating_sub(begin)).collect();
-    StubResult { result: Some(Value::Str(sub.clone())), description: format!("String.substring({},{}) → \"{}\"", begin, end, sub), console_line: None }
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
+    let begin = if args.len() >= 2 {
+        read_int(emu, args[1]) as usize
+    } else {
+        0
+    };
+    let end = if args.len() >= 3 {
+        read_int(emu, args[2]) as usize
+    } else {
+        s.len()
+    };
+    let sub: String = s
+        .chars()
+        .skip(begin)
+        .take(end.saturating_sub(begin))
+        .collect();
+    StubResult {
+        result: Some(Value::Str(sub.clone())),
+        description: format!("String.substring({},{}) → \"{}\"", begin, end, sub),
+        console_line: None,
+    }
 }
 
 fn stub_string_indexof(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
-    let needle = if args.len() >= 2 { read_string(emu, args[1]) } else { String::new() };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
+    let needle = if args.len() >= 2 {
+        read_string(emu, args[1])
+    } else {
+        String::new()
+    };
     let idx = s.find(&needle).map(|i| i as i32).unwrap_or(-1);
-    StubResult { result: Some(Value::Int(idx)), description: format!("String.indexOf(\"{}\") → {}", needle, idx), console_line: None }
+    StubResult {
+        result: Some(Value::Int(idx)),
+        description: format!("String.indexOf(\"{}\") → {}", needle, idx),
+        console_line: None,
+    }
 }
 
 fn stub_string_contains(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
-    let needle = if args.len() >= 2 { read_string(emu, args[1]) } else { String::new() };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
+    let needle = if args.len() >= 2 {
+        read_string(emu, args[1])
+    } else {
+        String::new()
+    };
     let c = s.contains(&needle);
-    StubResult { result: Some(Value::Int(if c { 1 } else { 0 })), description: format!("String.contains(\"{}\") → {}", needle, c), console_line: None }
+    StubResult {
+        result: Some(Value::Int(if c { 1 } else { 0 })),
+        description: format!("String.contains(\"{}\") → {}", needle, c),
+        console_line: None,
+    }
 }
 
 fn stub_string_isempty(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
     let empty = s.is_empty();
-    StubResult { result: Some(Value::Int(if empty { 1 } else { 0 })), description: format!("String.isEmpty() → {}", empty), console_line: None }
+    StubResult {
+        result: Some(Value::Int(if empty { 1 } else { 0 })),
+        description: format!("String.isEmpty() → {}", empty),
+        console_line: None,
+    }
 }
 
 fn stub_string_valueof(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { "null".into() };
-    StubResult { result: Some(Value::Str(s.clone())), description: format!("String.valueOf() → \"{}\"", s), console_line: None }
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        "null".into()
+    };
+    StubResult {
+        result: Some(Value::Str(s.clone())),
+        description: format!("String.valueOf() → \"{}\"", s),
+        console_line: None,
+    }
 }
 
 fn stub_string_concat(emu: &Emulator, args: &[u32]) -> StubResult {
-    let a = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
-    let b = if args.len() >= 2 { read_string(emu, args[1]) } else { String::new() };
+    let a = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
+    let b = if args.len() >= 2 {
+        read_string(emu, args[1])
+    } else {
+        String::new()
+    };
     let r = format!("{}{}", a, b);
-    StubResult { result: Some(Value::Str(r.clone())), description: format!("String.concat() → \"{}\"", r), console_line: None }
+    StubResult {
+        result: Some(Value::Str(r.clone())),
+        description: format!("String.concat() → \"{}\"", r),
+        console_line: None,
+    }
 }
 
 fn stub_string_startswith(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
-    let pfx = if args.len() >= 2 { read_string(emu, args[1]) } else { String::new() };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
+    let pfx = if args.len() >= 2 {
+        read_string(emu, args[1])
+    } else {
+        String::new()
+    };
     let r = s.starts_with(&pfx);
-    StubResult { result: Some(Value::Int(if r { 1 } else { 0 })), description: format!("String.startsWith(\"{}\") → {}", pfx, r), console_line: None }
+    StubResult {
+        result: Some(Value::Int(if r { 1 } else { 0 })),
+        description: format!("String.startsWith(\"{}\") → {}", pfx, r),
+        console_line: None,
+    }
 }
 
 fn stub_string_endswith(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
-    let sfx = if args.len() >= 2 { read_string(emu, args[1]) } else { String::new() };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
+    let sfx = if args.len() >= 2 {
+        read_string(emu, args[1])
+    } else {
+        String::new()
+    };
     let r = s.ends_with(&sfx);
-    StubResult { result: Some(Value::Int(if r { 1 } else { 0 })), description: format!("String.endsWith(\"{}\") → {}", sfx, r), console_line: None }
+    StubResult {
+        result: Some(Value::Int(if r { 1 } else { 0 })),
+        description: format!("String.endsWith(\"{}\") → {}", sfx, r),
+        console_line: None,
+    }
 }
 
 fn stub_string_trim(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
     let r = s.trim().to_string();
-    StubResult { result: Some(Value::Str(r.clone())), description: format!("String.trim() → \"{}\"", r), console_line: None }
+    StubResult {
+        result: Some(Value::Str(r.clone())),
+        description: format!("String.trim() → \"{}\"", r),
+        console_line: None,
+    }
 }
 
 fn stub_string_touppercase(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
     let r = s.to_uppercase();
-    StubResult { result: Some(Value::Str(r.clone())), description: format!("String.toUpperCase() → \"{}\"", r), console_line: None }
+    StubResult {
+        result: Some(Value::Str(r.clone())),
+        description: format!("String.toUpperCase() → \"{}\"", r),
+        console_line: None,
+    }
 }
 
 fn stub_string_tolowercase(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
     let r = s.to_lowercase();
-    StubResult { result: Some(Value::Str(r.clone())), description: format!("String.toLowerCase() → \"{}\"", r), console_line: None }
+    StubResult {
+        result: Some(Value::Str(r.clone())),
+        description: format!("String.toLowerCase() → \"{}\"", r),
+        console_line: None,
+    }
 }
 
 fn stub_string_replace(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { String::new() };
-    let old = if args.len() >= 2 { read_string(emu, args[1]) } else { String::new() };
-    let new = if args.len() >= 3 { read_string(emu, args[2]) } else { String::new() };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        String::new()
+    };
+    let old = if args.len() >= 2 {
+        read_string(emu, args[1])
+    } else {
+        String::new()
+    };
+    let new = if args.len() >= 3 {
+        read_string(emu, args[2])
+    } else {
+        String::new()
+    };
     let r = s.replace(&old, &new);
-    StubResult { result: Some(Value::Str(r.clone())), description: format!("String.replace(\"{}\",\"{}\") → \"{}\"", old, new, r), console_line: None }
+    StubResult {
+        result: Some(Value::Str(r.clone())),
+        description: format!("String.replace(\"{}\",\"{}\") → \"{}\"", old, new, r),
+        console_line: None,
+    }
 }
 
 // ========== Integer ==========
 
 fn stub_integer_parseint(emu: &Emulator, args: &[u32]) -> StubResult {
-    let s = if args.len() >= 1 { read_string(emu, args[0]) } else { "0".into() };
+    let s = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        "0".into()
+    };
     let v = s.parse::<i32>().unwrap_or(0);
-    StubResult { result: Some(Value::Int(v)), description: format!("Integer.parseInt(\"{}\") → {}", s, v), console_line: None }
+    StubResult {
+        result: Some(Value::Int(v)),
+        description: format!("Integer.parseInt(\"{}\") → {}", s, v),
+        console_line: None,
+    }
 }
 
 fn stub_integer_valueof(emu: &Emulator, args: &[u32]) -> StubResult {
-    let v = if args.len() >= 1 { read_int(emu, args[0]) } else { 0 };
-    StubResult { result: Some(Value::Int(v)), description: format!("Integer.valueOf({}) → {}", v, v), console_line: None }
+    let v = if args.len() >= 1 {
+        read_int(emu, args[0])
+    } else {
+        0
+    };
+    StubResult {
+        result: Some(Value::Int(v)),
+        description: format!("Integer.valueOf({}) → {}", v, v),
+        console_line: None,
+    }
 }
 
 fn stub_integer_tostring(emu: &Emulator, args: &[u32]) -> StubResult {
-    let v = if args.len() >= 1 { read_int(emu, args[0]) } else { 0 };
+    let v = if args.len() >= 1 {
+        read_int(emu, args[0])
+    } else {
+        0
+    };
     let s = v.to_string();
-    StubResult { result: Some(Value::Str(s.clone())), description: format!("Integer.toString({}) → \"{}\"", v, s), console_line: None }
+    StubResult {
+        result: Some(Value::Str(s.clone())),
+        description: format!("Integer.toString({}) → \"{}\"", v, s),
+        console_line: None,
+    }
 }
 
 fn stub_integer_intvalue(emu: &Emulator, args: &[u32]) -> StubResult {
-    let v = if args.len() >= 1 { read_int(emu, args[0]) } else { 0 };
-    StubResult { result: Some(Value::Int(v)), description: format!("Integer.intValue() → {}", v), console_line: None }
+    let v = if args.len() >= 1 {
+        read_int(emu, args[0])
+    } else {
+        0
+    };
+    StubResult {
+        result: Some(Value::Int(v)),
+        description: format!("Integer.intValue() → {}", v),
+        console_line: None,
+    }
 }
 
 // ========== Math ==========
 
 fn stub_math_max(emu: &Emulator, args: &[u32]) -> StubResult {
-    let a = if args.len() >= 1 { read_int(emu, args[0]) } else { 0 };
-    let b = if args.len() >= 2 { read_int(emu, args[1]) } else { 0 };
+    let a = if args.len() >= 1 {
+        read_int(emu, args[0])
+    } else {
+        0
+    };
+    let b = if args.len() >= 2 {
+        read_int(emu, args[1])
+    } else {
+        0
+    };
     let r = a.max(b);
-    StubResult { result: Some(Value::Int(r)), description: format!("Math.max({}, {}) → {}", a, b, r), console_line: None }
+    StubResult {
+        result: Some(Value::Int(r)),
+        description: format!("Math.max({}, {}) → {}", a, b, r),
+        console_line: None,
+    }
 }
 
 fn stub_math_min(emu: &Emulator, args: &[u32]) -> StubResult {
-    let a = if args.len() >= 1 { read_int(emu, args[0]) } else { 0 };
-    let b = if args.len() >= 2 { read_int(emu, args[1]) } else { 0 };
+    let a = if args.len() >= 1 {
+        read_int(emu, args[0])
+    } else {
+        0
+    };
+    let b = if args.len() >= 2 {
+        read_int(emu, args[1])
+    } else {
+        0
+    };
     let r = a.min(b);
-    StubResult { result: Some(Value::Int(r)), description: format!("Math.min({}, {}) → {}", a, b, r), console_line: None }
+    StubResult {
+        result: Some(Value::Int(r)),
+        description: format!("Math.min({}, {}) → {}", a, b, r),
+        console_line: None,
+    }
 }
 
 fn stub_math_abs(emu: &Emulator, args: &[u32]) -> StubResult {
-    let a = if args.len() >= 1 { read_int(emu, args[0]) } else { 0 };
+    let a = if args.len() >= 1 {
+        read_int(emu, args[0])
+    } else {
+        0
+    };
     let r = a.abs();
-    StubResult { result: Some(Value::Int(r)), description: format!("Math.abs({}) → {}", a, r), console_line: None }
+    StubResult {
+        result: Some(Value::Int(r)),
+        description: format!("Math.abs({}) → {}", a, r),
+        console_line: None,
+    }
 }
 
 // ========== System.arraycopy ==========
@@ -380,7 +638,11 @@ fn stub_math_abs(emu: &Emulator, args: &[u32]) -> StubResult {
 fn stub_arraycopy(emu: &mut Emulator, args: &[u32]) -> StubResult {
     // arraycopy(src, srcPos, dst, dstPos, length) — 5 args, all registers
     if args.len() < 5 {
-        return StubResult { result: None, description: "System.arraycopy (insufficient args)".into(), console_line: None };
+        return StubResult {
+            result: None,
+            description: "System.arraycopy (insufficient args)".into(),
+            console_line: None,
+        };
     }
     let src_val = emu.get_reg(args[0]).cloned().unwrap_or(Value::Null);
     let src_pos = read_int(emu, args[1]) as usize;
@@ -392,8 +654,12 @@ fn stub_arraycopy(emu: &mut Emulator, args: &[u32]) -> StubResult {
         let copied: Vec<Value> = if let Some(obj) = emu.heap.get(*src_idx) {
             if let HeapObjectKind::Array { ref values, .. } = obj.kind {
                 values.iter().skip(src_pos).take(length).cloned().collect()
-            } else { vec![] }
-        } else { vec![] };
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
         if let Some(obj) = emu.heap.get_mut(*dst_idx) {
             if let HeapObjectKind::Array { ref mut values, .. } = obj.kind {
                 for (i, v) in copied.into_iter().enumerate() {
@@ -404,7 +670,11 @@ fn stub_arraycopy(emu: &mut Emulator, args: &[u32]) -> StubResult {
             }
         }
     }
-    StubResult { result: None, description: format!("System.arraycopy(len={})", length), console_line: None }
+    StubResult {
+        result: None,
+        description: format!("System.arraycopy(len={})", length),
+        console_line: None,
+    }
 }
 
 // ========== Arrays.fill ==========
@@ -416,20 +686,34 @@ fn stub_arrays_fill(emu: &mut Emulator, args: &[u32]) -> StubResult {
         if let Value::Ref(idx) = arr_val {
             if let Some(obj) = emu.heap.get_mut(idx) {
                 if let HeapObjectKind::Array { ref mut values, .. } = obj.kind {
-                    for v in values.iter_mut() { *v = fill_val.clone(); }
+                    for v in values.iter_mut() {
+                        *v = fill_val.clone();
+                    }
                 }
             }
         }
     }
-    StubResult { result: None, description: "Arrays.fill()".into(), console_line: None }
+    StubResult {
+        result: None,
+        description: "Arrays.fill()".into(),
+        console_line: None,
+    }
 }
 
 // ========== android.util.Log ==========
 
 fn stub_android_log(emu: &mut Emulator, base: &str, args: &[u32]) -> StubResult {
     let level = base.rsplit('.').next().unwrap_or("d");
-    let tag = if args.len() >= 1 { read_string(emu, args[0]) } else { "?".into() };
-    let msg = if args.len() >= 2 { read_string(emu, args[1]) } else { "".into() };
+    let tag = if args.len() >= 1 {
+        read_string(emu, args[0])
+    } else {
+        "?".into()
+    };
+    let msg = if args.len() >= 2 {
+        read_string(emu, args[1])
+    } else {
+        "".into()
+    };
     let line = format!("[Log.{}] {}: {}", level, tag, msg);
     StubResult {
         result: Some(Value::Int(0)),
@@ -450,7 +734,11 @@ fn stub_bundle_init(emu: &mut Emulator, args: &[u32]) -> StubResult {
             }
         }
     }
-    StubResult { result: None, description: "Bundle.<init>()".into(), console_line: None }
+    StubResult {
+        result: None,
+        description: "Bundle.<init>()".into(),
+        console_line: None,
+    }
 }
 
 fn stub_bundle_put(emu: &mut Emulator, args: &[u32], op: &str) -> StubResult {
@@ -465,9 +753,17 @@ fn stub_bundle_put(emu: &mut Emulator, args: &[u32], op: &str) -> StubResult {
                 }
             }
         }
-        return StubResult { result: None, description: format!("Bundle.{}(\"{}\", {})", op, key, val.display_short()), console_line: None };
+        return StubResult {
+            result: None,
+            description: format!("Bundle.{}(\"{}\", {})", op, key, val.display_short()),
+            console_line: None,
+        };
     }
-    StubResult { result: None, description: format!("Bundle.{}(?)", op), console_line: None }
+    StubResult {
+        result: None,
+        description: format!("Bundle.{}(?)", op),
+        console_line: None,
+    }
 }
 
 fn stub_bundle_get_string(emu: &Emulator, args: &[u32]) -> StubResult {
@@ -478,14 +774,30 @@ fn stub_bundle_get_string(emu: &Emulator, args: &[u32]) -> StubResult {
             if let Some(obj) = emu.heap.get(idx) {
                 if let HeapObjectKind::Instance { ref fields, .. } = obj.kind {
                     if let Some(val) = fields.get(&key) {
-                        return StubResult { result: Some(val.clone()), description: format!("Bundle.getString(\"{}\") → {}", key, val.display_short()), console_line: None };
+                        return StubResult {
+                            result: Some(val.clone()),
+                            description: format!(
+                                "Bundle.getString(\"{}\") → {}",
+                                key,
+                                val.display_short()
+                            ),
+                            console_line: None,
+                        };
                     }
                 }
             }
         }
-        return StubResult { result: Some(Value::Null), description: format!("Bundle.getString(\"{}\") → null", key), console_line: None };
+        return StubResult {
+            result: Some(Value::Null),
+            description: format!("Bundle.getString(\"{}\") → null", key),
+            console_line: None,
+        };
     }
-    StubResult { result: Some(Value::Null), description: "Bundle.getString(?)".into(), console_line: None }
+    StubResult {
+        result: Some(Value::Null),
+        description: "Bundle.getString(?)".into(),
+        console_line: None,
+    }
 }
 
 fn stub_bundle_get_int(emu: &Emulator, args: &[u32]) -> StubResult {
@@ -497,14 +809,26 @@ fn stub_bundle_get_int(emu: &Emulator, args: &[u32]) -> StubResult {
                 if let HeapObjectKind::Instance { ref fields, .. } = obj.kind {
                     if let Some(val) = fields.get(&key) {
                         let v = val.as_int().unwrap_or(0);
-                        return StubResult { result: Some(Value::Int(v)), description: format!("Bundle.getInt(\"{}\") → {}", key, v), console_line: None };
+                        return StubResult {
+                            result: Some(Value::Int(v)),
+                            description: format!("Bundle.getInt(\"{}\") → {}", key, v),
+                            console_line: None,
+                        };
                     }
                 }
             }
         }
-        return StubResult { result: Some(Value::Int(0)), description: format!("Bundle.getInt(\"{}\") → 0", key), console_line: None };
+        return StubResult {
+            result: Some(Value::Int(0)),
+            description: format!("Bundle.getInt(\"{}\") → 0", key),
+            console_line: None,
+        };
     }
-    StubResult { result: Some(Value::Int(0)), description: "Bundle.getInt(?)".into(), console_line: None }
+    StubResult {
+        result: Some(Value::Int(0)),
+        description: "Bundle.getInt(?)".into(),
+        console_line: None,
+    }
 }
 
 // ========== android.content.Intent ==========
@@ -519,7 +843,11 @@ fn stub_intent_init(emu: &mut Emulator, args: &[u32]) -> StubResult {
             }
         }
     }
-    StubResult { result: None, description: "Intent.<init>()".into(), console_line: None }
+    StubResult {
+        result: None,
+        description: "Intent.<init>()".into(),
+        console_line: None,
+    }
 }
 
 fn stub_intent_put_extra(emu: &mut Emulator, args: &[u32]) -> StubResult {
@@ -540,7 +868,11 @@ fn stub_intent_put_extra(emu: &mut Emulator, args: &[u32]) -> StubResult {
             console_line: None,
         };
     }
-    StubResult { result: None, description: "Intent.putExtra(?)".into(), console_line: None }
+    StubResult {
+        result: None,
+        description: "Intent.putExtra(?)".into(),
+        console_line: None,
+    }
 }
 
 fn stub_intent_get_string_extra(emu: &Emulator, args: &[u32]) -> StubResult {
@@ -551,14 +883,30 @@ fn stub_intent_get_string_extra(emu: &Emulator, args: &[u32]) -> StubResult {
             if let Some(obj) = emu.heap.get(idx) {
                 if let HeapObjectKind::Instance { ref fields, .. } = obj.kind {
                     if let Some(val) = fields.get(&key) {
-                        return StubResult { result: Some(val.clone()), description: format!("Intent.getStringExtra(\"{}\") → {}", key, val.display_short()), console_line: None };
+                        return StubResult {
+                            result: Some(val.clone()),
+                            description: format!(
+                                "Intent.getStringExtra(\"{}\") → {}",
+                                key,
+                                val.display_short()
+                            ),
+                            console_line: None,
+                        };
                     }
                 }
             }
         }
-        return StubResult { result: Some(Value::Null), description: format!("Intent.getStringExtra(\"{}\") → null", key), console_line: None };
+        return StubResult {
+            result: Some(Value::Null),
+            description: format!("Intent.getStringExtra(\"{}\") → null", key),
+            console_line: None,
+        };
     }
-    StubResult { result: Some(Value::Null), description: "Intent.getStringExtra(?)".into(), console_line: None }
+    StubResult {
+        result: Some(Value::Null),
+        description: "Intent.getStringExtra(?)".into(),
+        console_line: None,
+    }
 }
 
 /// List all stubbed method prefixes for documentation / UI.

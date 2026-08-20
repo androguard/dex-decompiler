@@ -99,7 +99,8 @@ struct RulesFile {
 
 /// Load rules from a YAML file (`rules: [...]`).
 pub fn load_rules_from_yaml_file(path: &Path) -> Result<Vec<SemgrepRule>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     load_rules_from_str(&text).map_err(|e| format!("{}: {}", path.display(), e))
 }
 

@@ -35,7 +35,13 @@ pub fn scan_rce_dynamic_loading(
     class_name: &str,
     method_name: &str,
 ) -> Vec<VulnFinding> {
-    let mut out = invoke_scan(owned, class_name, method_name, "rce_dynamic_loading", RCE_PATTERNS);
+    let mut out = invoke_scan(
+        owned,
+        class_name,
+        method_name,
+        "rce_dynamic_loading",
+        RCE_PATTERNS,
+    );
     out.extend(source_sink_scan(
         owned,
         class_name,

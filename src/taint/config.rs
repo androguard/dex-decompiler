@@ -23,7 +23,8 @@ pub struct TaintConfig {
 
 impl TaintConfig {
     pub fn from_json_str(s: &str) -> Result<Self> {
-        serde_json::from_str(s).map_err(|e| DexDecompilerError::Decompilation(format!("taint config: {e}")))
+        serde_json::from_str(s)
+            .map_err(|e| DexDecompilerError::Decompilation(format!("taint config: {e}")))
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
@@ -45,6 +46,14 @@ impl TaintConfig {
         self.sources
             .iter()
             .find(|s| super::models::pattern_matches(method_ref, &s.patterns))
+    }
+
+    /// All matching source models. A callback may seed more than one argument/kind.
+    pub fn find_sources(&self, method_ref: &str) -> Vec<&SourceModel> {
+        self.sources
+            .iter()
+            .filter(|s| super::models::pattern_matches(method_ref, &s.patterns))
+            .collect()
     }
 
     pub fn find_sink(&self, method_ref: &str) -> Option<&SinkModel> {

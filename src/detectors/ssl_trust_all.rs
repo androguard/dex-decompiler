@@ -22,9 +22,10 @@ fn trust_all_hints(owned: &ValueFlowAnalysisOwned) -> bool {
             || u.contains("DO_NOT_VERIFY")
             || u.contains("NULLHOSTNAMEVERIFIER")
             || (u.contains("RETURN") && u.contains("TRUE") && u.contains("VERIFY"))
-    }) || owned.invoke_method_map.values().any(|m| {
-        m.contains("NullHostnameVerifier") || m.contains("AllowAllHostnameVerifier")
-    })
+    }) || owned
+        .invoke_method_map
+        .values()
+        .any(|m| m.contains("NullHostnameVerifier") || m.contains("AllowAllHostnameVerifier"))
 }
 
 pub fn scan_ssl_trust_all(

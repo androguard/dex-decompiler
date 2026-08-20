@@ -5,7 +5,12 @@ use crate::detectors::types::{method_matches_any, VulnFinding};
 
 const WEAK_CHECKS: &[&str] = &["contains", "endsWith", "startsWith", "indexOf"];
 const HOST_APIS: &[&str] = &["getHost", "getAuthority", "Uri.getHost", "toString"];
-const WEBVIEW_LOAD: &[&str] = &["loadUrl", "loadData", "loadDataWithBaseURL", "startActivity"];
+const WEBVIEW_LOAD: &[&str] = &[
+    "loadUrl",
+    "loadData",
+    "loadDataWithBaseURL",
+    "startActivity",
+];
 
 pub fn scan_weak_host_validation(
     owned: &ValueFlowAnalysisOwned,

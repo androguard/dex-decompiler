@@ -138,7 +138,11 @@ pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>
     fn rename_expr(expr: IrExpr, stacks: &HashMap<u32, Vec<u32>>) -> IrExpr {
         match expr {
             IrExpr::Var(v) => {
-                let ver = stacks.get(&v.reg).and_then(|s| s.last()).copied().unwrap_or(0);
+                let ver = stacks
+                    .get(&v.reg)
+                    .and_then(|s| s.last())
+                    .copied()
+                    .unwrap_or(0);
                 IrExpr::Var(VarId::new(v.reg, ver))
             }
             IrExpr::Call { target, args } => IrExpr::Call {
@@ -159,7 +163,11 @@ pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>
         super::pass::rename_vars_in_text_public(s, &cur)
     }
 
-    fn new_name(reg: u32, next_ver: &mut HashMap<u32, u32>, stacks: &mut HashMap<u32, Vec<u32>>) -> VarId {
+    fn new_name(
+        reg: u32,
+        next_ver: &mut HashMap<u32, u32>,
+        stacks: &mut HashMap<u32, Vec<u32>>,
+    ) -> VarId {
         let v = next_ver.entry(reg).or_insert(0);
         *v += 1;
         let ver = *v;

@@ -95,17 +95,18 @@ mod tests {
         rw_map.insert(0, (vec![], vec![0]));
         rw_map.insert(2, (vec![0], vec![]));
         let mut invoke_method_map = HashMap::new();
-        invoke_method_map.insert(2, "android.database.sqlite.SQLiteDatabase.rawQuery".to_string());
+        invoke_method_map.insert(
+            2,
+            "android.database.sqlite.SQLiteDatabase.rawQuery".to_string(),
+        );
         let mut insn_at = HashMap::new();
         insn_at.insert(0, "move-result-object v0".into());
         insn_at.insert(2, "invoke-virtual {v1, v0}, rawQuery".into());
         let owned = ValueFlowAnalysisOwned {
             cfg: make_cfg(vec![0, 2]),
             rw_map,
-            api_return_sources: vec![(
-                (0, 0),
-                "android.net.Uri.getQueryParameter".into(),
-            )],
+            exceptional_edges: vec![],
+            api_return_sources: vec![((0, 0), "android.net.Uri.getQueryParameter".into())],
             invoke_method_map,
             insn_at,
             registers_size: 0,

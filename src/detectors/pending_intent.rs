@@ -45,12 +45,8 @@ const INTENT_FILL_SETTERS: &[&str] = &[
 ];
 
 /// Subset: explicit-target setters (component/class/package).
-const INTENT_EXPLICIT_SETTERS: &[&str] = &[
-    "setComponent",
-    "setClass",
-    "setClassName",
-    "setPackage",
-];
+const INTENT_EXPLICIT_SETTERS: &[&str] =
+    &["setComponent", "setClass", "setClassName", "setPackage"];
 
 /// AICC / “where PI goes” sinks distilled from PITracker `aicc_new.txt`.
 const DANGEROUS_SINKS: &[&str] = &[
@@ -161,7 +157,9 @@ fn prev_offset_in_block(cfg: &MethodCfg) -> HashMap<u32, u32> {
 }
 
 fn is_pending_intent_creation(method_ref: &str) -> bool {
-    PENDING_INTENT_GET_METHODS.iter().any(|m| method_ref.contains(m))
+    PENDING_INTENT_GET_METHODS
+        .iter()
+        .any(|m| method_ref.contains(m))
 }
 
 fn creation_kind(method_ref: &str) -> String {
@@ -275,13 +273,15 @@ fn classify_destination(owned: &ValueFlowAnalysisOwned, flow: &ValueFlowResult) 
     for (off, _reg) in &flow.reads {
         if let Some(method_ref) = owned.invoke_method_map.get(off) {
             if is_dangerous_sink(method_ref) {
-                let kind = if method_ref.contains("Notification") || method_ref.contains("setContentIntent")
+                let kind = if method_ref.contains("Notification")
+                    || method_ref.contains("setContentIntent")
                     || method_ref.contains("setDeleteIntent")
                     || method_ref.contains("setFullScreenIntent")
                     || method_ref.contains("addAction")
                 {
                     "Notification/AICC"
-                } else if method_ref.contains("AlarmManager") || method_ref.contains("setExact")
+                } else if method_ref.contains("AlarmManager")
+                    || method_ref.contains("setExact")
                     || method_ref.contains("setRepeating")
                     || method_ref.contains("setAlarmClock")
                 {
@@ -337,7 +337,8 @@ fn parse_hex_or_dec(tok: &str) -> Option<i64> {
 
 fn flags_from_insn_text(text: &str) -> (bool, bool) {
     let u = text.to_uppercase();
-    let mut mutable = u.contains("FLAG_MUTABLE") || u.contains("0x2000000") || u.contains("0x02000000");
+    let mut mutable =
+        u.contains("FLAG_MUTABLE") || u.contains("0x2000000") || u.contains("0x02000000");
     let mut immutable =
         u.contains("FLAG_IMMUTABLE") || u.contains("0x4000000") || u.contains("0x04000000");
     for tok in text.split(|c: char| c.is_whitespace() || c == '{' || c == '}') {
@@ -353,7 +354,11 @@ fn flags_from_insn_text(text: &str) -> (bool, bool) {
     (mutable, immutable)
 }
 
-fn analyze_flags(owned: &ValueFlowAnalysisOwned, invoke_offset: u32, flag_reg: Option<u32>) -> (bool, bool) {
+fn analyze_flags(
+    owned: &ValueFlowAnalysisOwned,
+    invoke_offset: u32,
+    flag_reg: Option<u32>,
+) -> (bool, bool) {
     let mut mutable = false;
     let mut immutable = false;
     if let Some(text) = owned.insn_at.get(&invoke_offset) {
@@ -476,7 +481,8 @@ mod tests {
         rw_map.insert(4, (vec![0, 1, 2, 3], vec![]));
         rw_map.insert(6, (vec![], vec![4]));
         rw_map.insert(8, (vec![4], vec![]));
-        let api_return_sources = vec![((6, 4), "android.app.PendingIntent.getActivity".to_string())];
+        let api_return_sources =
+            vec![((6, 4), "android.app.PendingIntent.getActivity".to_string())];
         let mut invoke_method_map: HashMap<u32, String> = HashMap::new();
         if intent_has_setter {
             invoke_method_map.insert(0, "android.content.Intent.setAction".to_string());
@@ -493,6 +499,7 @@ mod tests {
         ValueFlowAnalysisOwned {
             cfg,
             rw_map,
+            exceptional_edges: vec![],
             api_return_sources,
             invoke_method_map,
             insn_at: HashMap::new(),

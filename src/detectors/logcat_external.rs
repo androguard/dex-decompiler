@@ -40,9 +40,8 @@ pub fn scan_logcat_external(
     method_name: &str,
 ) -> Vec<VulnFinding> {
     let blob = method_blob(owned);
-    let has_log_dump = blob.contains("logcat")
-        || blob.contains("dmesg")
-        || blob.contains("dumpsys");
+    let has_log_dump =
+        blob.contains("logcat") || blob.contains("dmesg") || blob.contains("dumpsys");
     let has_external = blob.contains("/sdcard")
         || blob.contains("/storage/emulated")
         || blob.contains("getexternalstorage")

@@ -44,7 +44,11 @@ pub fn scan_sqlcipher_passphrase(
                 class_name,
                 method_name,
                 "sqlcipher_hardcoded_passphrase",
-                &["openOrCreateDatabase", "getWritableDatabase", "SupportFactory"],
+                &[
+                    "openOrCreateDatabase",
+                    "getWritableDatabase",
+                    "SupportFactory",
+                ],
             ));
         }
     } else {

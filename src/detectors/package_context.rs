@@ -9,20 +9,27 @@ pub fn scan_package_context_ace(
     class_name: &str,
     method_name: &str,
 ) -> Vec<VulnFinding> {
-    let has_ctx = owned.invoke_method_map.values().any(|m| {
-        m.contains("createPackageContext") || m.contains("Context.createPackageContext")
-    });
+    let has_ctx = owned
+        .invoke_method_map
+        .values()
+        .any(|m| m.contains("createPackageContext") || m.contains("Context.createPackageContext"));
     let has_loader = owned.invoke_method_map.values().any(|m| {
         method_matches_any(
             m,
-            &["getClassLoader", "loadClass", "DexClassLoader", "PathClassLoader"],
+            &[
+                "getClassLoader",
+                "loadClass",
+                "DexClassLoader",
+                "PathClassLoader",
+            ],
         )
     });
     // Signature check reduces risk; still flag if createPackageContext+loadClass present
     // without checkSignatures (common OVAA plugin bug).
-    let has_sig_check = owned.invoke_method_map.values().any(|m| {
-        m.contains("checkSignatures") || m.contains("hasSigningCertificate")
-    });
+    let has_sig_check = owned
+        .invoke_method_map
+        .values()
+        .any(|m| m.contains("checkSignatures") || m.contains("hasSigningCertificate"));
 
     if !(has_ctx && has_loader) {
         return Vec::new();

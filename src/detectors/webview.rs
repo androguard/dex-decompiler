@@ -21,15 +21,9 @@ const WEBVIEW_SINKS: &[&str] = &[
     "loadData",
     "evaluateJavascript",
 ];
-const JAVASCRIPT_INTERFACE_PATTERNS: &[&str] = &[
-    "addJavascriptInterface",
-    "addJavascriptInterfaceOut",
-];
-const URI_PATH_SOURCES: &[&str] = &[
-    "getEncodedPath",
-    "getLastPathSegment",
-    "getPath",
-];
+const JAVASCRIPT_INTERFACE_PATTERNS: &[&str] =
+    &["addJavascriptInterface", "addJavascriptInterfaceOut"];
+const URI_PATH_SOURCES: &[&str] = &["getEncodedPath", "getLastPathSegment", "getPath"];
 const FILE_ACCESS_PATTERNS: &[&str] = &[
     "setAllowFileAccessFromFileURLs",
     "setAllowUniversalAccessFromFileURLs",

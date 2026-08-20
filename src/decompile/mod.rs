@@ -17,8 +17,8 @@ mod read_write;
 pub mod region;
 pub mod rename;
 pub mod resource_consts;
-pub mod ssa;
 mod simplify;
+pub mod ssa;
 pub use simplify::restore_string_switch as simplify_restore_string_switch_for_tests;
 pub use simplify::simplify_method_body as simplify_method_body_for_tests;
 mod try_catch;
@@ -30,29 +30,32 @@ use try_catch::{
 mod type_infer;
 pub mod value_flow;
 
+use crate::error::{DexDecompilerError, Result};
+use crate::java;
 use cfg::{BlockEnd, BlockId, MethodCfg};
+use dex_bytecode::{decode_all, Instruction};
+use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod, NO_INDEX};
+use ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
+use pass::{
+    run_dead_assign_with_used_regs, used_regs, ConstructorMergePass, CopyPropPass, DeadAssignPass,
+    ExprSimplifyPass, InlineFilledArrayPass, InvokeChainPass, Pass, PassRunner, SsaRenamePass,
+};
 use region::{
     as_single_if, build_regions, build_regions_filtered, for_loop_pattern,
-    loop_body_do_while_pattern, loop_body_do_while_exit_in_else, loop_exit_break_target,
+    loop_body_do_while_exit_in_else, loop_body_do_while_pattern, loop_exit_break_target,
     loop_prefix_multi_exit_ifs, region_contains_loop, region_is_empty, region_is_empty_with_cfg,
     Region,
 };
-use dex_bytecode::{decode_all, Instruction};
-use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod, NO_INDEX};
-use crate::error::{DexDecompilerError, Result};
-use crate::java;
-use std::fmt::Write;
-use ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
-use pass::{run_dead_assign_with_used_regs, ConstructorMergePass, CopyPropPass, DeadAssignPass, ExprSimplifyPass, InlineFilledArrayPass, InvokeChainPass, Pass, PassRunner, SsaRenamePass, used_regs};
 use ssa::{apply_canonical_names, construct_ssa, phi_canonical_map, phi_registers, strip_phis};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use type_infer::{
-    build_var_names_with_regs, enrich_types_with_register_map, infer_types,
-    is_primitive_java_type, preferred_debug_type_for_reg, types_compatible_for_naming,
+    build_var_names_with_regs, enrich_types_with_register_map, infer_types, is_primitive_java_type,
+    preferred_debug_type_for_reg, types_compatible_for_naming,
 };
 use value_flow::{
-    build_api_return_sources, build_insn_labels, build_invoke_method_map, build_instruction_rw_map,
+    build_api_return_sources, build_insn_labels, build_instruction_rw_map, build_invoke_method_map,
     ValueFlowAnalysisOwned,
 };
 
@@ -160,9 +163,7 @@ fn is_direct_named_inner(outer: &str, candidate: &str) -> bool {
     let Some(suffix) = candidate.strip_prefix(&prefix) else {
         return false;
     };
-    !suffix.is_empty()
-        && !suffix.contains('$')
-        && !suffix.chars().all(|c| c.is_ascii_digit())
+    !suffix.is_empty() && !suffix.contains('$') && !suffix.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Last emitted statement is return/throw/break/continue (no trailing break needed).
@@ -171,10 +172,7 @@ fn body_ends_with_exit(out: &str) -> bool {
         return false;
     };
     let t = last.trim();
-    t.starts_with("return")
-        || t.starts_with("throw")
-        || t == "break;"
-        || t == "continue;"
+    t.starts_with("return") || t.starts_with("throw") || t == "break;" || t == "continue;"
 }
 
 fn is_synthetic_local_name(s: &str) -> bool {
@@ -189,7 +187,22 @@ fn is_synthetic_local_name(s: &str) -> bool {
     if b.len() >= 2
         && b[0].is_ascii_alphabetic()
         && b[1..].iter().all(|c| c.is_ascii_digit())
-        && matches!(b[0], b'i' | b's' | b'z' | b'j' | b'f' | b'd' | b'l' | b'b' | b'c' | b'v' | b'o' | b't' | b'a' | b'x')
+        && matches!(
+            b[0],
+            b'i' | b's'
+                | b'z'
+                | b'j'
+                | b'f'
+                | b'd'
+                | b'l'
+                | b'b'
+                | b'c'
+                | b'v'
+                | b'o'
+                | b't'
+                | b'a'
+                | b'x'
+        )
     {
         return true;
     }
@@ -202,7 +215,10 @@ fn is_signature_style_name(s: &str) -> bool {
     b.len() >= 2
         && b[0].is_ascii_alphabetic()
         && b[1..].iter().all(|c| c.is_ascii_digit())
-        && matches!(b[0], b'p' | b's' | b'i' | b'z' | b'l' | b'f' | b'd' | b'c' | b'x')
+        && matches!(
+            b[0],
+            b'p' | b's' | b'i' | b'z' | b'l' | b'f' | b'd' | b'c' | b'x'
+        )
 }
 
 fn is_java_ident(name: &str) -> bool {
@@ -256,13 +272,30 @@ fn mark_condition_idents_declared(condition: &str, declared: &mut HashSet<String
             return;
         }
         let name = std::mem::take(cur);
-        if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
+        if !name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
             return;
         }
         if matches!(
             name.as_str(),
-            "true" | "false" | "null" | "new" | "this" | "super" | "instanceof"
-                | "int" | "long" | "boolean" | "byte" | "char" | "short" | "float" | "double"
+            "true"
+                | "false"
+                | "null"
+                | "new"
+                | "this"
+                | "super"
+                | "instanceof"
+                | "int"
+                | "long"
+                | "boolean"
+                | "byte"
+                | "char"
+                | "short"
+                | "float"
+                | "double"
         ) {
             return;
         }
@@ -416,7 +449,8 @@ impl<'a> Decompiler<'a> {
             if base + 2 > data.len() {
                 break;
             }
-            let type_idx = u16::from_le_bytes(data[base..base + 2].try_into().unwrap_or([0; 2])) as u32;
+            let type_idx =
+                u16::from_le_bytes(data[base..base + 2].try_into().unwrap_or([0; 2])) as u32;
             if let Ok(desc) = self.dex.get_type(type_idx) {
                 out.push(java::descriptor_to_java(&desc));
             }
@@ -428,7 +462,8 @@ impl<'a> Decompiler<'a> {
     fn direct_named_inner_defs(&self, outer: &str) -> Result<Vec<ClassDef>> {
         let mut out = Vec::new();
         for class_def_result in self.dex.class_defs() {
-            let class_def = class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let class_def =
+                class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
             let class_type = self
                 .dex
                 .get_type(class_def.class_idx)
@@ -540,8 +575,12 @@ impl<'a> Decompiler<'a> {
         let mut out = String::new();
         let mut first = true;
         for class_def_result in self.dex.class_defs() {
-            let class_def = class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-            let class_type = self.dex.get_type(class_def.class_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let class_def =
+                class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let class_type = self
+                .dex
+                .get_type(class_def.class_idx)
+                .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
             let class_name = java::descriptor_to_java(&class_type);
             if !class_matches_filter(&class_name, self.only_package.as_deref(), &self.exclude) {
                 continue;
@@ -551,11 +590,13 @@ impl<'a> Decompiler<'a> {
                 continue;
             }
             if !first {
-                writeln!(&mut out).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(&mut out)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
             first = false;
             let class_java = self.decompile_class(&class_def)?;
-            write!(&mut out, "{}", class_java).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            write!(&mut out, "{}", class_java)
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
         Ok(out)
     }
@@ -565,7 +606,8 @@ impl<'a> Decompiler<'a> {
         use json_export::{ClassJson, DexJsonExport, FieldJson, MethodJson};
         let mut classes = Vec::new();
         for class_def_result in self.dex.class_defs() {
-            let class_def = class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let class_def =
+                class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
             let class_type = self
                 .dex
                 .get_type(class_def.class_idx)
@@ -635,9 +677,8 @@ impl<'a> Decompiler<'a> {
                 methods,
             });
         }
-        serde_json::to_string_pretty(&DexJsonExport { classes }).map_err(|e| {
-            DexDecompilerError::Decompilation(format!("json export: {e}"))
-        })
+        serde_json::to_string_pretty(&DexJsonExport { classes })
+            .map_err(|e| DexDecompilerError::Decompilation(format!("json export: {e}")))
     }
 
     /// Decompile entire DEX into a directory with package structure (e.g. `out/com/example/MyClass.java`).
@@ -650,8 +691,12 @@ impl<'a> Decompiler<'a> {
     pub fn collect_included_classes(&self) -> Result<Vec<(ClassDef, String)>> {
         let mut out = Vec::new();
         for class_def_result in self.dex.class_defs() {
-            let class_def = class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
-            let class_type = self.dex.get_type(class_def.class_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let class_def =
+                class_def_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let class_type = self
+                .dex
+                .get_type(class_def.class_idx)
+                .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
             let class_name = java::descriptor_to_java(&class_type);
             if is_nested_dex_class(&class_name) {
                 continue;
@@ -684,9 +729,17 @@ impl<'a> Decompiler<'a> {
                 .unwrap_or_else(|| class_name.clone());
             let (rel_dir, file_name) = class_name_to_path(&output_class_name);
             let full_dir = base_path.join(rel_dir);
-            std::fs::create_dir_all(&full_dir).map_err(|e| DexDecompilerError::Decompilation(format!("create dir {}: {}", full_dir.display(), e)))?;
+            std::fs::create_dir_all(&full_dir).map_err(|e| {
+                DexDecompilerError::Decompilation(format!(
+                    "create dir {}: {}",
+                    full_dir.display(),
+                    e
+                ))
+            })?;
             let file_path = full_dir.join(file_name);
-            std::fs::write(&file_path, class_java).map_err(|e| DexDecompilerError::Decompilation(format!("write {}: {}", file_path.display(), e)))?;
+            std::fs::write(&file_path, class_java).map_err(|e| {
+                DexDecompilerError::Decompilation(format!("write {}: {}", file_path.display(), e))
+            })?;
         }
         Ok(())
     }
@@ -839,16 +892,25 @@ impl<'a> Decompiler<'a> {
 
     /// Decompile one class. When `as_member`, skip package/imports (nested class body).
     fn decompile_class_ex(&self, class_def: &ClassDef, as_member: bool) -> Result<String> {
-        let class_type = self.dex.get_type(class_def.class_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let class_type = self
+            .dex
+            .get_type(class_def.class_idx)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
         let class_name = java::descriptor_to_java(&class_type);
         let (package, simple_raw) = split_package_and_class(&class_name);
         let simple_class_name = simple_raw
             .rsplit_once('$')
             .map(|(_, s)| s.to_string())
             .unwrap_or(simple_raw);
-        let class_data = self.dex.get_class_data(class_def).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let class_data = self
+            .dex
+            .get_class_data(class_def)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
         let super_type = if class_def.superclass_idx != NO_INDEX {
-            let s = self.dex.get_type(class_def.superclass_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            let s = self
+                .dex
+                .get_type(class_def.superclass_idx)
+                .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
             shorten_java_names(&java::descriptor_to_java(&s))
         } else {
             "Object".to_string()
@@ -857,7 +919,8 @@ impl<'a> Decompiler<'a> {
         let mut out = String::new();
         if !as_member {
             if !package.is_empty() {
-                writeln!(&mut out, "// package {}", package).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(&mut out, "// package {}", package)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
             let imports = collect_class_imports(
                 self.dex,
@@ -867,18 +930,19 @@ impl<'a> Decompiler<'a> {
                 &package,
             )?;
             for fqn in &imports {
-                writeln!(&mut out, "import {};", fqn).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(&mut out, "import {};", fqn)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
             if !imports.is_empty() {
-                writeln!(&mut out).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(&mut out)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
         }
-        let class_anns = annotations::class_annotations(
-            self.dex.data.as_ref(),
-            class_def,
-            &|idx| self.dex.get_string(idx).ok(),
-        )
-        .unwrap_or_default();
+        let class_anns =
+            annotations::class_annotations(self.dex.data.as_ref(), class_def, &|idx| {
+                self.dex.get_string(idx).ok()
+            })
+            .unwrap_or_default();
         for ann in &class_anns {
             if let Some(line) = annotations::format_annotation_java(
                 ann,
@@ -935,11 +999,18 @@ impl<'a> Decompiler<'a> {
         if ifaces.is_empty() {
             ifaces = self.class_interfaces(class_def);
         }
-        let enum_constants = detect_enum_constants(self.dex, class_def, class_data.as_ref(), &class_name, &super_type);
+        let enum_constants = detect_enum_constants(
+            self.dex,
+            class_def,
+            class_data.as_ref(),
+            &class_name,
+            &super_type,
+        );
         let is_enum = !enum_constants.is_empty();
 
         for f in &flags {
-            write!(&mut out, "{} ", f).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            write!(&mut out, "{} ", f)
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
         let class_kw = if kt.is_data {
             "/* data */ class"
@@ -960,7 +1031,8 @@ impl<'a> Decompiler<'a> {
                 class_kw, simple_class_name, type_params
             )
             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-            if !extends_ty.is_empty() && extends_ty != "java.lang.Object" && extends_ty != "Object" {
+            if !extends_ty.is_empty() && extends_ty != "java.lang.Object" && extends_ty != "Object"
+            {
                 write!(&mut out, " extends {}", shorten_java_names(&extends_ty))
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
@@ -998,7 +1070,8 @@ impl<'a> Decompiler<'a> {
             if is_enum {
                 writeln!(&mut out, "    {}", enum_constants.join(", "))
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                writeln!(&mut out, "    ;").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(&mut out, "    ;")
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
             for f in &cd.static_fields {
                 if let Ok(fi) = self.dex.get_field_info(f.field_idx) {
@@ -1008,7 +1081,8 @@ impl<'a> Decompiler<'a> {
                     let typ = self.field_type_java(class_def, f.field_idx, &fi.typ);
                     let name = fi.name;
                     let fflags = java::access_flags_to_java(f.access_flags, false);
-                    write!(&mut out, "    ").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    write!(&mut out, "    ")
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     if !fflags.is_empty() {
                         write!(&mut out, "{} ", fflags.join(" "))
                             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
@@ -1031,12 +1105,14 @@ impl<'a> Decompiler<'a> {
                     let typ = self.field_type_java(class_def, f.field_idx, &fi.typ);
                     let name = fi.name;
                     let fflags = java::access_flags_to_java(f.access_flags, false);
-                    write!(&mut out, "    ").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    write!(&mut out, "    ")
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     if !fflags.is_empty() {
                         write!(&mut out, "{} ", fflags.join(" "))
                             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     }
-                    writeln!(&mut out, "{} {};", typ, name).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    writeln!(&mut out, "{} {};", typ, name)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 }
             }
             for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
@@ -1045,8 +1121,10 @@ impl<'a> Decompiler<'a> {
                         continue;
                     }
                 }
-                let method_java = self.decompile_method(m, Some(&simple_class_name), Some(&class_name))?;
-                write!(&mut out, "{}", method_java).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                let method_java =
+                    self.decompile_method(m, Some(&simple_class_name), Some(&class_name))?;
+                write!(&mut out, "{}", method_java)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
             self.const_field_reps.borrow_mut().clear();
             self.accessor_reps.borrow_mut().clear();
@@ -1108,9 +1186,16 @@ impl<'a> Decompiler<'a> {
         class_simple_name: Option<&str>,
         class_name: Option<&str>,
     ) -> Result<String> {
-        let info = self.dex.get_method_info(encoded.method_idx).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let info = self
+            .dex
+            .get_method_info(encoded.method_idx)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
         let mut return_type = java::descriptor_to_java(&info.return_type);
-        let mut params: Vec<String> = info.params.iter().map(|p| java::descriptor_to_java(p)).collect();
+        let mut params: Vec<String> = info
+            .params
+            .iter()
+            .map(|p| java::descriptor_to_java(p))
+            .collect();
         let mut type_params = String::new();
         if let Some(cname) = class_name {
             if let Some(class_def) = self.find_class_def(cname) {
@@ -1173,29 +1258,38 @@ impl<'a> Decompiler<'a> {
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
         if flags.contains(&"abstract") || flags.contains(&"native") {
-            writeln!(&mut out, ";").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            writeln!(&mut out, ";")
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             return Ok(out);
         }
         if encoded.code_off == 0 {
-            writeln!(&mut out, "{{ }}").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            writeln!(&mut out, "{{ }}")
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             return Ok(out);
         }
-        let code = self.dex.get_code_item(encoded.code_off).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let code = self
+            .dex
+            .get_code_item(encoded.code_off)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
         // Raw DEX instructions as comments before the method body (only when requested).
         if self.show_bytecode {
             let raw_listing = self.raw_dex_instructions_listing(&code)?;
             if !raw_listing.is_empty() {
-                writeln!(&mut out).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                write!(&mut out, "{}", raw_listing).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(&mut out)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                write!(&mut out, "{}", raw_listing)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
         }
         let body = self.decompile_method_body(&code, encoded, class_name)?;
         writeln!(&mut out, "{{").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-        write!(&mut out, "{}", body).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        write!(&mut out, "{}", body)
+            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         if !body.ends_with('\n') {
             writeln!(&mut out).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
-        writeln!(&mut out, "    }}").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        writeln!(&mut out, "    }}")
+            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         Ok(out)
     }
 
@@ -1207,7 +1301,10 @@ impl<'a> Decompiler<'a> {
         if encoded.code_off == 0 {
             return Ok((vec![], vec![], vec![]));
         }
-        let code = self.dex.get_code_item(encoded.code_off).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let code = self
+            .dex
+            .get_code_item(encoded.code_off)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
         let insns_bytes = code.insns_slice(&*self.dex.data);
         let base_offset = 0usize;
         let instructions = decode_all(insns_bytes, base_offset)
@@ -1241,7 +1338,9 @@ impl<'a> Decompiler<'a> {
                     .instruction_offsets
                     .first()
                     .and_then(|&off| {
-                        instructions.iter().find(|i| (i.offset as usize) + base_offset == off as usize)
+                        instructions
+                            .iter()
+                            .find(|i| (i.offset as usize) + base_offset == off as usize)
                     })
                     .map(|ins| {
                         let ops = self.resolve_operands(ins.operands());
@@ -1298,7 +1397,11 @@ impl<'a> Decompiler<'a> {
         let dex = self.dex_at(slot);
         let class_data_opt = dex.get_class_data(&class_def).ok()?;
         let class_data = class_data_opt.as_ref()?;
-        for encoded in class_data.direct_methods.iter().chain(class_data.virtual_methods.iter()) {
+        for encoded in class_data
+            .direct_methods
+            .iter()
+            .chain(class_data.virtual_methods.iter())
+        {
             if encoded.method_idx == method_idx {
                 return Some(encoded.clone());
             }
@@ -1456,7 +1559,11 @@ impl<'a> Decompiler<'a> {
         let dex = self.dex_at(slot);
         let class_data_opt = dex.get_class_data(&class_def).ok()?;
         let class_data = class_data_opt.as_ref()?;
-        for encoded in class_data.direct_methods.iter().chain(class_data.virtual_methods.iter()) {
+        for encoded in class_data
+            .direct_methods
+            .iter()
+            .chain(class_data.virtual_methods.iter())
+        {
             let info = dex.get_method_info(encoded.method_idx).ok()?;
             if info.name == method_name {
                 return Some(encoded.clone());
@@ -1473,7 +1580,10 @@ impl<'a> Decompiler<'a> {
                 "value_flow_analysis: method has no code".into(),
             ));
         }
-        let code = self.dex.get_code_item(encoded.code_off).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let code = self
+            .dex
+            .get_code_item(encoded.code_off)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
         let insns_bytes = code.insns_slice(&*self.dex.data);
         let base_offset = 0usize;
         let instructions = decode_all(insns_bytes, base_offset)
@@ -1483,14 +1593,84 @@ impl<'a> Decompiler<'a> {
             format_condition(ins.mnemonic(), &resolved)
         };
         // CFG and rw_map use the same offset space (relative to method code start: 0, 2, 4, ...).
-        let cfg = MethodCfg::build(&instructions, insns_bytes, base_offset, &condition_for);
-        let rw_map = build_instruction_rw_map(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
-        let api_return_sources = build_api_return_sources(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
-        let invoke_method_map = build_invoke_method_map(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
-        let insn_at = build_insn_labels(&instructions, base_offset as u32, |ops| self.resolve_operands(ops));
+        let mut cfg = MethodCfg::build(&instructions, insns_bytes, base_offset, &condition_for);
+        let mut exceptional_edges = Vec::new();
+        if code.tries_size > 0 {
+            if let Some(pairs) = try_handler_pairs(&self.dex.data, encoded.code_off, &code) {
+                let mut exception_ranges = Vec::new();
+                let mut handler_leaders = Vec::new();
+                for (try_item, handler) in pairs {
+                    let try_start = try_item.start_addr * 2;
+                    let try_end = (try_item.start_addr + try_item.insn_count as u32) * 2;
+                    let mut handler_starts: Vec<u32> = handler
+                        .handlers
+                        .iter()
+                        .map(|entry| entry.addr * 2)
+                        .collect();
+                    if let Some(catch_all) = handler.catch_all_addr {
+                        handler_starts.push(catch_all * 2);
+                    }
+                    handler_leaders.extend(handler_starts.iter().copied());
+                    exception_ranges.push((try_start, try_end, handler_starts));
+                }
+                cfg.split_at_offsets(&handler_leaders);
+                for (try_start, try_end, handler_starts) in exception_ranges {
+                    exceptional_edges.extend(cfg.exceptional_edges_for_range(
+                        try_start,
+                        try_end,
+                        &handler_starts,
+                    ));
+                }
+                exceptional_edges.sort_unstable();
+                exceptional_edges.dedup();
+            }
+        }
+        let rw_map = build_instruction_rw_map(&instructions, base_offset as u32, |ops| {
+            self.resolve_operands(ops)
+        });
+        let api_return_sources =
+            build_api_return_sources(&instructions, base_offset as u32, |ops| {
+                self.resolve_operands(ops)
+            });
+        let mut invoke_method_map =
+            build_invoke_method_map(&instructions, base_offset as u32, |ops| {
+                self.resolve_operands(ops)
+            });
+        // invoke-custom references call_site_ids rather than method_ids. Resolve the
+        // lambda implementation handle so taint/call-graph analysis can follow
+        // captured values into the callback body.
+        for ins in &instructions {
+            if !matches!(ins.opcode, 0xfc | 0xfd) {
+                continue;
+            }
+            let Some(callsite_idx) = extract_callsite_idx(ins.operands()) else {
+                continue;
+            };
+            let Ok(callsite) = self.dex.get_call_site(callsite_idx) else {
+                continue;
+            };
+            let Some(method_idx) = dex_parser::DexCallSites::impl_method_id(&callsite) else {
+                continue;
+            };
+            let Ok(method) = self.dex.get_method_info(method_idx as u32) else {
+                continue;
+            };
+            invoke_method_map.insert(
+                (ins.offset as u32).wrapping_add(base_offset as u32),
+                format!(
+                    "{}.{}",
+                    java::descriptor_to_java(&method.class),
+                    method.name
+                ),
+            );
+        }
+        let insn_at = build_insn_labels(&instructions, base_offset as u32, |ops| {
+            self.resolve_operands(ops)
+        });
         Ok(ValueFlowAnalysisOwned {
             cfg,
             rw_map,
+            exceptional_edges,
             api_return_sources,
             invoke_method_map,
             insn_at,
@@ -1513,15 +1693,23 @@ impl<'a> Decompiler<'a> {
             None => return String::new(),
         };
         let start = ins.offset as usize;
-        let end = instructions.get(idx + 1).map(|n| n.offset as usize).or_else(|| {
-            full_instructions.and_then(|full| {
-                full.iter()
-                    .find(|n| n.offset as usize > start)
-                    .map(|n| n.offset as usize)
+        let end = instructions
+            .get(idx + 1)
+            .map(|n| n.offset as usize)
+            .or_else(|| {
+                full_instructions.and_then(|full| {
+                    full.iter()
+                        .find(|n| n.offset as usize > start)
+                        .map(|n| n.offset as usize)
+                })
             })
-        }).unwrap_or_else(|| code_insns.len());
+            .unwrap_or_else(|| code_insns.len());
         let slice = code_insns.get(start..end).unwrap_or(&[]);
-        slice.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+        slice
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Raw DEX instructions line by line as comments (before the method body).
@@ -1540,8 +1728,12 @@ impl<'a> Decompiler<'a> {
             if m == "goto" {
                 ops = format_goto_operands_signed(&raw_hex, &ops);
             }
-            writeln!(out, "    // [{}] {:04x} ({}): {} {}", idx, offset, raw_hex, m, ops)
-                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            writeln!(
+                out,
+                "    // [{}] {:04x} ({}): {} {}",
+                idx, offset, raw_hex, m, ops
+            )
+            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
         if !instructions.is_empty() {
             writeln!(out).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
@@ -1622,7 +1814,8 @@ impl<'a> Decompiler<'a> {
         // Method-level φ analysis for shared naming across branches (restructure path).
         self.refresh_phi_regs(&cfg, &instructions, code, encoded);
 
-        let global_used_regs = self.method_used_regs(&cfg, &instructions, code.insns_off, insns_bytes);
+        let global_used_regs =
+            self.method_used_regs(&cfg, &instructions, code.insns_off, insns_bytes);
         let is_constructor = self
             .dex
             .get_method_info(encoded.method_idx)
@@ -1650,7 +1843,22 @@ impl<'a> Decompiler<'a> {
             let mut declared = HashSet::new();
             self.seed_declared_from_params(&mut declared, code, encoded);
             if let Some(root) = build_regions(&cfg, cfg.entry) {
-                self.emit_region(&root, &cfg, &instructions, code.insns_off, encoded, code, &mut fallback, 2, None, None, &mut declared, Some(&global_used_regs), None, class_name)?;
+                self.emit_region(
+                    &root,
+                    &cfg,
+                    &instructions,
+                    code.insns_off,
+                    encoded,
+                    code,
+                    &mut fallback,
+                    2,
+                    None,
+                    None,
+                    &mut declared,
+                    Some(&global_used_regs),
+                    None,
+                    class_name,
+                )?;
             }
             out = Some(fallback);
         }
@@ -1736,20 +1944,27 @@ impl<'a> Decompiler<'a> {
                 } else {
                     args_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
-                let next_line = lines.get(i + 1).map(|l| {
-                    let t = l.trim();
-                    if let Some(c) = t.find("  // ") { t[..c].trim_end() } else { t }
-                }).unwrap_or("");
+                let next_line = lines
+                    .get(i + 1)
+                    .map(|l| {
+                        let t = l.trim();
+                        if let Some(c) = t.find("  // ") {
+                            t[..c].trim_end()
+                        } else {
+                            t
+                        }
+                    })
+                    .unwrap_or("");
                 if !receiver.is_empty()
-                    && receiver.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && receiver
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
                 {
                     // Thread: <init>; start();
                     if next_line == format!("{}.start();", receiver) {
-                        if let Some((replacement, skip)) = self.build_anonymous_thread_inline(
-                            enclosing_class,
-                            &args,
-                            line,
-                        )? {
+                        if let Some((replacement, skip)) =
+                            self.build_anonymous_thread_inline(enclosing_class, &args, line)?
+                        {
                             out.push_str(&replacement);
                             if !replacement.ends_with('\n') {
                                 out.push('\n');
@@ -1803,7 +2018,14 @@ impl<'a> Decompiler<'a> {
         };
         // Prefer known SAM method names.
         const SAM_NAMES: &[&str] = &[
-            "run", "onClick", "accept", "apply", "test", "call", "compare", "onReceive",
+            "run",
+            "onClick",
+            "accept",
+            "apply",
+            "test",
+            "call",
+            "compare",
+            "onReceive",
         ];
         let mut sam_method = None;
         for &name in SAM_NAMES {
@@ -1944,11 +2166,9 @@ impl<'a> Decompiler<'a> {
                         break;
                     }
                 }
-                map.entry(enclosing.to_string()).or_default().push((
-                    name,
-                    ctor_params,
-                    super_name,
-                ));
+                map.entry(enclosing.to_string())
+                    .or_default()
+                    .push((name, ctor_params, super_name));
             }
             Ok(())
         };
@@ -1977,7 +2197,8 @@ impl<'a> Decompiler<'a> {
     ) -> Result<Option<(String, usize)>> {
         let indent = first_line.len() - first_line.trim_start().len();
         let indent_str: String = first_line.chars().take(indent).collect();
-        let Some(inner_class_name) = self.find_inner_thread_class(enclosing_class, args.len())? else {
+        let Some(inner_class_name) = self.find_inner_thread_class(enclosing_class, args.len())?
+        else {
             return Ok(None);
         };
         let run_encoded = match self.find_method(&inner_class_name, "run") {
@@ -1992,7 +2213,10 @@ impl<'a> Decompiler<'a> {
             if let Some(cached) = cache.get(&inner_class_name) {
                 cached.clone()
             } else {
-                let code = self.dex.get_code_item(run_encoded.code_off).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+                let code = self
+                    .dex
+                    .get_code_item(run_encoded.code_off)
+                    .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
                 let body = self.decompile_method_body(&code, &run_encoded, None)?;
                 cache.insert(inner_class_name.clone(), body.clone());
                 body
@@ -2027,17 +2251,17 @@ impl<'a> Decompiler<'a> {
             .join("\n");
         let block = format!(
             "{}new Thread() {{\n{}    public void run() {{\n{}\n{}    }}\n{}}}.start();",
-            indent_str,
-            indent_str,
-            run_lines,
-            indent_str,
-            indent_str,
+            indent_str, indent_str, run_lines, indent_str, indent_str,
         );
         Ok(Some((block, 2)))
     }
 
     /// Find inner class (enclosing_class$N) that extends Thread and has constructor with given arity.
-    fn find_inner_thread_class(&self, enclosing_class: &str, num_args: usize) -> Result<Option<String>> {
+    fn find_inner_thread_class(
+        &self,
+        enclosing_class: &str,
+        num_args: usize,
+    ) -> Result<Option<String>> {
         self.ensure_inner_thread_index()?;
         let inner = self
             .inner_thread_index
@@ -2050,12 +2274,18 @@ impl<'a> Decompiler<'a> {
     }
 
     /// Map this$0 / val$* field names to outer arg names for inlining.
-    fn inner_class_capture_map(&self, inner_class_name: &str, args: &[String]) -> Result<Vec<(String, String)>> {
+    fn inner_class_capture_map(
+        &self,
+        inner_class_name: &str,
+        args: &[String],
+    ) -> Result<Vec<(String, String)>> {
         let Some((slot, class_def)) = self.find_class_def_slot(inner_class_name) else {
             return Ok(vec![]);
         };
         let dex = self.dex_at(slot);
-        let class_data_opt = dex.get_class_data(&class_def).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let class_data_opt = dex
+            .get_class_data(&class_def)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
         let class_data = class_data_opt.as_ref();
         let Some(cd) = class_data else {
             return Ok(vec![]);
@@ -2136,17 +2366,10 @@ impl<'a> Decompiler<'a> {
         let mut cursor: u32 = 0;
 
         for (idx, (try_item, handler)) in pairs.iter().enumerate() {
-            let next_try_start = pairs
-                .get(idx + 1)
-                .map(|(t, _)| t.start_addr * 2);
+            let next_try_start = pairs.get(idx + 1).map(|(t, _)| t.start_addr * 2);
             let post_end = next_try_start.or(Some(code_end_byte));
             let (try_start_byte, try_end_byte, handler_ranges) =
-                try_and_handler_byte_ranges_with_end(
-                    try_item,
-                    handler,
-                    code.insns_size,
-                    post_end,
-                );
+                try_and_handler_byte_ranges_with_end(try_item, handler, code.insns_size, post_end);
 
             // Code before this try (from cursor). When a catch-all handler exists, defer
             // emission so catch-all/finally cleanup can pull pre-try statements into the try body.
@@ -2394,7 +2617,10 @@ impl<'a> Decompiler<'a> {
             }
 
             let nest_pair = nested_runtime_exception_handler_pair(
-                &typed_handlers.iter().map(|h| h.type_name.clone()).collect::<Vec<_>>(),
+                &typed_handlers
+                    .iter()
+                    .map(|h| h.type_name.clone())
+                    .collect::<Vec<_>>(),
             );
 
             if let Some((re_idx, ex_idx)) = nest_pair {
@@ -2542,43 +2768,65 @@ impl<'a> Decompiler<'a> {
     ) -> Result<String> {
         let data = self.dex.data.as_ref();
         let Some(pairs) = try_catch::try_handler_pairs(data, code_off, code) else {
-            return Ok(format!("        // try/catch ({} tries) - failed to parse handlers\n{}", code.tries_size, body));
+            return Ok(format!(
+                "        // try/catch ({} tries) - failed to parse handlers\n{}",
+                code.tries_size, body
+            ));
         };
         if pairs.is_empty() {
-            return Ok(format!("        // try/catch ({} tries)\n{}", code.tries_size, body));
+            return Ok(format!(
+                "        // try/catch ({} tries)\n{}",
+                code.tries_size, body
+            ));
         }
         let mut out = String::new();
-        writeln!(out, "        try {{").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        writeln!(out, "        try {{")
+            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         out.push_str(body);
         if !body.ends_with('\n') {
             out.push('\n');
         }
         let (_, first_handler) = &pairs[0];
         for type_addr in &first_handler.handlers {
-            let type_name = self.dex
+            let type_name = self
+                .dex
                 .get_type(type_addr.type_idx)
                 .map_err(|e| DexDecompilerError::Parse(e.to_string()))
                 .map(|d| shorten_java_names(&java::descriptor_to_java(&d)))?;
             writeln!(out, "        }} catch ({} e) {{", type_name)
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-            writeln!(out, "            // handler at code unit {}", type_addr.addr)
-                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            writeln!(
+                out,
+                "            // handler at code unit {}",
+                type_addr.addr
+            )
+            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
-        let as_finally = !first_handler.handlers.is_empty() && first_handler.catch_all_addr.is_some();
+        let as_finally =
+            !first_handler.handlers.is_empty() && first_handler.catch_all_addr.is_some();
         if let Some(addr) = first_handler.catch_all_addr {
             if as_finally {
                 writeln!(out, "        }} finally {{")
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                writeln!(out, "            // finally (catch-all) at code unit {}", addr)
-                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(
+                    out,
+                    "            // finally (catch-all) at code unit {}",
+                    addr
+                )
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             } else {
                 writeln!(out, "        }} catch (Throwable e) {{")
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                writeln!(out, "            // catch-all handler at code unit {}", addr)
-                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(
+                    out,
+                    "            // catch-all handler at code unit {}",
+                    addr
+                )
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
         }
-        writeln!(out, "        }}").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        writeln!(out, "        }}")
+            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         Ok(out)
     }
 
@@ -2595,7 +2843,8 @@ impl<'a> Decompiler<'a> {
         let mut block_ir: HashMap<BlockId, Vec<IrStmt>> = HashMap::new();
         for bid in 0..cfg.block_count() {
             let seq = self.block_instruction_seq(cfg, instructions, bid, None, false, None);
-            let stmts = self.instructions_to_ir(&seq, code.insns_off, code_insns, Some(instructions))?;
+            let stmts =
+                self.instructions_to_ir(&seq, code.insns_off, code_insns, Some(instructions))?;
             let mut runner = PassRunner::new();
             runner.add(InvokeChainPass);
             runner.add(ConstructorMergePass);
@@ -2612,12 +2861,8 @@ impl<'a> Decompiler<'a> {
         let global_used_regs = self.method_used_regs(cfg, instructions, code.insns_off, code_insns);
         for bid in 0..cfg.block_count() {
             let block = &cfg.blocks[bid];
-            writeln!(
-                out,
-                "        // block_{} @ 0x{:x}",
-                bid, block.start_offset
-            )
-            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            writeln!(out, "        // block_{} @ 0x{:x}", bid, block.start_offset)
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             let stmts = block_ir.remove(&bid).unwrap_or_default();
             let stmts = CopyPropPass.run(stmts);
             let stmts = run_dead_assign_with_used_regs(stmts, &global_used_regs);
@@ -2631,7 +2876,8 @@ impl<'a> Decompiler<'a> {
             self.apply_debug_names_to_name_map(&mut name_map, &type_map, code, encoded);
             self.apply_signature_param_names(&mut name_map, encoded, code);
             self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
-            for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), &mut declared)
+            for line in
+                self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), &mut declared)
             {
                 if !line.is_empty() {
                     writeln!(out, "        {}", line)
@@ -2732,14 +2978,16 @@ impl<'a> Decompiler<'a> {
         let registers_size = code.registers_size as u32;
         let ins_size = code.ins_size as u32;
         let is_static = (encoded.access_flags & 0x8) != 0;
-        let mut name_map = build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
+        let mut name_map =
+            build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
         self.apply_debug_names_to_name_map(&mut name_map, &type_map, code, encoded);
         self.apply_signature_param_names(&mut name_map, encoded, code);
         self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
         let mut declared = HashSet::new();
         for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), &mut declared) {
             if !line.is_empty() {
-                writeln!(&mut out, "        {}", line).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(&mut out, "        {}", line)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
         }
         if out.is_empty() {
@@ -2811,23 +3059,58 @@ impl<'a> Decompiler<'a> {
     ) -> Result<bool> {
         let ind = "    ".repeat(indent);
         match region {
-            Region::Block(block_id) => {
-                self.emit_block_instructions(
-                    cfg, instructions, base_off, *block_id, skip_goto_to, break_target,
-                    encoded, code, out, indent, declared, global_used_regs, false, emit_range, class_name,
-                )
-            }
+            Region::Block(block_id) => self.emit_block_instructions(
+                cfg,
+                instructions,
+                base_off,
+                *block_id,
+                skip_goto_to,
+                break_target,
+                encoded,
+                code,
+                out,
+                indent,
+                declared,
+                global_used_regs,
+                false,
+                emit_range,
+                class_name,
+            ),
             Region::Seq(children) => {
-                if let Some((init_block, header, condition, body_without_update, then_branch, update_block)) =
-                    for_loop_pattern(children)
+                if let Some((
+                    init_block,
+                    header,
+                    condition,
+                    body_without_update,
+                    then_branch,
+                    update_block,
+                )) = for_loop_pattern(children)
                 {
                     if self.block_is_single_const_init(cfg, instructions, init_block)
-                        && self.block_is_single_update_and_back_edge(cfg, instructions, update_block, header)
+                        && self.block_is_single_update_and_back_edge(
+                            cfg,
+                            instructions,
+                            update_block,
+                            header,
+                        )
                     {
                         let mut init_buf = String::new();
                         self.emit_block_instructions(
-                            cfg, instructions, base_off, init_block, skip_goto_to, break_target,
-                            encoded, code, &mut init_buf, indent, declared, global_used_regs, false, emit_range, class_name,
+                            cfg,
+                            instructions,
+                            base_off,
+                            init_block,
+                            skip_goto_to,
+                            break_target,
+                            encoded,
+                            code,
+                            &mut init_buf,
+                            indent,
+                            declared,
+                            global_used_regs,
+                            false,
+                            emit_range,
+                            class_name,
                         )?;
                         let init_str = init_buf
                             .trim()
@@ -2839,8 +3122,21 @@ impl<'a> Decompiler<'a> {
                             .trim();
                         let mut update_buf = String::new();
                         self.emit_block_instructions(
-                            cfg, instructions, base_off, update_block, Some(header), break_target,
-                            encoded, code, &mut update_buf, indent, declared, global_used_regs, false, emit_range, class_name,
+                            cfg,
+                            instructions,
+                            base_off,
+                            update_block,
+                            Some(header),
+                            break_target,
+                            encoded,
+                            code,
+                            &mut update_buf,
+                            indent,
+                            declared,
+                            global_used_regs,
+                            false,
+                            emit_range,
+                            class_name,
                         )?;
                         let update_str = update_buf
                             .trim()
@@ -2861,8 +3157,21 @@ impl<'a> Decompiler<'a> {
                             )
                             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                             let _ = self.emit_block_instructions(
-                                cfg, instructions, base_off, header, Some(header), None,
-                                encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range, class_name,
+                                cfg,
+                                instructions,
+                                base_off,
+                                header,
+                                Some(header),
+                                None,
+                                encoded,
+                                code,
+                                out,
+                                indent + 1,
+                                declared,
+                                global_used_regs,
+                                true,
+                                emit_range,
+                                class_name,
                             )?;
                             let _ = self.emit_region(
                                 &body_without_update,
@@ -2914,14 +3223,57 @@ impl<'a> Decompiler<'a> {
                     let emitted_break = if skip_block_last {
                         if let Region::Block(block_id) = r {
                             self.emit_block_instructions(
-                                cfg, instructions, base_off, *block_id, skip_goto_to, break_target,
-                                encoded, code, out, indent, declared, global_used_regs, true, emit_range, class_name,
+                                cfg,
+                                instructions,
+                                base_off,
+                                *block_id,
+                                skip_goto_to,
+                                break_target,
+                                encoded,
+                                code,
+                                out,
+                                indent,
+                                declared,
+                                global_used_regs,
+                                true,
+                                emit_range,
+                                class_name,
                             )?
                         } else {
-                            self.emit_region(r, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?
+                            self.emit_region(
+                                r,
+                                cfg,
+                                instructions,
+                                base_off,
+                                encoded,
+                                code,
+                                out,
+                                indent,
+                                skip_goto_to,
+                                break_target,
+                                declared,
+                                global_used_regs,
+                                emit_range,
+                                class_name,
+                            )?
                         }
                     } else {
-                        self.emit_region(r, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?
+                        self.emit_region(
+                            r,
+                            cfg,
+                            instructions,
+                            base_off,
+                            encoded,
+                            code,
+                            out,
+                            indent,
+                            skip_goto_to,
+                            break_target,
+                            declared,
+                            global_used_regs,
+                            emit_range,
+                            class_name,
+                        )?
                     };
                     if emitted_break {
                         return Ok(true);
@@ -2944,23 +3296,57 @@ impl<'a> Decompiler<'a> {
                 let at_top_level = skip_goto_to.is_none() && break_target.is_none();
                 let then_has_loop = region_contains_loop(then_branch);
                 let else_has_loop = region_contains_loop(else_branch);
-                let (condition, then_branch, else_branch) = if at_top_level && then_has_loop && !else_has_loop {
-                    (negate_condition(condition), else_branch, then_branch)
-                } else {
-                    (condition.clone(), then_branch, else_branch)
-                };
+                let (condition, then_branch, else_branch) =
+                    if at_top_level && then_has_loop && !else_has_loop {
+                        (negate_condition(condition), else_branch, then_branch)
+                    } else {
+                        (condition.clone(), then_branch, else_branch)
+                    };
                 let then_empty_after = region_is_empty_with_cfg(then_branch, cfg);
                 let else_empty_after = region_is_empty_with_cfg(else_branch, cfg);
                 if then_empty_after && !else_empty_after {
                     let neg = negate_condition(&condition);
                     mark_condition_idents_declared(&neg, declared);
-                    writeln!(out, "{}if ({}) {{", ind, shorten_java_names(&neg)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
-                    writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    writeln!(out, "{}if ({}) {{", ind, shorten_java_names(&neg))
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    let _ = self.emit_region(
+                        else_branch,
+                        cfg,
+                        instructions,
+                        base_off,
+                        encoded,
+                        code,
+                        out,
+                        indent + 1,
+                        skip_goto_to,
+                        break_target,
+                        declared,
+                        global_used_regs,
+                        emit_range,
+                        class_name,
+                    )?;
+                    writeln!(out, "{}}}", ind)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 } else {
                     mark_condition_idents_declared(&condition, declared);
-                    writeln!(out, "{}if ({}) {{", ind, shorten_java_names(&condition)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
+                    writeln!(out, "{}if ({}) {{", ind, shorten_java_names(&condition))
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    let _ = self.emit_region(
+                        then_branch,
+                        cfg,
+                        instructions,
+                        base_off,
+                        encoded,
+                        code,
+                        out,
+                        indent + 1,
+                        skip_goto_to,
+                        break_target,
+                        declared,
+                        global_used_regs,
+                        emit_range,
+                        class_name,
+                    )?;
                     if !else_empty_after {
                         // Emit-time else-if: `} else { if (c)` → `} else if (c)`
                         self.emit_else_chain(
@@ -2980,7 +3366,8 @@ impl<'a> Decompiler<'a> {
                             class_name,
                         )?;
                     } else {
-                        writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        writeln!(out, "{}}}", ind)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     }
                 }
                 Ok(false)
@@ -3001,8 +3388,25 @@ impl<'a> Decompiler<'a> {
                         {
                             let exit_block = region::first_block(then_branch);
                             let while_cond = negate_condition(&condition);
-                            writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&while_cond)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                            let _ = self.emit_block_instructions(cfg, instructions, base_off, *header, Some(*header), None, encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range, class_name)?;
+                            writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&while_cond))
+                                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                            let _ = self.emit_block_instructions(
+                                cfg,
+                                instructions,
+                                base_off,
+                                *header,
+                                Some(*header),
+                                None,
+                                encoded,
+                                code,
+                                out,
+                                indent + 1,
+                                declared,
+                                global_used_regs,
+                                true,
+                                emit_range,
+                                class_name,
+                            )?;
                             if let Some(middle) = region::loop_body_break_middle(body, *header) {
                                 if !region_is_empty_with_cfg(&middle, cfg) {
                                     let _ = self.emit_region(
@@ -3023,10 +3427,41 @@ impl<'a> Decompiler<'a> {
                                     )?;
                                 }
                             }
-                            let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), exit_block, declared, global_used_regs, emit_range, class_name)?;
-                            writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                            let _ = self.emit_region(
+                                else_branch,
+                                cfg,
+                                instructions,
+                                base_off,
+                                encoded,
+                                code,
+                                out,
+                                indent + 1,
+                                Some(*header),
+                                exit_block,
+                                declared,
+                                global_used_regs,
+                                emit_range,
+                                class_name,
+                            )?;
+                            writeln!(out, "{}}}", ind)
+                                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                             if !region_is_empty_with_cfg(then_branch, cfg) {
-                                let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
+                                let _ = self.emit_region(
+                                    then_branch,
+                                    cfg,
+                                    instructions,
+                                    base_off,
+                                    encoded,
+                                    code,
+                                    out,
+                                    indent,
+                                    skip_goto_to,
+                                    break_target,
+                                    declared,
+                                    global_used_regs,
+                                    emit_range,
+                                    class_name,
+                                )?;
                             }
                             loop_emitted = true;
                         }
@@ -3079,97 +3514,79 @@ impl<'a> Decompiler<'a> {
                     }
                 }
                 if !loop_emitted {
-                if let Some((exit_cond, do_body, then_branch)) =
-                    region::loop_body_do_while_loose(body, *header)
-                        .or_else(|| loop_body_do_while_pattern(body, *header))
-                {
-                    let while_cond = negate_condition(exit_cond);
-                    writeln!(out, "{}do {{", ind)
-                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    let _ = self.emit_region(
-                        &do_body,
-                        cfg,
-                        instructions,
-                        base_off,
-                        encoded,
-                        code,
-                        out,
-                        indent + 1,
-                        Some(*header),
-                        region::first_block(then_branch),
-                        declared,
-                        global_used_regs,
-                        emit_range,
-                        class_name,
-                    )?;
-                    writeln!(
-                        out,
-                        "{}}} while ({});",
-                        ind,
-                        shorten_java_names(&while_cond)
-                    )
-                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    if !region_is_empty_with_cfg(then_branch, cfg) {
+                    if let Some((exit_cond, do_body, then_branch)) =
+                        region::loop_body_do_while_loose(body, *header)
+                            .or_else(|| loop_body_do_while_pattern(body, *header))
+                    {
+                        let while_cond = negate_condition(exit_cond);
+                        writeln!(out, "{}do {{", ind)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                         let _ = self.emit_region(
-                            then_branch,
+                            &do_body,
                             cfg,
                             instructions,
                             base_off,
                             encoded,
                             code,
                             out,
-                            indent,
-                            skip_goto_to,
-                            break_target,
+                            indent + 1,
+                            Some(*header),
+                            region::first_block(then_branch),
                             declared,
                             global_used_regs,
                             emit_range,
                             class_name,
                         )?;
-                    }
-                    loop_emitted = true;
-                } else if let Some((condition, else_branch, then_branch)) =
-                    region::loop_body_break_pattern(body, *header)
-                {
-                    let exit_block = region::first_block(then_branch);
-                    let while_cond = negate_condition(&condition);
-                    writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&while_cond)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    let _ = self.emit_block_instructions(cfg, instructions, base_off, *header, Some(*header), None, encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range, class_name)?;
-                    if let Some(middle) = region::loop_body_break_middle(body, *header) {
-                        if !region_is_empty_with_cfg(&middle, cfg) {
+                        writeln!(
+                            out,
+                            "{}}} while ({});",
+                            ind,
+                            shorten_java_names(&while_cond)
+                        )
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        if !region_is_empty_with_cfg(then_branch, cfg) {
                             let _ = self.emit_region(
-                                &middle,
+                                then_branch,
                                 cfg,
                                 instructions,
                                 base_off,
                                 encoded,
                                 code,
                                 out,
-                                indent + 1,
-                                Some(*header),
-                                exit_block,
+                                indent,
+                                skip_goto_to,
+                                break_target,
                                 declared,
                                 global_used_regs,
                                 emit_range,
                                 class_name,
                             )?;
                         }
-                    }
-                    let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), exit_block, declared, global_used_regs, emit_range, class_name)?;
-                    writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                    if !region_is_empty_with_cfg(then_branch, cfg) {
-                        let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
-                    }
-                    loop_emitted = true;
-                } else if let Some((condition, else_branch, then_branch)) =
-                    region::loop_body_break_pattern_trailing(body, *header)
-                {
-                    // Nested trailing exit-if (merge tail loops): require a non-empty exit `then`.
-                    if !region_is_empty_with_cfg(then_branch, cfg) {
+                        loop_emitted = true;
+                    } else if let Some((condition, else_branch, then_branch)) =
+                        region::loop_body_break_pattern(body, *header)
+                    {
                         let exit_block = region::first_block(then_branch);
                         let while_cond = negate_condition(&condition);
-                        writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&while_cond)).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-                        let _ = self.emit_block_instructions(cfg, instructions, base_off, *header, Some(*header), None, encoded, code, out, indent + 1, declared, global_used_regs, true, emit_range, class_name)?;
+                        writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&while_cond))
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        let _ = self.emit_block_instructions(
+                            cfg,
+                            instructions,
+                            base_off,
+                            *header,
+                            Some(*header),
+                            None,
+                            encoded,
+                            code,
+                            out,
+                            indent + 1,
+                            declared,
+                            global_used_regs,
+                            true,
+                            emit_range,
+                            class_name,
+                        )?;
                         if let Some(middle) = region::loop_body_break_middle(body, *header) {
                             if !region_is_empty_with_cfg(&middle, cfg) {
                                 let _ = self.emit_region(
@@ -3190,14 +3607,128 @@ impl<'a> Decompiler<'a> {
                                 )?;
                             }
                         }
-                        let _ = self.emit_region(else_branch, cfg, instructions, base_off, encoded, code, out, indent + 1, Some(*header), exit_block, declared, global_used_regs, emit_range, class_name)?;
-                        writeln!(out, "{}}}", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                        let _ = self.emit_region(
+                            else_branch,
+                            cfg,
+                            instructions,
+                            base_off,
+                            encoded,
+                            code,
+                            out,
+                            indent + 1,
+                            Some(*header),
+                            exit_block,
+                            declared,
+                            global_used_regs,
+                            emit_range,
+                            class_name,
+                        )?;
+                        writeln!(out, "{}}}", ind)
+                            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                         if !region_is_empty_with_cfg(then_branch, cfg) {
-                            let _ = self.emit_region(then_branch, cfg, instructions, base_off, encoded, code, out, indent, skip_goto_to, break_target, declared, global_used_regs, emit_range, class_name)?;
+                            let _ = self.emit_region(
+                                then_branch,
+                                cfg,
+                                instructions,
+                                base_off,
+                                encoded,
+                                code,
+                                out,
+                                indent,
+                                skip_goto_to,
+                                break_target,
+                                declared,
+                                global_used_regs,
+                                emit_range,
+                                class_name,
+                            )?;
                         }
                         loop_emitted = true;
+                    } else if let Some((condition, else_branch, then_branch)) =
+                        region::loop_body_break_pattern_trailing(body, *header)
+                    {
+                        // Nested trailing exit-if (merge tail loops): require a non-empty exit `then`.
+                        if !region_is_empty_with_cfg(then_branch, cfg) {
+                            let exit_block = region::first_block(then_branch);
+                            let while_cond = negate_condition(&condition);
+                            writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&while_cond))
+                                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                            let _ = self.emit_block_instructions(
+                                cfg,
+                                instructions,
+                                base_off,
+                                *header,
+                                Some(*header),
+                                None,
+                                encoded,
+                                code,
+                                out,
+                                indent + 1,
+                                declared,
+                                global_used_regs,
+                                true,
+                                emit_range,
+                                class_name,
+                            )?;
+                            if let Some(middle) = region::loop_body_break_middle(body, *header) {
+                                if !region_is_empty_with_cfg(&middle, cfg) {
+                                    let _ = self.emit_region(
+                                        &middle,
+                                        cfg,
+                                        instructions,
+                                        base_off,
+                                        encoded,
+                                        code,
+                                        out,
+                                        indent + 1,
+                                        Some(*header),
+                                        exit_block,
+                                        declared,
+                                        global_used_regs,
+                                        emit_range,
+                                        class_name,
+                                    )?;
+                                }
+                            }
+                            let _ = self.emit_region(
+                                else_branch,
+                                cfg,
+                                instructions,
+                                base_off,
+                                encoded,
+                                code,
+                                out,
+                                indent + 1,
+                                Some(*header),
+                                exit_block,
+                                declared,
+                                global_used_regs,
+                                emit_range,
+                                class_name,
+                            )?;
+                            writeln!(out, "{}}}", ind)
+                                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                            if !region_is_empty_with_cfg(then_branch, cfg) {
+                                let _ = self.emit_region(
+                                    then_branch,
+                                    cfg,
+                                    instructions,
+                                    base_off,
+                                    encoded,
+                                    code,
+                                    out,
+                                    indent,
+                                    skip_goto_to,
+                                    break_target,
+                                    declared,
+                                    global_used_regs,
+                                    emit_range,
+                                    class_name,
+                                )?;
+                            }
+                            loop_emitted = true;
+                        }
                     }
-                }
                 }
                 if !loop_emitted {
                     let loop_break = region::loop_exit_break_target(body, *header, cfg);
@@ -3206,31 +3737,69 @@ impl<'a> Decompiler<'a> {
                         writeln!(out, "{}while (true) {{", ind)
                             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                         let _ = self.emit_block_instructions(
-                            cfg, instructions, base_off, *header, Some(*header), loop_break,
-                            encoded, code, out, indent + 1, declared, global_used_regs, true,
-                            emit_range, class_name,
+                            cfg,
+                            instructions,
+                            base_off,
+                            *header,
+                            Some(*header),
+                            loop_break,
+                            encoded,
+                            code,
+                            out,
+                            indent + 1,
+                            declared,
+                            global_used_regs,
+                            true,
+                            emit_range,
+                            class_name,
                         )?;
                         if let Some(middle) = region::loop_body_break_middle(body, *header) {
                             if !region_is_empty_with_cfg(&middle, cfg) {
                                 let _ = self.emit_region(
-                                    &middle, cfg, instructions, base_off, encoded, code, out,
-                                    indent + 1, Some(*header), loop_break, declared,
-                                    global_used_regs, emit_range, class_name,
+                                    &middle,
+                                    cfg,
+                                    instructions,
+                                    base_off,
+                                    encoded,
+                                    code,
+                                    out,
+                                    indent + 1,
+                                    Some(*header),
+                                    loop_break,
+                                    declared,
+                                    global_used_regs,
+                                    emit_range,
+                                    class_name,
                                 )?;
                             }
                         }
                         for (i, (cond, exit_r)) in multi_exits.iter().enumerate() {
                             if i == 0 {
                                 writeln!(out, "{}if ({}) {{", ind, shorten_java_names(cond))
-                                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                                    .map_err(|_| {
+                                        DexDecompilerError::Decompilation("write".into())
+                                    })?;
                             } else {
                                 writeln!(out, "{} else if ({}) {{", ind, shorten_java_names(cond))
-                                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                                    .map_err(|_| {
+                                        DexDecompilerError::Decompilation("write".into())
+                                    })?;
                             }
                             let _ = self.emit_region(
-                                exit_r, cfg, instructions, base_off, encoded, code, out,
-                                indent + 2, Some(*header), loop_break, declared,
-                                global_used_regs, emit_range, class_name,
+                                exit_r,
+                                cfg,
+                                instructions,
+                                base_off,
+                                encoded,
+                                code,
+                                out,
+                                indent + 2,
+                                Some(*header),
+                                loop_break,
+                                declared,
+                                global_used_regs,
+                                emit_range,
+                                class_name,
                             )?;
                         }
                         if !multi_exits.is_empty() {
@@ -3243,8 +3812,19 @@ impl<'a> Decompiler<'a> {
                         writeln!(out, "{}while (true) {{", ind)
                             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                         let _ = self.emit_region(
-                            body, cfg, instructions, base_off, encoded, code, out, indent + 1,
-                            Some(*header), loop_break, declared, global_used_regs, emit_range,
+                            body,
+                            cfg,
+                            instructions,
+                            base_off,
+                            encoded,
+                            code,
+                            out,
+                            indent + 1,
+                            Some(*header),
+                            loop_break,
+                            declared,
+                            global_used_regs,
+                            emit_range,
                             class_name,
                         )?;
                         writeln!(out, "{}}}", ind)
@@ -3344,7 +3924,10 @@ impl<'a> Decompiler<'a> {
         let loop_headers = cfg.loop_headers.clone();
         let mut folded: HashSet<u32> = HashSet::new();
         for (bid, block) in cfg.blocks.iter_mut().enumerate() {
-            if let BlockEnd::Conditional { ref mut condition, .. } = block.end {
+            if let BlockEnd::Conditional {
+                ref mut condition, ..
+            } = block.end
+            {
                 let offs = block.instruction_offsets.clone();
                 if offs.len() < 2 {
                     continue;
@@ -3357,7 +3940,8 @@ impl<'a> Decompiler<'a> {
                     let Some(ins) = find_ins(off) else { continue };
                     let m = ins.mnemonic();
                     if m == "const/4" || m == "const/16" || m == "const" || m == "const/high16" {
-                        let parts: Vec<&str> = ins.operands().split(',').map(|s| s.trim()).collect();
+                        let parts: Vec<&str> =
+                            ins.operands().split(',').map(|s| s.trim()).collect();
                         if parts.len() >= 2 {
                             if let Some(reg) = parse_one_reg(parts[0]) {
                                 if is_loop && mutated.contains(&reg) {
@@ -3397,7 +3981,8 @@ impl<'a> Decompiler<'a> {
                             }
                         }
                     } else if m == "instance-of" {
-                        let parts: Vec<&str> = ins.operands().split(',').map(|s| s.trim()).collect();
+                        let parts: Vec<&str> =
+                            ins.operands().split(',').map(|s| s.trim()).collect();
                         if parts.len() >= 3 {
                             if let Some(dst) = parse_one_reg(parts[0]) {
                                 if is_loop && mutated.contains(&dst) {
@@ -3447,13 +4032,8 @@ impl<'a> Decompiler<'a> {
         loop {
             if let Some((cond, then_b, else_b)) = as_single_if(current) {
                 mark_condition_idents_declared(cond, declared);
-                writeln!(
-                    out,
-                    "{}}} else if ({}) {{",
-                    ind,
-                    shorten_java_names(cond)
-                )
-                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(out, "{}}} else if ({}) {{", ind, shorten_java_names(cond))
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 let _ = self.emit_region(
                     then_b,
                     cfg,
@@ -3572,8 +4152,7 @@ impl<'a> Decompiler<'a> {
         let mut seq = self.block_instruction_seq(cfg, instructions, block_id, None, true, None);
         // `invoke; move-result` in the fall-through predecessor block.
         for pred in Self::predecessor_blocks_for_condition_naming(cfg, block_id) {
-            let pred_seq =
-                self.block_instruction_seq(cfg, instructions, pred, None, false, None);
+            let pred_seq = self.block_instruction_seq(cfg, instructions, pred, None, false, None);
             if pred_seq.iter().any(|i| i.mnemonic().starts_with("invoke")) {
                 seq.splice(0..0, pred_seq);
             }
@@ -3607,8 +4186,7 @@ impl<'a> Decompiler<'a> {
 
             // Include fall-through predecessor blocks so `invoke; move-result` + `if-nez`
             // in adjacent blocks still names the tested value as `obj1`, not stale `obj0`.
-            let seq =
-                self.block_instruction_seq_for_condition_naming(cfg, instructions, block_id);
+            let seq = self.block_instruction_seq_for_condition_naming(cfg, instructions, block_id);
             let mut local_names: HashMap<u32, String> = HashMap::new();
             let mut local_types: HashMap<u32, String> = HashMap::new();
             let mut name_map: HashMap<ir::VarId, String> = HashMap::new();
@@ -3705,7 +4283,10 @@ impl<'a> Decompiler<'a> {
                 }
             }
 
-            if let BlockEnd::Conditional { ref mut condition, .. } = cfg.blocks[block_id].end {
+            if let BlockEnd::Conditional {
+                ref mut condition, ..
+            } = cfg.blocks[block_id].end
+            {
                 *condition = replace_register_names(condition, &merged);
                 *condition = polish_boolean_condition(condition, &local_names, &local_types);
             }
@@ -3715,13 +4296,21 @@ impl<'a> Decompiler<'a> {
     /// Collect register numbers that are read (used) in any block, so dead-assign doesn't remove assigns used in other blocks.
     /// Runs the pipeline once over the full method instead of per-block for speed.
     /// Also includes registers only referenced by branch/switch conditions (not present in IR stmts).
-    fn method_used_regs(&self, _cfg: &MethodCfg, instructions: &[Instruction], base_off: usize, code_insns: &[u8]) -> HashSet<u32> {
+    fn method_used_regs(
+        &self,
+        _cfg: &MethodCfg,
+        instructions: &[Instruction],
+        base_off: usize,
+        code_insns: &[u8],
+    ) -> HashSet<u32> {
         let mut runner = PassRunner::new();
         runner.add(InvokeChainPass);
         runner.add(SsaRenamePass);
         runner.add(CopyPropPass);
         runner.add(InlineFilledArrayPass);
-        let stmts = self.instructions_to_ir(instructions, base_off, code_insns, None).unwrap_or_default();
+        let stmts = self
+            .instructions_to_ir(instructions, base_off, code_insns, None)
+            .unwrap_or_default();
         let stmts = runner.run(stmts);
         let mut regs = used_regs(&stmts);
         for ins in instructions {
@@ -3801,7 +4390,9 @@ impl<'a> Decompiler<'a> {
                     continue;
                 }
                 let ty = types.get(vid).map(|s| s.as_str());
-                if !types_compatible_for_naming(ty, method_ty) && method_ty.is_some() && ty.is_some()
+                if !types_compatible_for_naming(ty, method_ty)
+                    && method_ty.is_some()
+                    && ty.is_some()
                 {
                     continue;
                 }
@@ -3811,7 +4402,9 @@ impl<'a> Decompiler<'a> {
                     5 + vid.ver as i32
                 } else if ty.is_some_and(is_primitive_java_type)
                     && !is_synthetic_local_name(name)
-                    && types.iter().any(|(v, t)| v.reg == reg && !is_primitive_java_type(t))
+                    && types
+                        .iter()
+                        .any(|(v, t)| v.reg == reg && !is_primitive_java_type(t))
                 {
                     // Debug name `host` on a reused int (`const/4 0` for resolveActivity flags).
                     5 + vid.ver as i32
@@ -3885,8 +4478,12 @@ impl<'a> Decompiler<'a> {
         let offs = &block.instruction_offsets;
         let mut seq: Vec<Instruction> = Vec::new();
         let drop_last = skip_last_instruction
-            && matches!(&block.end, BlockEnd::Conditional { .. } | BlockEnd::Switch { .. });
-        let skip_switch_ins = skip_last_instruction && matches!(&block.end, BlockEnd::Switch { .. });
+            && matches!(
+                &block.end,
+                BlockEnd::Conditional { .. } | BlockEnd::Switch { .. }
+            );
+        let skip_switch_ins =
+            skip_last_instruction && matches!(&block.end, BlockEnd::Switch { .. });
         let limit = if drop_last && !offs.is_empty() {
             offs.len() - 1
         } else {
@@ -3912,7 +4509,9 @@ impl<'a> Decompiler<'a> {
                 if cfg.folded_const_offsets.contains(&off) {
                     continue;
                 }
-                if skip_switch_ins && (ins.mnemonic() == "packed-switch" || ins.mnemonic() == "sparse-switch") {
+                if skip_switch_ins
+                    && (ins.mnemonic() == "packed-switch" || ins.mnemonic() == "sparse-switch")
+                {
                     continue;
                 }
                 seq.push(ins.clone());
@@ -4108,9 +4707,8 @@ impl<'a> Decompiler<'a> {
             }
         }
 
-        let latest_ver_by_reg: HashMap<u32, u32> = name_map
-            .keys()
-            .fold(HashMap::new(), |mut m, v| {
+        let latest_ver_by_reg: HashMap<u32, u32> =
+            name_map.keys().fold(HashMap::new(), |mut m, v| {
                 m.entry(v.reg)
                     .and_modify(|ver| *ver = (*ver).max(v.ver))
                     .or_insert(v.ver);
@@ -4121,7 +4719,9 @@ impl<'a> Decompiler<'a> {
             if display.as_str() == "this" {
                 continue;
             }
-            let Some(n) = dbg.name_for_reg(var.reg) else { continue };
+            let Some(n) = dbg.name_for_reg(var.reg) else {
+                continue;
+            };
             if !is_java_ident(n) {
                 continue;
             }
@@ -4140,15 +4740,16 @@ impl<'a> Decompiler<'a> {
         }
     }
 
-  /// Apply user-defined variable renames to the name_map (key: ClassName#methodName).
-  /// For constructors, also accepts UI keys that use the simple class name instead of `<init>`.
-  fn apply_variable_renames_to_name_map(
+    /// Apply user-defined variable renames to the name_map (key: ClassName#methodName).
+    /// For constructors, also accepts UI keys that use the simple class name instead of `<init>`.
+    fn apply_variable_renames_to_name_map(
         &self,
         name_map: &mut HashMap<VarId, String>,
         class_name: Option<&str>,
         encoded: &EncodedMethod,
     ) {
-        let (Some(class_name), Some(ref rename_map)) = (class_name, self.rename_map.as_ref()) else {
+        let (Some(class_name), Some(ref rename_map)) = (class_name, self.rename_map.as_ref())
+        else {
             return;
         };
         let Ok(info) = self.dex.get_method_info(encoded.method_idx) else {
@@ -4224,7 +4825,8 @@ impl<'a> Decompiler<'a> {
         let registers_size = code.registers_size as u32;
         let ins_size = code.ins_size as u32;
         let is_static = (encoded.access_flags & 0x8) != 0;
-        let mut name_map = build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
+        let mut name_map =
+            build_var_names_with_regs(&stmts, &type_map, registers_size, ins_size, is_static);
         self.apply_phi_register_names(&mut name_map, &type_map);
         self.apply_debug_names_to_name_map(&mut name_map, &type_map, code, encoded);
         // Prefer method-wide names so loop index / length / temps stay consistent across blocks.
@@ -4273,16 +4875,19 @@ impl<'a> Decompiler<'a> {
         self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
         for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), declared) {
             if !line.is_empty() {
-                writeln!(out, "{}{}", ind, line).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(out, "{}{}", ind, line)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
         }
         match &block.end {
             BlockEnd::Goto(t) if break_target == Some(*t) => {
-                writeln!(out, "{}break;", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(out, "{}break;", ind)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 Ok(true)
             }
             BlockEnd::Goto(t) if skip_goto_to == Some(*t) => {
-                writeln!(out, "{}continue;", ind).map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                writeln!(out, "{}continue;", ind)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -4312,7 +4917,9 @@ impl<'a> Decompiler<'a> {
         let line = match (stmt, type_map) {
             (IrStmt::Assign { dst, rhs, comment }, Some(types)) if types.get(dst).is_some() => {
                 let ty = types.get(dst).unwrap();
-                let var = name_map.and_then(|n| n.get(dst).cloned()).unwrap_or_else(|| IrExpr::Var(*dst).to_java());
+                let var = name_map
+                    .and_then(|n| n.get(dst).cloned())
+                    .unwrap_or_else(|| IrExpr::Var(*dst).to_java());
                 let rhs_str = rhs.to_java_with_names(name_map);
                 // Handle compound assign markers from ExprSimplifyPass
                 if let Some(compound) = rhs_str.strip_prefix("__compound_") {
@@ -4410,11 +5017,15 @@ impl<'a> Decompiler<'a> {
         let mut out: Vec<IrStmt> = Vec::new();
         let mut pending_invoke: Option<PendingInvoke> = None;
 
-        let flush_pending_invoke = |out: &mut Vec<IrStmt>, pending_invoke: &mut Option<PendingInvoke>| {
-            if let Some(pi) = pending_invoke.take() {
-                out.push(IrStmt::Expr { expr: pi.call_expr, comment: Some(pi.comment) });
-            }
-        };
+        let flush_pending_invoke =
+            |out: &mut Vec<IrStmt>, pending_invoke: &mut Option<PendingInvoke>| {
+                if let Some(pi) = pending_invoke.take() {
+                    out.push(IrStmt::Expr {
+                        expr: pi.call_expr,
+                        comment: Some(pi.comment),
+                    });
+                }
+            };
 
         for (idx, ins) in instructions.iter().enumerate() {
             let m = ins.mnemonic();
@@ -4424,13 +5035,17 @@ impl<'a> Decompiler<'a> {
             let ops = ins.operands();
             let ops_resolved = self.resolve_operands(ops);
             let offset = ins.offset as usize + base_off;
-            let raw_hex = Self::instruction_raw_hex(instructions, idx, code_insns, full_instructions);
+            let raw_hex =
+                Self::instruction_raw_hex(instructions, idx, code_insns, full_instructions);
             let ops_display = if m == "goto" {
                 format_goto_operands_signed(&raw_hex, &ops)
             } else {
                 ops.to_string()
             };
-            let comment = format!("// [{}] {:04x} ({}): {} {}", idx, offset, raw_hex, m, ops_display);
+            let comment = format!(
+                "// [{}] {:04x} ({}): {} {}",
+                idx, offset, raw_hex, m, ops_display
+            );
 
             if pending_invoke.is_some() && !m.starts_with("move-result") {
                 flush_pending_invoke(&mut out, &mut pending_invoke);
@@ -4447,8 +5062,10 @@ impl<'a> Decompiler<'a> {
                     continue;
                 }
                 let is_super = m.starts_with("invoke-super");
-                let is_instance = m.starts_with("invoke-virtual") || m.starts_with("invoke-interface")
-                    || m.starts_with("invoke-direct") || is_super;
+                let is_instance = m.starts_with("invoke-virtual")
+                    || m.starts_with("invoke-interface")
+                    || m.starts_with("invoke-direct")
+                    || is_super;
                 if let Some((target, args, param_types)) = parse_invoke_call_parts(&ops_resolved) {
                     let (target, args) = if is_super {
                         to_super_style(&target, &args)
@@ -4485,7 +5102,10 @@ impl<'a> Decompiler<'a> {
             if m == "move-result" || m == "move-result-wide" || m == "move-result-object" {
                 if let Some(pi) = pending_invoke.take() {
                     if let Some(reg) = parse_one_reg(&ops_resolved) {
-                        out.push(IrStmt::Expr { expr: pi.call_expr, comment: Some(pi.comment) });
+                        out.push(IrStmt::Expr {
+                            expr: pi.call_expr,
+                            comment: Some(pi.comment),
+                        });
                         out.push(IrStmt::Assign {
                             dst: ir::VarId::new(reg, 0),
                             rhs: IrExpr::PendingResult,
@@ -4494,14 +5114,22 @@ impl<'a> Decompiler<'a> {
                         continue;
                     }
                 }
-                let line = self.instruction_to_java(ins, base_off, code_insns, Some((idx, instructions, full_instructions)))?;
-                    out.push(IrStmt::Raw(line));
+                let line = self.instruction_to_java(
+                    ins,
+                    base_off,
+                    code_insns,
+                    Some((idx, instructions, full_instructions)),
+                )?;
+                out.push(IrStmt::Raw(line));
                 continue;
             }
 
             if m == "return-void" {
                 flush_pending_invoke(&mut out, &mut pending_invoke);
-                out.push(IrStmt::Return { value: None, comment: Some(comment) });
+                out.push(IrStmt::Return {
+                    value: None,
+                    comment: Some(comment),
+                });
                 continue;
             }
 
@@ -4513,7 +5141,12 @@ impl<'a> Decompiler<'a> {
                         comment: Some(comment),
                     });
                 } else {
-                    let line = self.instruction_to_java(ins, base_off, code_insns, Some((idx, instructions, full_instructions)))?;
+                    let line = self.instruction_to_java(
+                        ins,
+                        base_off,
+                        code_insns,
+                        Some((idx, instructions, full_instructions)),
+                    )?;
                     out.push(IrStmt::Raw(line));
                 }
                 continue;
@@ -4559,7 +5192,12 @@ impl<'a> Decompiler<'a> {
             }
 
             flush_pending_invoke(&mut out, &mut pending_invoke);
-            let line = self.instruction_to_java(ins, base_off, code_insns, Some((idx, instructions, full_instructions)))?;
+            let line = self.instruction_to_java(
+                ins,
+                base_off,
+                code_insns,
+                Some((idx, instructions, full_instructions)),
+            )?;
             out.push(IrStmt::Raw(line));
         }
 
@@ -4598,35 +5236,62 @@ impl<'a> Decompiler<'a> {
         let offset = ins.offset as usize + base_off;
         let comment = match bytecode_ctx {
             Some((idx, instructions, full_instructions)) => {
-                let raw_hex = Self::instruction_raw_hex(instructions, idx, code_insns, full_instructions);
+                let raw_hex =
+                    Self::instruction_raw_hex(instructions, idx, code_insns, full_instructions);
                 let ops_display = if m == "goto" {
                     format_goto_operands_signed(&raw_hex, ops)
                 } else {
                     ops.to_string()
                 };
-                format!("// [{}] {:04x} ({}): {} {}", idx, offset, raw_hex, m, ops_display)
+                format!(
+                    "// [{}] {:04x} ({}): {} {}",
+                    idx, offset, raw_hex, m, ops_display
+                )
             }
             None => format!("// {:04x}: {} {}", offset, m, ops),
         };
         let stmt = match m {
             "nop" => String::new(),
             "return-void" => "return;".into(),
-            "return" => parse_one_reg(&ops_resolved).map(|r| format!("return v{};", r)).unwrap_or_default(),
-            "return-wide" => parse_one_reg(&ops_resolved).map(|r| format!("return v{};", r)).unwrap_or_default(),
-            "return-object" => parse_one_reg(&ops_resolved).map(|r| format!("return v{};", r)).unwrap_or_default(),
-            "move" | "move/from16" | "move/16" => parse_two_regs(&ops_resolved).map(|(d, s)| format!("v{} = v{};", d, s)).unwrap_or_default(),
-            "move-object" => parse_two_regs(&ops_resolved).map(|(d, s)| format!("v{} = v{};", d, s)).unwrap_or_default(),
-            "move-result" | "move-result-wide" | "move-result-object" => parse_one_reg(&ops_resolved).map(|r| format!("v{} = <result>;", r)).unwrap_or_default(),
-            "const/4" | "const/16" | "const" => parse_const_into_reg(&ops_resolved).unwrap_or_default(),
-            "const-string" | "const-string/jumbo" => parse_string_ref(&ops_resolved).unwrap_or_default(),
-            "invoke-virtual" | "invoke-super" | "invoke-direct" | "invoke-static" | "invoke-interface" => {
+            "return" => parse_one_reg(&ops_resolved)
+                .map(|r| format!("return v{};", r))
+                .unwrap_or_default(),
+            "return-wide" => parse_one_reg(&ops_resolved)
+                .map(|r| format!("return v{};", r))
+                .unwrap_or_default(),
+            "return-object" => parse_one_reg(&ops_resolved)
+                .map(|r| format!("return v{};", r))
+                .unwrap_or_default(),
+            "move" | "move/from16" | "move/16" => parse_two_regs(&ops_resolved)
+                .map(|(d, s)| format!("v{} = v{};", d, s))
+                .unwrap_or_default(),
+            "move-object" => parse_two_regs(&ops_resolved)
+                .map(|(d, s)| format!("v{} = v{};", d, s))
+                .unwrap_or_default(),
+            "move-result" | "move-result-wide" | "move-result-object" => {
+                parse_one_reg(&ops_resolved)
+                    .map(|r| format!("v{} = <result>;", r))
+                    .unwrap_or_default()
+            }
+            "const/4" | "const/16" | "const" => {
+                parse_const_into_reg(&ops_resolved).unwrap_or_default()
+            }
+            "const-string" | "const-string/jumbo" => {
+                parse_string_ref(&ops_resolved).unwrap_or_default()
+            }
+            "invoke-virtual" | "invoke-super" | "invoke-direct" | "invoke-static"
+            | "invoke-interface" => {
                 format!("{}( {} );", m, ops_resolved)
             }
-            "invoke-virtual/range" | "invoke-super/range" | "invoke-direct/range" | "invoke-static/range" | "invoke-interface/range" => {
+            "invoke-virtual/range"
+            | "invoke-super/range"
+            | "invoke-direct/range"
+            | "invoke-static/range"
+            | "invoke-interface/range" => {
                 format!("{}( {} );", m, ops_resolved)
             }
-            "if-eq" | "if-ne" | "if-lt" | "if-ge" | "if-gt" | "if-le"
-            | "if-eqz" | "if-nez" | "if-ltz" | "if-gez" | "if-gtz" | "if-lez" => {
+            "if-eq" | "if-ne" | "if-lt" | "if-ge" | "if-gt" | "if-le" | "if-eqz" | "if-nez"
+            | "if-ltz" | "if-gez" | "if-gtz" | "if-lez" => {
                 // No real label is emitted; show only bytecode comment to avoid "goto label" with no label.
                 String::new()
             }
@@ -4643,7 +5308,9 @@ impl<'a> Decompiler<'a> {
             "iput" | "iput-wide" | "iput-object" | "iput-boolean" => format_iput(&ops_resolved),
             "sget" | "sget-wide" | "sget-object" => format_sget(&ops_resolved),
             "sput" | "sput-wide" | "sput-object" => format_sput(&ops_resolved),
-            "throw" => parse_one_reg(&ops_resolved).map(|r| format!("throw v{};", r)).unwrap_or_default(),
+            "throw" => parse_one_reg(&ops_resolved)
+                .map(|r| format!("throw v{};", r))
+                .unwrap_or_default(),
             // Binary int ops (2addr): vA, vB → vA = vA op vB
             "add-int/2addr" | "add-long/2addr" => format_binop_2addr(&ops_resolved, "+"),
             "sub-int/2addr" | "sub-long/2addr" => format_binop_2addr(&ops_resolved, "-"),
@@ -4721,12 +5388,10 @@ impl<'a> Decompiler<'a> {
             "int-to-short" => format_cast(&ops_resolved, "short"),
             // Array
             "array-length" => format_array_length(&ops_resolved),
-            "aget" | "aget-wide" | "aget-object" | "aget-boolean" | "aget-byte" | "aget-char" | "aget-short" => {
-                format_aget(&ops_resolved)
-            }
-            "aput" | "aput-wide" | "aput-object" | "aput-boolean" | "aput-byte" | "aput-char" | "aput-short" => {
-                format_aput(&ops_resolved)
-            }
+            "aget" | "aget-wide" | "aget-object" | "aget-boolean" | "aget-byte" | "aget-char"
+            | "aget-short" => format_aget(&ops_resolved),
+            "aput" | "aput-wide" | "aput-object" | "aput-boolean" | "aput-byte" | "aput-char"
+            | "aput-short" => format_aput(&ops_resolved),
             // Comparison (F23x): vA, vB, vC → vA = (vB op vC) ? 1 : 0; we emit Java-like comparison
             "cmpl-float" | "cmpg-float" | "cmpl-double" | "cmpg-double" | "cmp-long" => {
                 format_cmp(&ops_resolved, m)
@@ -4738,8 +5403,12 @@ impl<'a> Decompiler<'a> {
             // const-class vA, type → "vA = Type.class;"
             "const-class" => format_const_class(&ops_resolved),
             // monitor-enter/exit
-            "monitor-enter" => parse_one_reg(&ops_resolved).map(|r| format!("/* monitor-enter(v{}) */", r)).unwrap_or_default(),
-            "monitor-exit" => parse_one_reg(&ops_resolved).map(|r| format!("/* monitor-exit(v{}) */", r)).unwrap_or_default(),
+            "monitor-enter" => parse_one_reg(&ops_resolved)
+                .map(|r| format!("/* monitor-enter(v{}) */", r))
+                .unwrap_or_default(),
+            "monitor-exit" => parse_one_reg(&ops_resolved)
+                .map(|r| format!("/* monitor-exit(v{}) */", r))
+                .unwrap_or_default(),
             // fill-array-data: parse payload and emit arr = new int[]{ ... };
             "fill-array-data" => format_fill_array_data(ins, code_insns, &ops_resolved),
             _ => format!("{}; /* {} */", ops_resolved, m),
@@ -4778,7 +5447,9 @@ impl<'a> Decompiler<'a> {
     ) -> Result<crate::emulator::Emulator> {
         use crate::emulator::state::{Emulator as Emu, InstructionInfo};
 
-        let code = self.dex.get_code_item(encoded.code_off)
+        let code = self
+            .dex
+            .get_code_item(encoded.code_off)
             .map_err(|e| DexDecompilerError::Decompilation(format!("code_item: {}", e)))?;
         let insns_bytes = code.insns_slice(&*self.dex.data);
         let instructions = decode_all(insns_bytes, 0)
@@ -4805,7 +5476,15 @@ impl<'a> Decompiler<'a> {
         let ins_size = code.ins_size as u32;
         let is_static = (encoded.access_flags & 0x8) != 0;
 
-        Ok(Emu::new_with_heap(ins_info, resolved, registers_size, ins_size, is_static, params, initial_heap))
+        Ok(Emu::new_with_heap(
+            ins_info,
+            resolved,
+            registers_size,
+            ins_size,
+            is_static,
+            params,
+            initial_heap,
+        ))
     }
 }
 
@@ -4818,18 +5497,21 @@ fn replace_capture_in_body(body: &str, field_name: &str, arg: &str) -> String {
             .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .map(|i| i + 1)
             .unwrap_or(0);
-        result = format!("{}{}{}", &result[..start], arg, &result[pos + dot_field.len()..]);
+        result = format!(
+            "{}{}{}",
+            &result[..start],
+            arg,
+            &result[pos + dot_field.len()..]
+        );
     }
     result = result.replace(field_name, arg);
     result
 }
 
 /// After capture replacement: find "var = arg;" lines and replace whole-word "var" with "arg" in body, then remove those assignment lines.
-fn replace_capture_assignees_in_body(
-    body: &str,
-    val_replacements: &[(String, String)],
-) -> String {
-    let args: std::collections::HashSet<&str> = val_replacements.iter().map(|(_, a)| a.as_str()).collect();
+fn replace_capture_assignees_in_body(body: &str, val_replacements: &[(String, String)]) -> String {
+    let args: std::collections::HashSet<&str> =
+        val_replacements.iter().map(|(_, a)| a.as_str()).collect();
     let mut assignees: Vec<(String, String)> = Vec::new();
     for line in body.lines() {
         let stmt = line.trim();
@@ -4841,7 +5523,10 @@ fn replace_capture_assignees_in_body(
         if let Some(eq) = stmt_clean.find(" = ") {
             let var = stmt_clean[..eq].trim();
             let rhs = stmt_clean[eq + 3..].trim_end_matches(';').trim();
-            if args.contains(rhs) && !var.is_empty() && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if args.contains(rhs)
+                && !var.is_empty()
+                && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
                 assignees.push((var.to_string(), rhs.to_string()));
             }
         }
@@ -4918,7 +5603,9 @@ fn strip_unreachable_exception_junk_after_return(body: &str) -> String {
                     i += 1;
                     continue;
                 }
-                if next_indent <= return_indent && (next.trim().starts_with('}') || next.trim().starts_with("} catch")) {
+                if next_indent <= return_indent
+                    && (next.trim().starts_with('}') || next.trim().starts_with("} catch"))
+                {
                     break;
                 }
                 let t = next.trim();
@@ -4949,9 +5636,16 @@ fn replace_whole_word(body: &str, from: &str, to: &str) -> String {
             let start = i;
             let end = i + from.len();
             let prev_ok = start == 0
-                || !body[..start].chars().rev().next().map_or(false, |c| c.is_ascii_alphanumeric() || c == '_');
+                || !body[..start]
+                    .chars()
+                    .rev()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_alphanumeric() || c == '_');
             let next_ok = end >= body.len()
-                || !body[end..].chars().next().map_or(false, |c| c.is_ascii_alphanumeric() || c == '_');
+                || !body[end..]
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_alphanumeric() || c == '_');
             if prev_ok && next_ok {
                 result.push_str(to);
                 i = end;
@@ -5082,10 +5776,7 @@ fn looks_like_dalvik_reg(s: &str) -> bool {
         return false;
     };
     // v0 / p1 / v3_0 (SSA)
-    !rest.is_empty()
-        && rest
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '_')
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '_')
 }
 
 fn split_top_level_args(s: &str) -> Vec<String> {
@@ -5141,7 +5832,11 @@ fn drop_wide_high_half_args(args: &str, param_types: &[String]) -> String {
 }
 
 /// Format compound assign marker into proper Java (e.g. `i++` or `n0 += 3`).
-fn format_compound_line(compound: &str, var: &str, name_map: Option<&HashMap<VarId, String>>) -> String {
+fn format_compound_line(
+    compound: &str,
+    var: &str,
+    name_map: Option<&HashMap<VarId, String>>,
+) -> String {
     let compound = if let Some(nm) = name_map {
         ir::substitute_names_in_text_pub(compound, nm)
     } else {
@@ -5168,7 +5863,9 @@ fn format_compound_line(compound: &str, var: &str, name_map: Option<&HashMap<Var
 fn resolve_compound_in_line(line: &str, name_map: Option<&HashMap<VarId, String>>) -> String {
     if let Some(eq_pos) = line.find(" = __compound_") {
         let var = line[..eq_pos].trim();
-        let after = line[eq_pos + " = __compound_".len()..].trim_end_matches(';').trim();
+        let after = line[eq_pos + " = __compound_".len()..]
+            .trim_end_matches(';')
+            .trim();
         let after = if let Some(nm) = name_map {
             ir::substitute_names_in_text_pub(after, nm)
         } else {
@@ -5327,8 +6024,14 @@ fn collect_class_imports(
 fn shorten_java_names(line: &str) -> String {
     let mut s = line.to_string();
     for prefix in &[
-        "java.lang.", "java.util.", "java.io.", "android.content.",
-        "android.os.", "android.app.", "android.view.", "android.widget.",
+        "java.lang.",
+        "java.util.",
+        "java.io.",
+        "android.content.",
+        "android.os.",
+        "android.app.",
+        "android.view.",
+        "android.widget.",
     ] {
         while let Some(pos) = s.find(prefix) {
             // Only shorten if the previous char is a word boundary
@@ -5473,7 +6176,11 @@ fn is_branch_offset(token: &str) -> bool {
         return true;
     }
     let b = t.as_bytes();
-    (b[0] == b'+' || b[0] == b'-') && t[1..].trim().chars().all(|c| c.is_ascii_hexdigit() || c == 'h')
+    (b[0] == b'+' || b[0] == b'-')
+        && t[1..]
+            .trim()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == 'h')
         || (t.starts_with("0x") && t[2..].chars().all(|c| c.is_ascii_hexdigit()))
 }
 
@@ -5494,8 +6201,7 @@ fn replace_register_names(condition: &str, reg_to_name: &HashMap<u32, String>) -
                 }
                 if end > start {
                     let after_ok = end == bytes.len()
-                        || !(bytes[end] as char).is_ascii_alphanumeric()
-                            && bytes[end] != b'_';
+                        || !(bytes[end] as char).is_ascii_alphanumeric() && bytes[end] != b'_';
                     if after_ok {
                         if let Ok(reg) = condition[start..end].parse::<u32>() {
                             if let Some(name) = reg_to_name.get(&reg) {
@@ -5533,7 +6239,9 @@ fn polish_boolean_condition(
         return condition.to_string();
     }
     let ty = local_names.iter().find_map(|(reg, n)| {
-        (n == name).then(|| local_types.get(reg).map(|t| t.as_str())).flatten()
+        (n == name)
+            .then(|| local_types.get(reg).map(|t| t.as_str()))
+            .flatten()
     });
     let is_bool = ty == Some("boolean") || looks_like_boolean_temp(name);
     if is_bool {
@@ -5768,8 +6476,18 @@ fn resolve_one(dex: &DexFile, part: &str) -> String {
     if let Some(idx_str) = part.strip_prefix("method@") {
         if let Ok(idx) = idx_str.parse::<u32>() {
             if let Ok(mi) = dex.get_method_info(idx) {
-                let params = mi.params.iter().map(|p| java::descriptor_to_java(p)).collect::<Vec<_>>().join(", ");
-                return format!("{}.{}({})", java::descriptor_to_java(&mi.class), mi.name, params);
+                let params = mi
+                    .params
+                    .iter()
+                    .map(|p| java::descriptor_to_java(p))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return format!(
+                    "{}.{}({})",
+                    java::descriptor_to_java(&mi.class),
+                    mi.name,
+                    params
+                );
             }
         }
     }
@@ -5809,10 +6527,7 @@ fn format_call_site_java(dex: &dex_parser::DexFile, info: &dex_parser::CallSiteI
     if let Some(mid) = dex_parser::DexCallSites::impl_method_id(info) {
         if let Ok(mi) = dex.get_method_info(mid as u32) {
             let class = java::descriptor_to_java(&mi.class);
-            return format!(
-                "/* lambda {} → {}.{} */",
-                info.method_name, class, mi.name
-            );
+            return format!("/* lambda {} → {}.{} */", info.method_name, class, mi.name);
         }
     }
     format!(
@@ -5832,11 +6547,7 @@ fn format_invoke_custom_stmt(dex: &dex_parser::DexFile, raw_ops: &str) -> String
                     let class = java::descriptor_to_java(&mi.class);
                     return format!(
                         "/* lambda {}.{} */ {}.{}({})",
-                        info.method_name,
-                        mi.name,
-                        class,
-                        mi.name,
-                        args
+                        info.method_name, mi.name, class, mi.name, args
                     );
                 }
             }
@@ -5982,7 +6693,11 @@ pub(crate) fn parse_instance_field_operands(ops: &str) -> Option<(u32, u32, Stri
     let dest = parts[0].strip_prefix('v')?.parse().ok()?;
     let object_reg = parts[1].strip_prefix('v')?.parse().ok()?;
     let field_ref = parts[2].trim();
-    let field_name = field_ref.rsplit('.').next().unwrap_or(field_ref).to_string();
+    let field_name = field_ref
+        .rsplit('.')
+        .next()
+        .unwrap_or(field_ref)
+        .to_string();
     Some((dest, object_reg, field_name))
 }
 
@@ -6040,7 +6755,11 @@ fn shorten_float_literal(v: f64, s: &str) -> String {
                 best = trim_float_trailing_zeros(&candidate);
             }
         }
-        if !candidate.as_bytes().last().is_some_and(|b| b.is_ascii_digit()) {
+        if !candidate
+            .as_bytes()
+            .last()
+            .is_some_and(|b| b.is_ascii_digit())
+        {
             break;
         }
         candidate.pop();
@@ -6118,11 +6837,13 @@ fn parse_assign_rhs(m: &str, ops: &str) -> Option<(u32, String)> {
             Some((reg, val))
         }
         "sub-int/2addr" | "add-int/2addr" | "mul-int/2addr" | "div-int/2addr" | "rem-int/2addr"
-        | "and-int/2addr" | "or-int/2addr" | "xor-int/2addr" | "shl-int/2addr" | "shr-int/2addr" | "ushr-int/2addr"
-        | "add-long/2addr" | "sub-long/2addr" | "mul-long/2addr" | "div-long/2addr" | "rem-long/2addr"
-        | "and-long/2addr" | "or-long/2addr" | "xor-long/2addr" | "shl-long/2addr" | "shr-long/2addr" | "ushr-long/2addr"
-        | "add-float/2addr" | "sub-float/2addr" | "mul-float/2addr" | "div-float/2addr" | "rem-float/2addr"
-        | "add-double/2addr" | "sub-double/2addr" | "mul-double/2addr" | "div-double/2addr" | "rem-double/2addr" => {
+        | "and-int/2addr" | "or-int/2addr" | "xor-int/2addr" | "shl-int/2addr"
+        | "shr-int/2addr" | "ushr-int/2addr" | "add-long/2addr" | "sub-long/2addr"
+        | "mul-long/2addr" | "div-long/2addr" | "rem-long/2addr" | "and-long/2addr"
+        | "or-long/2addr" | "xor-long/2addr" | "shl-long/2addr" | "shr-long/2addr"
+        | "ushr-long/2addr" | "add-float/2addr" | "sub-float/2addr" | "mul-float/2addr"
+        | "div-float/2addr" | "rem-float/2addr" | "add-double/2addr" | "sub-double/2addr"
+        | "mul-double/2addr" | "div-double/2addr" | "rem-double/2addr" => {
             let op = match m {
                 "sub-int/2addr" | "sub-long/2addr" | "sub-float/2addr" | "sub-double/2addr" => "-",
                 "add-int/2addr" | "add-long/2addr" | "add-float/2addr" | "add-double/2addr" => "+",
@@ -6139,13 +6860,31 @@ fn parse_assign_rhs(m: &str, ops: &str) -> Option<(u32, String)> {
             };
             parse_two_regs(ops).map(|(a, b)| (a, format!("v{} {} v{}", a, op, b)))
         }
-        "add-int/lit8" | "mul-int/lit8" | "div-int/lit8" | "rem-int/lit8" | "and-int/lit8" | "or-int/lit8" | "xor-int/lit8"
-        | "shl-int/lit8" | "shr-int/lit8" | "ushr-int/lit8"
-        | "add-int/lit16" | "mul-int/lit16" | "div-int/lit16" | "rem-int/lit16" | "and-int/lit16" | "or-int/lit16" | "xor-int/lit16" => {
-            let op = if m.contains("add") { "+" } else if m.contains("mul") { "*" } else if m.contains("div") { "/" }
-                else if m.contains("rem") { "%" } else if m.contains("and") { "&" } else if m.contains("or") { "|" }
-                else if m.contains("xor") { "^" } else if m.contains("shl") { "<<" } else if m.contains("shr") && !m.contains("ushr") { ">>" }
-                else { ">>>" };
+        "add-int/lit8" | "mul-int/lit8" | "div-int/lit8" | "rem-int/lit8" | "and-int/lit8"
+        | "or-int/lit8" | "xor-int/lit8" | "shl-int/lit8" | "shr-int/lit8" | "ushr-int/lit8"
+        | "add-int/lit16" | "mul-int/lit16" | "div-int/lit16" | "rem-int/lit16"
+        | "and-int/lit16" | "or-int/lit16" | "xor-int/lit16" => {
+            let op = if m.contains("add") {
+                "+"
+            } else if m.contains("mul") {
+                "*"
+            } else if m.contains("div") {
+                "/"
+            } else if m.contains("rem") {
+                "%"
+            } else if m.contains("and") {
+                "&"
+            } else if m.contains("or") {
+                "|"
+            } else if m.contains("xor") {
+                "^"
+            } else if m.contains("shl") {
+                "<<"
+            } else if m.contains("shr") && !m.contains("ushr") {
+                ">>"
+            } else {
+                ">>>"
+            };
             parse_two_regs_and_literal(ops).map(|(dest, src, lit)| {
                 let lit_trim = lit.trim();
                 let rhs = if op == "+" && lit_trim.starts_with('-') && lit_trim.len() > 1 {
@@ -6157,22 +6896,43 @@ fn parse_assign_rhs(m: &str, ops: &str) -> Option<(u32, String)> {
                 (dest, rhs)
             })
         }
-        "rsub-int/lit8" | "rsub-int" => {
-            parse_two_regs_and_literal(ops).map(|(dest, src, lit)| (dest, format!("{} - v{}", lit, src)))
-        }
-        "add-int" | "add-long" | "sub-int" | "sub-long" | "mul-int" | "mul-long" | "div-int" | "div-long" | "rem-int" | "rem-long"
-        | "and-int" | "and-long" | "or-int" | "or-long" | "xor-int" | "xor-long" | "shl-int" | "shl-long" | "shr-int" | "shr-long" | "ushr-int" | "ushr-long" => {
-            let op = if m.contains("add") { "+" } else if m.contains("sub") { "-" } else if m.contains("mul") { "*" }
-                else if m.contains("div") { "/" } else if m.contains("rem") { "%" } else if m.contains("and") { "&" }
-                else if m.contains("or") { "|" } else if m.contains("xor") { "^" } else if m.contains("shl") { "<<" }
-                else if m.contains("ushr") { ">>>" } else { ">>" };
+        "rsub-int/lit8" | "rsub-int" => parse_two_regs_and_literal(ops)
+            .map(|(dest, src, lit)| (dest, format!("{} - v{}", lit, src))),
+        "add-int" | "add-long" | "sub-int" | "sub-long" | "mul-int" | "mul-long" | "div-int"
+        | "div-long" | "rem-int" | "rem-long" | "and-int" | "and-long" | "or-int" | "or-long"
+        | "xor-int" | "xor-long" | "shl-int" | "shl-long" | "shr-int" | "shr-long" | "ushr-int"
+        | "ushr-long" => {
+            let op = if m.contains("add") {
+                "+"
+            } else if m.contains("sub") {
+                "-"
+            } else if m.contains("mul") {
+                "*"
+            } else if m.contains("div") {
+                "/"
+            } else if m.contains("rem") {
+                "%"
+            } else if m.contains("and") {
+                "&"
+            } else if m.contains("or") {
+                "|"
+            } else if m.contains("xor") {
+                "^"
+            } else if m.contains("shl") {
+                "<<"
+            } else if m.contains("ushr") {
+                ">>>"
+            } else {
+                ">>"
+            };
             parse_three_regs(ops).map(|(a, b, c)| (a, format!("v{} {} v{}", b, op, c)))
         }
         "neg-int" | "neg-long" | "neg-float" | "neg-double" | "not-int" | "not-long" => {
             let op = if m.starts_with("neg") { "-" } else { "~" };
             parse_two_regs(ops).map(|(a, b)| (a, format!("{}{}", op, format!("v{}", b))))
         }
-        "move" | "move/from16" | "move/16" | "move-object" | "move-wide" | "move-wide/from16" | "move-wide/16" | "move-object/from16" | "move-object/16" => {
+        "move" | "move/from16" | "move/16" | "move-object" | "move-wide" | "move-wide/from16"
+        | "move-wide/16" | "move-object/from16" | "move-object/16" => {
             parse_two_regs(ops).map(|(d, s)| (d, format!("v{}", s)))
         }
         // Int-to-* casts
@@ -6202,53 +6962,69 @@ fn parse_assign_rhs(m: &str, ops: &str) -> Option<(u32, String)> {
             let element_type = type_str.strip_suffix("[]").unwrap_or(type_str);
             Some((dst_reg, format!("new {}[v{}]", element_type, size_reg)))
         }
-        "iget" | "iget-wide" | "iget-object" | "iget-boolean" | "iget-byte" | "iget-char" | "iget-short" => {
+        "iget" | "iget-wide" | "iget-object" | "iget-boolean" | "iget-byte" | "iget-char"
+        | "iget-short" => {
             if let Some((dest, obj, field)) = parse_instance_field_operands(ops) {
                 Some((dest, format!("v{}.{}", obj, field)))
             } else {
                 None
             }
         }
-        "sget" | "sget-wide" | "sget-object" | "sget-boolean" | "sget-byte" | "sget-char" | "sget-short" => {
+        "sget" | "sget-wide" | "sget-object" | "sget-boolean" | "sget-byte" | "sget-char"
+        | "sget-short" => {
             if let Some((reg, field_ref)) = parse_static_field_operands(ops) {
                 Some((reg, field_ref))
             } else {
                 None
             }
         }
-        "aget" | "aget-wide" | "aget-object" | "aget-boolean" | "aget-byte" | "aget-char" | "aget-short" => {
-            parse_three_regs(ops).map(|(a, b, c)| (a, format!("v{}[v{}]", b, c)))
-        }
-        "array-length" => {
-            parse_two_regs(ops).map(|(a, b)| (a, format!("v{}.length", b)))
-        }
+        "aget" | "aget-wide" | "aget-object" | "aget-boolean" | "aget-byte" | "aget-char"
+        | "aget-short" => parse_three_regs(ops).map(|(a, b, c)| (a, format!("v{}[v{}]", b, c))),
+        "array-length" => parse_two_regs(ops).map(|(a, b)| (a, format!("v{}.length", b))),
         "new-instance" => {
             let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let reg: u32 = parts[0].strip_prefix('v')?.parse().ok()?;
             Some((reg, format!("new {}()", parts[1])))
         }
         "check-cast" => {
             let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let reg: u32 = parts[0].strip_prefix('v')?.parse().ok()?;
             Some((reg, format!("({}) v{}", parts[1], reg)))
         }
         "instance-of" => {
             let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
-            if parts.len() < 3 { return None; }
+            if parts.len() < 3 {
+                return None;
+            }
             let dst: u32 = parts[0].strip_prefix('v')?.parse().ok()?;
-            Some((dst, format!("v{} instanceof {}", parts[1].strip_prefix('v').unwrap_or(parts[1]), parts[2])))
+            Some((
+                dst,
+                format!(
+                    "v{} instanceof {}",
+                    parts[1].strip_prefix('v').unwrap_or(parts[1]),
+                    parts[2]
+                ),
+            ))
         }
         "const-class" => {
             let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let reg: u32 = parts[0].strip_prefix('v')?.parse().ok()?;
             Some((reg, format!("{}.class", parts[1])))
         }
         "const-wide/16" | "const-wide/32" | "const-wide" | "const-wide/high16" | "const/high16" => {
             let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let reg: u32 = parts[0].strip_prefix('v')?.parse().ok()?;
             Some((reg, parts[1..].join(", ")))
         }
@@ -6292,7 +7068,11 @@ fn format_new_array(ops: &str) -> Option<String> {
 /// filled-new-array vA, vB, …, type[] → `new ElementType[]{ vA, vB, … }` (no destination;
 /// result is taken by a following move-result-object).
 fn format_filled_new_array_expr(ops: &str) -> Option<String> {
-    let parts: Vec<&str> = ops.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = ops
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.len() < 2 {
         return None;
     }
@@ -6423,7 +7203,9 @@ fn format_iget(ops: &str) -> String {
 /// Format iput*: vA (value), vB (object), field → "vB.fieldName = vA;"
 fn format_iput(ops: &str) -> String {
     parse_instance_field_operands(ops)
-        .map(|(value_reg, object_reg, field_name)| format!("v{}.{} = v{};", object_reg, field_name, value_reg))
+        .map(|(value_reg, object_reg, field_name)| {
+            format!("v{}.{} = v{};", object_reg, field_name, value_reg)
+        })
         .unwrap_or_default()
 }
 
@@ -6469,7 +7251,11 @@ const SPARSE_SWITCH_ID: u16 = 0x0200;
 const FILL_ARRAY_DATA_ID: u16 = 0x0300;
 
 fn format_switch(ins: &Instruction, code_insns: &[u8], ops_resolved: &str) -> String {
-    let var = ops_resolved.split(',').next().map(str::trim).unwrap_or("v0");
+    let var = ops_resolved
+        .split(',')
+        .next()
+        .map(str::trim)
+        .unwrap_or("v0");
     let ins_off = ins.offset as usize;
     if ins_off + 6 > code_insns.len() {
         return format!("switch ({});  // (payload missing)", var);
@@ -6502,10 +7288,15 @@ fn format_switch(ins: &Instruction, code_insns: &[u8], ops_resolved: &str) -> St
     };
     let cand_a = (ins_off as i32 + rel_units * 2) as usize; // branch from instruction start
     let cand_b = (ins_off as i32 + 2 + rel_units * 2) as usize; // branch from instruction+2
-    let mut candidates: Vec<usize> = [cand_a, cand_b, (ins_off as i32 + rel_units) as usize, (ins_off as i32 + 2 + rel_units) as usize]
-        .iter()
-        .filter_map(|&c| to_valid(c))
-        .collect();
+    let mut candidates: Vec<usize> = [
+        cand_a,
+        cand_b,
+        (ins_off as i32 + rel_units) as usize,
+        (ins_off as i32 + 2 + rel_units) as usize,
+    ]
+    .iter()
+    .filter_map(|&c| to_valid(c))
+    .collect();
     // If no candidate matched, scan a small window (alignment / offset convention)
     if candidates.iter().all(|&c| try_at(c).is_none()) {
         let center = cand_a;
@@ -6557,7 +7348,11 @@ fn format_switch(ins: &Instruction, code_insns: &[u8], ops_resolved: &str) -> St
         _ => return format!("switch ({});  // (unknown payload)", var),
     }
     let case_str: Vec<String> = cases.iter().map(|k| format!("case {}:", k)).collect();
-    format!("switch ({}) {{ {} default: break; }}", var, case_str.join(" "))
+    format!(
+        "switch ({}) {{ {} default: break; }}",
+        var,
+        case_str.join(" ")
+    )
 }
 
 /// Parse fill-array-data payload and return an initializer like "arr = new int[]{ 1, 2, 3 };".
@@ -6586,7 +7381,11 @@ fn parse_fill_array_data_assign(
     code_insns: &[u8],
     ops_resolved: &str,
 ) -> Option<(u32, String)> {
-    let arr_tok = ops_resolved.split(',').next().map(str::trim).unwrap_or("v0");
+    let arr_tok = ops_resolved
+        .split(',')
+        .next()
+        .map(str::trim)
+        .unwrap_or("v0");
     let reg: u32 = arr_tok.strip_prefix('v')?.parse().ok()?;
     let ins_off = ins.offset as usize;
     if ins_off + 6 > code_insns.len() {
@@ -6606,7 +7405,11 @@ fn parse_fill_array_data_assign(
             return None;
         }
         let elem_w = u16::from_le_bytes(code_insns[off + 2..off + 4].try_into().unwrap_or([0, 0]));
-        let size = u32::from_le_bytes(code_insns[off + 4..off + 8].try_into().unwrap_or([0, 0, 0, 0]));
+        let size = u32::from_le_bytes(
+            code_insns[off + 4..off + 8]
+                .try_into()
+                .unwrap_or([0, 0, 0, 0]),
+        );
         if elem_w != 1 && elem_w != 2 && elem_w != 4 && elem_w != 8 {
             return None;
         }
@@ -6636,7 +7439,8 @@ fn parse_fill_array_data_assign(
                 if el_off + 2 > code_insns.len() {
                     break;
                 }
-                let s = i16::from_le_bytes(code_insns[el_off..el_off + 2].try_into().unwrap_or([0, 0]));
+                let s =
+                    i16::from_le_bytes(code_insns[el_off..el_off + 2].try_into().unwrap_or([0, 0]));
                 s.to_string()
             }
             4 => {
@@ -6654,11 +7458,8 @@ fn parse_fill_array_data_assign(
                 if el_off + 8 > code_insns.len() {
                     break;
                 }
-                let n = i64::from_le_bytes(
-                    code_insns[el_off..el_off + 8]
-                        .try_into()
-                        .unwrap_or([0; 8]),
-                );
+                let n =
+                    i64::from_le_bytes(code_insns[el_off..el_off + 8].try_into().unwrap_or([0; 8]));
                 n.to_string()
             }
             _ => break,
@@ -6672,19 +7473,30 @@ fn parse_fill_array_data_assign(
 
 /// Format cmp (F23x): vA, vB, vC → vA = -1/0/1 comparison result.
 fn format_cmp(ops: &str, mnemonic: &str) -> String {
-    parse_three_regs(ops).map(|(a, b, c)| {
-        // cmpl: less -> -1, greater -> 1, equal -> 0; cmpg: same (NaN handling differs in Dalvik).
-        // cmp-long: (vB > vC) ? 1 : ((vB < vC) ? -1 : 0)
-        match mnemonic {
-            "cmpl-float" | "cmpl-double" | "cmpg-float" | "cmpg-double" => {
-                format!("v{} = (v{} < v{}) ? -1 : ((v{} > v{}) ? 1 : 0);", a, b, c, b, c)
+    parse_three_regs(ops)
+        .map(|(a, b, c)| {
+            // cmpl: less -> -1, greater -> 1, equal -> 0; cmpg: same (NaN handling differs in Dalvik).
+            // cmp-long: (vB > vC) ? 1 : ((vB < vC) ? -1 : 0)
+            match mnemonic {
+                "cmpl-float" | "cmpl-double" | "cmpg-float" | "cmpg-double" => {
+                    format!(
+                        "v{} = (v{} < v{}) ? -1 : ((v{} > v{}) ? 1 : 0);",
+                        a, b, c, b, c
+                    )
+                }
+                "cmp-long" => {
+                    format!(
+                        "v{} = (v{} > v{}) ? 1 : ((v{} < v{}) ? -1 : 0);",
+                        a, b, c, b, c
+                    )
+                }
+                _ => format!(
+                    "v{} = (v{} < v{}) ? -1 : ((v{} > v{}) ? 1 : 0);",
+                    a, b, c, b, c
+                ),
             }
-            "cmp-long" => {
-                format!("v{} = (v{} > v{}) ? 1 : ((v{} < v{}) ? -1 : 0);", a, b, c, b, c)
-            }
-            _ => format!("v{} = (v{} < v{}) ? -1 : ((v{} > v{}) ? 1 : 0);", a, b, c, b, c),
-        }
-    }).unwrap_or_default()
+        })
+        .unwrap_or_default()
 }
 
 /// check-cast: "vN, Type" → "vN = (Type) vN;"
@@ -6897,20 +7709,17 @@ mod tests {
             super::format_iput("v3, v1, pkg.Clz.fieldName"),
             "v1.fieldName = v3;"
         );
-        assert_eq!(super::format_sget("v0, Foo.staticField"), "v0 = Foo.staticField;");
+        assert_eq!(
+            super::format_sget("v0, Foo.staticField"),
+            "v0 = Foo.staticField;"
+        );
         assert_eq!(super::format_sput("v1, Bar.other"), "Bar.other = v1;");
     }
 
     #[test]
     fn parse_const_into_reg_valid() {
-        assert_eq!(
-            parse_const_into_reg("v0, 42"),
-            Some("v0 = 42;".into())
-        );
-        assert_eq!(
-            parse_const_into_reg("v1, -1"),
-            Some("v1 = -1;".into())
-        );
+        assert_eq!(parse_const_into_reg("v0, 42"), Some("v0 = 42;".into()));
+        assert_eq!(parse_const_into_reg("v1, -1"), Some("v1 = -1;".into()));
     }
 
     #[test]
@@ -7026,14 +7835,8 @@ mod tests {
     fn polish_boolean_condition_z_temp() {
         let names = HashMap::new();
         let types = HashMap::new();
-        assert_eq!(
-            polish_boolean_condition("z0 == 0", &names, &types),
-            "!z0"
-        );
-        assert_eq!(
-            polish_boolean_condition("z0 != 0", &names, &types),
-            "z0"
-        );
+        assert_eq!(polish_boolean_condition("z0 == 0", &names, &types), "!z0");
+        assert_eq!(polish_boolean_condition("z0 != 0", &names, &types), "z0");
         // Non-boolean temps stay as comparisons
         assert_eq!(
             polish_boolean_condition("i0 == 0", &names, &types),
@@ -7097,19 +7900,16 @@ mod tests {
 
     #[test]
     fn enum_detection_non_static_final_ignored() {
-        let static_fields = vec![
-            ("test.Color".to_string(), "RED".to_string(), 0x8u32),
-        ];
+        let static_fields = vec![("test.Color".to_string(), "RED".to_string(), 0x8u32)];
         let r = super::enum_constants_from_static_fields("test.Color", "Enum", &static_fields);
         assert!(r.is_empty());
     }
 
     #[test]
     fn parse_invoke_keeps_param_types() {
-        let (target, args, params) = super::parse_invoke_call_parts(
-            "v1, v3, v4, java.lang.StringBuilder.append(long)",
-        )
-        .unwrap();
+        let (target, args, params) =
+            super::parse_invoke_call_parts("v1, v3, v4, java.lang.StringBuilder.append(long)")
+                .unwrap();
         assert_eq!(target, "java.lang.StringBuilder.append");
         assert_eq!(args, "v1, v3, v4");
         assert_eq!(params, vec!["long"]);
@@ -7117,10 +7917,9 @@ mod tests {
 
     #[test]
     fn drop_wide_high_half_for_append_long() {
-        let (_, args, params) = super::parse_invoke_call_parts(
-            "v1, v3, v4, java.lang.StringBuilder.append(long)",
-        )
-        .unwrap();
+        let (_, args, params) =
+            super::parse_invoke_call_parts("v1, v3, v4, java.lang.StringBuilder.append(long)")
+                .unwrap();
         let (target, args) = super::to_receiver_style("java.lang.StringBuilder.append", &args);
         assert_eq!(target, "v1.append");
         assert_eq!(super::drop_wide_high_half_args(&args, &params), "v3");
@@ -7139,20 +7938,14 @@ mod tests {
     #[test]
     fn drop_wide_leaves_non_reg_second_arg() {
         // Don't drop a real expression that happens to follow a long-typed slot mismatch.
-        let args = super::drop_wide_high_half_args(
-            "System.currentTimeMillis(), \"x\"",
-            &["long".into()],
-        );
+        let args =
+            super::drop_wide_high_half_args("System.currentTimeMillis(), \"x\"", &["long".into()]);
         assert_eq!(args, "System.currentTimeMillis(), \"x\"");
     }
 
     #[test]
     fn debug_param_names_prefer_table_then_start_local() {
-        let types = vec![
-            "int".into(),
-            "java.lang.String[]".into(),
-            "int[]".into(),
-        ];
+        let types = vec!["int".into(), "java.lang.String[]".into(), "int[]".into()];
         let mut locals = HashMap::new();
         // instance: slot 0 = this, 1 = requestCode, 2 = permissions, 3 = grantResults
         locals.insert(4, "grantResults".to_string());

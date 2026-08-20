@@ -28,10 +28,7 @@ pub fn restore_string_switch(body: &str) -> String {
         {
             let inner = inner.trim().to_string();
             if inner.ends_with(".hashCode()") {
-                let expr = inner
-                    .trim_end_matches(".hashCode()")
-                    .trim()
-                    .to_string();
+                let expr = inner.trim_end_matches(".hashCode()").trim().to_string();
                 let indent = leading_indent(&lines[i]).to_string();
                 lines[i] = format!("{}switch ({}) {{", indent, expr);
                 let mut j = i + 1;
@@ -102,7 +99,10 @@ pub fn restore_string_switch(body: &str) -> String {
     let mut cleaned = Vec::with_capacity(lines.len());
     for (idx, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
-            let prev_empty = cleaned.last().map(|l: &String| l.trim().is_empty()).unwrap_or(true);
+            let prev_empty = cleaned
+                .last()
+                .map(|l: &String| l.trim().is_empty())
+                .unwrap_or(true);
             let next_case = lines
                 .get(idx + 1)
                 .map(|l| {
@@ -159,17 +159,25 @@ pub(crate) fn clear_string_equals_guards(lines: &mut [String], start: usize, exp
             break;
         }
         let is_guard = extract_string_equals(&tk, expr).is_some()
-            || (tk.contains(".equals(") && (tk.contains(expr) || tk.contains(&format!("\"{expr}"))));
+            || (tk.contains(".equals(")
+                && (tk.contains(expr) || tk.contains(&format!("\"{expr}"))));
         if is_guard && tk.starts_with("if (") {
             lines[k] = String::new();
             if k + 1 < lines.len() && lines[k + 1].trim() == "break;" {
                 lines[k + 1] = String::new();
             }
         } else if tk == "break;"
-            && lines.get(k.wrapping_sub(1)).map(|l| l.trim().is_empty() || l.trim().contains(".equals(")).unwrap_or(false)
+            && lines
+                .get(k.wrapping_sub(1))
+                .map(|l| l.trim().is_empty() || l.trim().contains(".equals("))
+                .unwrap_or(false)
         {
             // orphaned break after cleared multi-line if — leave alone unless previous was equals
-            if lines.get(k.wrapping_sub(1)).map(|l| l.trim().contains(".equals(")).unwrap_or(false) {
+            if lines
+                .get(k.wrapping_sub(1))
+                .map(|l| l.trim().contains(".equals("))
+                .unwrap_or(false)
+            {
                 lines[k] = String::new();
             }
         }

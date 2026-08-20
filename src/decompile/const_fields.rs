@@ -25,8 +25,8 @@ pub fn parse_static_inits(
     if class_def.static_values_off == 0 {
         return vec![];
     }
-    let values = parse_encoded_array(&*dex.data, class_def.static_values_off as usize)
-        .unwrap_or_default();
+    let values =
+        parse_encoded_array(&*dex.data, class_def.static_values_off as usize).unwrap_or_default();
     let mut out = Vec::new();
     for (i, field) in class_data.static_fields.iter().enumerate() {
         let Some(val) = values.get(i) else { break };
@@ -270,7 +270,9 @@ fn read_encoded_value(data: &[u8], pos: &mut usize) -> Option<EncodedValue> {
                 buf[i] = *data.get(*pos)?;
                 *pos += 1;
             }
-            Some(EncodedValue::Double(f64::from_bits(u64::from_le_bytes(buf))))
+            Some(EncodedValue::Double(f64::from_bits(u64::from_le_bytes(
+                buf,
+            ))))
         }
         0x17 => {
             let mut v: u32 = 0;

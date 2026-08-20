@@ -554,7 +554,8 @@ impl VulnFinding {
         let meta = category_meta(category);
         let source_desc = source_desc.into();
         let sink_desc = sink_desc.into();
-        let message = format_finding_message(meta, class_name, method_name, &source_desc, &sink_desc);
+        let message =
+            format_finding_message(meta, class_name, method_name, &source_desc, &sink_desc);
         let problem = format_problem(
             class_name,
             method_name,
@@ -677,7 +678,10 @@ fn format_problem(
             sink = sink_bit,
         );
     }
-    format!("In `{loc}`, dangerous API {sink} is invoked.", sink = sink_bit)
+    format!(
+        "In `{loc}`, dangerous API {sink} is invoked.",
+        sink = sink_bit
+    )
 }
 
 /// Shorten `pkg.Class.method` / `Lpkg/Class;.method` style refs for display.
@@ -895,7 +899,88 @@ pub fn source_sink_scan(
             }
         }
     }
+    if is_untrusted_callback(method_name) && owned.ins_size > 1 {
+        let first_param = owned
+            .registers_size
+            .saturating_sub(owned.ins_size)
+            .saturating_add(1); // skip `this`
+        let source_offset = owned
+            .cfg
+            .blocks
+            .get(owned.cfg.entry)
+            .map(|block| block.start_offset)
+            .unwrap_or(0);
+        let mut seen = BTreeSet::new();
+        for seed_reg in first_param..owned.registers_size {
+            let flow = owned.value_flow_from_entry_reg(seed_reg);
+            for (read_offset, read_reg) in flow.reads {
+                let Some(sink_ref) = owned.invoke_method_map.get(&read_offset) else {
+                    continue;
+                };
+                if !method_matches_any(sink_ref, sink_patterns)
+                    || !seen.insert((read_offset, read_reg))
+                {
+                    continue;
+                }
+                let source_desc = format!("callback parameter {method_name}");
+                let trace = vec![
+                    VulnTraceStep {
+                        offset: source_offset,
+                        reg: Some(seed_reg),
+                        kind: "source".into(),
+                        description: format!(
+                            "Android callback parameter v{seed_reg} is externally controlled"
+                        ),
+                    },
+                    VulnTraceStep {
+                        offset: read_offset,
+                        reg: Some(read_reg),
+                        kind: "sink".into(),
+                        description: format!(
+                            "Sink `{}` uses callback-derived v{read_reg} — {}",
+                            short_method_ref(sink_ref),
+                            insn_desc(owned, read_offset)
+                        ),
+                    },
+                ];
+                findings.push(VulnFinding::with_flow(
+                    category,
+                    class_name,
+                    method_name,
+                    None,
+                    Some(seed_reg),
+                    source_desc,
+                    read_offset,
+                    Some(read_reg),
+                    sink_ref.clone(),
+                    trace,
+                    vec![source_offset, read_offset],
+                ));
+            }
+        }
+    }
     findings
+}
+
+fn is_untrusted_callback(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "onNewIntent"
+            | "onStartCommand"
+            | "onReceive"
+            | "onActivityResult"
+            | "query"
+            | "insert"
+            | "update"
+            | "delete"
+            | "openFile"
+            | "openAssetFile"
+            | "shouldOverrideUrlLoading"
+            | "shouldInterceptRequest"
+            | "onJsPrompt"
+            | "onJsAlert"
+            | "onMessage"
+    )
 }
 
 /// Invoke-only scan: report every invoke whose method ref matches any of the patterns.
@@ -968,6 +1053,7 @@ mod tests {
         let owned = ValueFlowAnalysisOwned {
             cfg: make_cfg(vec![0, 2, 4]),
             rw_map,
+            exceptional_edges: vec![],
             api_return_sources: vec![((0, 0), "android.content.Intent.getParcelableExtra".into())],
             invoke_method_map,
             insn_at,

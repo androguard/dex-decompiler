@@ -20,7 +20,11 @@ fn kind_rule_matching_like_mt_rule_test() {
     .unwrap();
     assert_eq!(cfg.matching_rules("Source", "Sink").len(), 1);
     assert!(cfg.matching_rules("Source", "CodeExecution").is_empty());
-    assert_eq!(cfg.matching_rules("ActivityUserInput", "CodeExecution").len(), 1);
+    assert_eq!(
+        cfg.matching_rules("ActivityUserInput", "CodeExecution")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -44,7 +48,10 @@ fn sanitizer_clears_star_kinds_like_mt_sanitizer_test() {
 fn port_parsing_covers_mt_ports() {
     assert!(matches!(parse_mt_port("Return"), Port::Return));
     assert!(matches!(parse_mt_port("This"), Port::This));
-    assert!(matches!(parse_mt_port("Argument(2)"), Port::Argument { index: 2 }));
+    assert!(matches!(
+        parse_mt_port("Argument(2)"),
+        Port::Argument { index: 2 }
+    ));
 }
 
 #[test]
@@ -56,8 +63,12 @@ fn method_patterns_from_mt_descriptors() {
 #[test]
 fn default_android_config_has_mt_aligned_rules() {
     let cfg = default_config();
-    assert!(!cfg.matching_rules("ActivityUserInput", "CodeExecution").is_empty());
-    assert!(!cfg.matching_rules("ActivityUserInput", "SQLQuery").is_empty());
+    assert!(!cfg
+        .matching_rules("ActivityUserInput", "CodeExecution")
+        .is_empty());
+    assert!(!cfg
+        .matching_rules("ActivityUserInput", "SQLQuery")
+        .is_empty());
     assert!(!cfg.matching_rules("DeviceId", "Logging").is_empty());
 }
 
@@ -81,5 +92,8 @@ fn call_graph_builds_on_sample_dex() {
 #[test]
 fn solve_options_exclude_framework() {
     let opts = SolveOptions::default_android();
-    assert!(opts.exclude_prefixes.iter().any(|p| p.starts_with("android.")));
+    assert!(opts
+        .exclude_prefixes
+        .iter()
+        .any(|p| p.starts_with("android.")));
 }

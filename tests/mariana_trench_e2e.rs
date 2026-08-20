@@ -73,7 +73,11 @@ fn all_mt_expected_issues_catalogs() {
     for entry in &manifest {
         let path = case_dir(&entry.case).join("expected_issues.json");
         if !path.exists() {
-            assert_eq!(entry.issue_count, 0, "missing expected_issues for {}", entry.case);
+            assert_eq!(
+                entry.issue_count, 0,
+                "missing expected_issues for {}",
+                entry.case
+            );
             continue;
         }
         let issues: Vec<ExpectedIssue> =
@@ -101,10 +105,9 @@ fn all_mt_expected_issues_have_matching_rules() {
         if cfg.rules.is_empty() {
             continue;
         }
-        let issues: Vec<ExpectedIssue> = serde_json::from_str(
-            &fs::read_to_string(dir.join("expected_issues.json")).unwrap(),
-        )
-        .unwrap();
+        let issues: Vec<ExpectedIssue> =
+            serde_json::from_str(&fs::read_to_string(dir.join("expected_issues.json")).unwrap())
+                .unwrap();
         for iss in &issues {
             let mut matched = false;
             for sk in &iss.source_kinds {

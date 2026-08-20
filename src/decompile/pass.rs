@@ -3,8 +3,8 @@
 //! Passes transform method IR (`Vec<IrStmt>`) in sequence. Built-in passes handle
 //! invoke+move-result+return folding and similar patterns.
 
-use crate::decompile::ir::{Expr as IrExpr, Stmt as IrStmt};
 use crate::decompile::ir::VarId;
+use crate::decompile::ir::{Expr as IrExpr, Stmt as IrStmt};
 use std::collections::{HashMap, HashSet};
 
 /// A single transformation pass over method IR.
@@ -55,16 +55,32 @@ impl Pass for InvokeChainPass {
             // Try: Expr(Call) + Assign(reg, PendingResult) + Return(Var(reg)) → Return(Call)
             if i + 2 < stmts.len() {
                 if let (
-                    IrStmt::Expr { expr: IrExpr::Call { target, args }, comment: c1 },
-                    IrStmt::Assign { dst, rhs: IrExpr::PendingResult, comment: c2 },
-                    IrStmt::Return { value: Some(IrExpr::Var(ret_reg)), comment: c3 },
+                    IrStmt::Expr {
+                        expr: IrExpr::Call { target, args },
+                        comment: c1,
+                    },
+                    IrStmt::Assign {
+                        dst,
+                        rhs: IrExpr::PendingResult,
+                        comment: c2,
+                    },
+                    IrStmt::Return {
+                        value: Some(IrExpr::Var(ret_reg)),
+                        comment: c3,
+                    },
                 ) = (&stmts[i], &stmts[i + 1], &stmts[i + 2])
                 {
                     if dst == ret_reg {
-                        let comment = merge_comment(c1.as_deref(), merge_comment(c2.as_deref(), c3.as_deref()).as_deref());
+                        let comment = merge_comment(
+                            c1.as_deref(),
+                            merge_comment(c2.as_deref(), c3.as_deref()).as_deref(),
+                        );
                         let args = snapshot_invoke_args_overwritten_by_result(args, *dst, &out);
                         out.push(IrStmt::Return {
-                            value: Some(IrExpr::Call { target: target.clone(), args }),
+                            value: Some(IrExpr::Call {
+                                target: target.clone(),
+                                args,
+                            }),
                             comment,
                         });
                         i += 3;
@@ -75,12 +91,26 @@ impl Pass for InvokeChainPass {
 
             // Try: Expr(Call) + Assign(reg, PendingResult) → Assign(reg, Call)
             if i + 1 < stmts.len() {
-                if let (IrStmt::Expr { expr: IrExpr::Call { target, args }, comment: c1 }, IrStmt::Assign { dst, rhs: IrExpr::PendingResult, comment: c2 }) = (&stmts[i], &stmts[i + 1]) {
+                if let (
+                    IrStmt::Expr {
+                        expr: IrExpr::Call { target, args },
+                        comment: c1,
+                    },
+                    IrStmt::Assign {
+                        dst,
+                        rhs: IrExpr::PendingResult,
+                        comment: c2,
+                    },
+                ) = (&stmts[i], &stmts[i + 1])
+                {
                     let comment = merge_comment(c1.as_deref(), c2.as_deref());
                     let args = snapshot_invoke_args_overwritten_by_result(args, *dst, &out);
                     out.push(IrStmt::Assign {
                         dst: *dst,
-                        rhs: IrExpr::Call { target: target.clone(), args },
+                        rhs: IrExpr::Call {
+                            target: target.clone(),
+                            args,
+                        },
                         comment,
                     });
                     i += 2;
@@ -88,7 +118,10 @@ impl Pass for InvokeChainPass {
                 }
                 // Expr(Raw) + Assign(PendingResult) → Assign(Raw) — lambda / invoke-custom
                 if let (
-                    IrStmt::Expr { expr: IrExpr::Raw(raw), comment: c1 },
+                    IrStmt::Expr {
+                        expr: IrExpr::Raw(raw),
+                        comment: c1,
+                    },
                     IrStmt::Assign {
                         dst,
                         rhs: IrExpr::PendingResult,
@@ -111,7 +144,11 @@ impl Pass for InvokeChainPass {
             // Covers Call and Raw/literals: `result = "bad_name"; return result;` → `return "bad_name";`
             if i + 1 < stmts.len() {
                 if let (
-                    IrStmt::Assign { dst, rhs, comment: c1 },
+                    IrStmt::Assign {
+                        dst,
+                        rhs,
+                        comment: c1,
+                    },
                     IrStmt::Return {
                         value: Some(IrExpr::Var(ret_reg)),
                         comment: c2,
@@ -143,10 +180,7 @@ fn snapshot_invoke_args_overwritten_by_result(args: &str, dst: VarId, prior: &[I
     let names = if dst.ver == 0 {
         vec![format!("v{}", dst.reg)]
     } else {
-        vec![
-            format!("v{}_{}", dst.reg, dst.ver),
-            format!("v{}", dst.reg),
-        ]
+        vec![format!("v{}_{}", dst.reg, dst.ver), format!("v{}", dst.reg)]
     };
     if !names.iter().any(|n| ident_in_arg_list(args, n)) {
         return args.to_string();
@@ -233,10 +267,7 @@ impl Pass for DeadAssignPass {
 /// Dead-assign using a precomputed set of used *register numbers* (not VarId).
 /// Keeps Assign if dst.reg is in used_regs. Use when emitting CFG so assigns
 /// whose destination is used in other blocks are not removed.
-pub fn run_dead_assign_with_used_regs(
-    stmts: Vec<IrStmt>,
-    used_regs: &HashSet<u32>,
-) -> Vec<IrStmt> {
+pub fn run_dead_assign_with_used_regs(stmts: Vec<IrStmt>, used_regs: &HashSet<u32>) -> Vec<IrStmt> {
     stmts
         .into_iter()
         .filter(|s| {
@@ -614,7 +645,11 @@ impl Pass for SsaRenamePass {
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in stmts {
             match stmt {
-                IrStmt::Assign { mut dst, rhs, comment } => {
+                IrStmt::Assign {
+                    mut dst,
+                    rhs,
+                    comment,
+                } => {
                     let rhs = rename_expr(rhs, &cur_ver);
                     let v = next_ver.entry(dst.reg).or_insert(0);
                     *v += 1;
@@ -623,7 +658,10 @@ impl Pass for SsaRenamePass {
                     out.push(IrStmt::Assign { dst, rhs, comment });
                 }
                 IrStmt::Expr { expr, comment } => {
-                    out.push(IrStmt::Expr { expr: rename_expr(expr, &cur_ver), comment });
+                    out.push(IrStmt::Expr {
+                        expr: rename_expr(expr, &cur_ver),
+                        comment,
+                    });
                 }
                 IrStmt::Return { value, comment } => {
                     let value = value.map(|e| rename_expr(e, &cur_ver));
@@ -647,7 +685,10 @@ impl Pass for SsaRenamePass {
 fn rename_expr(expr: IrExpr, cur_ver: &HashMap<u32, u32>) -> IrExpr {
     match expr {
         IrExpr::Var(v) => IrExpr::Var(rename_var(v, cur_ver)),
-        IrExpr::Call { target, args } => IrExpr::Call { target: rename_vars_in_text(&target, cur_ver), args: rename_vars_in_text(&args, cur_ver) },
+        IrExpr::Call { target, args } => IrExpr::Call {
+            target: rename_vars_in_text(&target, cur_ver),
+            args: rename_vars_in_text(&args, cur_ver),
+        },
         IrExpr::PendingResult => IrExpr::PendingResult,
         IrExpr::Raw(s) => IrExpr::Raw(rename_vars_in_text(&s, cur_ver)),
     }
@@ -764,7 +805,9 @@ fn try_merge_constructor(stmts: &[IrStmt], i: usize) -> Option<(Vec<IrStmt>, usi
     else {
         return None;
     };
-    let class_name = raw.strip_prefix("new ").and_then(|s| s.strip_suffix("()"))?;
+    let class_name = raw
+        .strip_prefix("new ")
+        .and_then(|s| s.strip_suffix("()"))?;
     let dst_reg = dst.reg;
     let mut intervening: Vec<IrStmt> = Vec::new();
     let mut j = i + 1;
@@ -818,10 +861,7 @@ fn inline_var_in_args(args: &str, vid: VarId, rval: &str) -> String {
     let names = if vid.ver == 0 {
         vec![format!("v{}", vid.reg)]
     } else {
-        vec![
-            format!("v{}_{}", vid.reg, vid.ver),
-            format!("v{}", vid.reg),
-        ]
+        vec![format!("v{}_{}", vid.reg, vid.ver), format!("v{}", vid.reg)]
     };
     let mut out = args.to_string();
     for name in names {
@@ -840,9 +880,11 @@ fn replace_whole_ident(text: &str, var: &str, replacement: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if i + v.len() <= bytes.len() && &bytes[i..i + v.len()] == v {
-            let before_ok = i == 0 || !(bytes[i - 1] as char).is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+            let before_ok =
+                i == 0 || !(bytes[i - 1] as char).is_ascii_alphanumeric() && bytes[i - 1] != b'_';
             let after_ok = i + v.len() == bytes.len()
-                || (!(bytes[i + v.len()] as char).is_ascii_alphanumeric() && bytes[i + v.len()] != b'_');
+                || (!(bytes[i + v.len()] as char).is_ascii_alphanumeric()
+                    && bytes[i + v.len()] != b'_');
             if before_ok && after_ok {
                 out.push_str(replacement);
                 i += v.len();
@@ -894,7 +936,12 @@ impl Pass for InlineFilledArrayPass {
     fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
         let mut defs: HashMap<VarId, String> = HashMap::new();
         for s in &stmts {
-            if let IrStmt::Assign { dst, rhs: IrExpr::Raw(r), .. } = s {
+            if let IrStmt::Assign {
+                dst,
+                rhs: IrExpr::Raw(r),
+                ..
+            } = s
+            {
                 if is_inlinable_array_elem_def(r) {
                     defs.insert(*dst, r.trim().to_string());
                 }
@@ -907,8 +954,14 @@ impl Pass for InlineFilledArrayPass {
         let mut rewrites: HashMap<usize, String> = HashMap::new();
         for (idx, s) in stmts.iter().enumerate() {
             let raw = match s {
-                IrStmt::Assign { rhs: IrExpr::Raw(r), .. } => Some(r.as_str()),
-                IrStmt::Return { value: Some(IrExpr::Raw(r)), .. } => Some(r.as_str()),
+                IrStmt::Assign {
+                    rhs: IrExpr::Raw(r),
+                    ..
+                } => Some(r.as_str()),
+                IrStmt::Return {
+                    value: Some(IrExpr::Raw(r)),
+                    ..
+                } => Some(r.as_str()),
                 _ => None,
             };
             if let Some(r) = raw {
@@ -923,7 +976,9 @@ impl Pass for InlineFilledArrayPass {
         let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len());
         for (idx, s) in stmts.iter().enumerate() {
             if let IrStmt::Assign { dst, .. } = s {
-                if inlined_from.contains(dst) && !vid_used_outside_inlined_arrays(&stmts, *dst, &rewrites) {
+                if inlined_from.contains(dst)
+                    && !vid_used_outside_inlined_arrays(&stmts, *dst, &rewrites)
+                {
                     continue;
                 }
             }
@@ -993,7 +1048,11 @@ fn is_inlinable_array_elem_def(r: &str) -> bool {
         return true;
     }
     let b = r.as_bytes();
-    if b.first().copied().map(|c| c.is_ascii_digit() || c == b'-').unwrap_or(false) {
+    if b.first()
+        .copied()
+        .map(|c| c.is_ascii_digit() || c == b'-')
+        .unwrap_or(false)
+    {
         return true;
     }
     if r.ends_with(".class") {
@@ -1116,7 +1175,10 @@ mod tests {
     fn invoke_chain_merge_assign_then_return() {
         let stmts = vec![
             IrStmt::Expr {
-                expr: IrExpr::Call { target: "Foo.bar".into(), args: "v0".into() },
+                expr: IrExpr::Call {
+                    target: "Foo.bar".into(),
+                    args: "v0".into(),
+                },
                 comment: Some("invoke".into()),
             },
             IrStmt::Assign {
@@ -1132,7 +1194,10 @@ mod tests {
         let out = InvokeChainPass.run(stmts);
         assert_eq!(out.len(), 1);
         match &out[0] {
-            IrStmt::Return { value: Some(IrExpr::Call { target, args }), .. } => {
+            IrStmt::Return {
+                value: Some(IrExpr::Call { target, args }),
+                ..
+            } => {
                 assert_eq!(target, "Foo.bar");
                 assert_eq!(args, "v0");
             }
@@ -1144,7 +1209,10 @@ mod tests {
     fn invoke_chain_merge_assign_only() {
         let stmts = vec![
             IrStmt::Expr {
-                expr: IrExpr::Call { target: "Baz.qux".into(), args: "v2, v3".into() },
+                expr: IrExpr::Call {
+                    target: "Baz.qux".into(),
+                    args: "v2, v3".into(),
+                },
                 comment: None,
             },
             IrStmt::Assign {
@@ -1156,7 +1224,11 @@ mod tests {
         let out = InvokeChainPass.run(stmts);
         assert_eq!(out.len(), 1);
         match &out[0] {
-            IrStmt::Assign { dst, rhs: IrExpr::Call { target, args }, .. } if *dst == VarId::new(0, 0) => {
+            IrStmt::Assign {
+                dst,
+                rhs: IrExpr::Call { target, args },
+                ..
+            } if *dst == VarId::new(0, 0) => {
                 assert_eq!(target, "Baz.qux");
                 assert_eq!(args, "v2, v3");
             }
@@ -1232,7 +1304,10 @@ mod tests {
                 rhs: IrExpr::Call { args, .. },
                 ..
             } => {
-                assert_eq!(args, "v5", "must not replace array arg with stale 5: {args}");
+                assert_eq!(
+                    args, "v5",
+                    "must not replace array arg with stale 5: {args}"
+                );
             }
             other => panic!("expected Assign(Call), got {other:?}"),
         }
@@ -1268,11 +1343,21 @@ mod tests {
         runner.add(InvokeChainPass);
         let stmts = vec![
             IrStmt::Expr {
-                expr: IrExpr::Call { target: "X.y".into(), args: "".into() },
+                expr: IrExpr::Call {
+                    target: "X.y".into(),
+                    args: "".into(),
+                },
                 comment: None,
             },
-            IrStmt::Assign { dst: VarId::new(0, 0), rhs: IrExpr::PendingResult, comment: None },
-            IrStmt::Return { value: Some(IrExpr::Var(VarId::new(0, 0))), comment: None },
+            IrStmt::Assign {
+                dst: VarId::new(0, 0),
+                rhs: IrExpr::PendingResult,
+                comment: None,
+            },
+            IrStmt::Return {
+                value: Some(IrExpr::Var(VarId::new(0, 0))),
+                comment: None,
+            },
         ];
         let out = runner.run(stmts);
         assert_eq!(out.len(), 1);
@@ -1281,9 +1366,20 @@ mod tests {
     #[test]
     fn ssa_renames_defs_and_uses_linearly() {
         let stmts = vec![
-            IrStmt::Assign { dst: VarId::new(0, 0), rhs: IrExpr::Raw("0".into()), comment: None },
-            IrStmt::Assign { dst: VarId::new(0, 0), rhs: IrExpr::Var(VarId::new(0, 0)), comment: None },
-            IrStmt::Return { value: Some(IrExpr::Var(VarId::new(0, 0))), comment: None },
+            IrStmt::Assign {
+                dst: VarId::new(0, 0),
+                rhs: IrExpr::Raw("0".into()),
+                comment: None,
+            },
+            IrStmt::Assign {
+                dst: VarId::new(0, 0),
+                rhs: IrExpr::Var(VarId::new(0, 0)),
+                comment: None,
+            },
+            IrStmt::Return {
+                value: Some(IrExpr::Var(VarId::new(0, 0))),
+                comment: None,
+            },
         ];
         let out = SsaRenamePass.run(stmts);
         assert_eq!(out.len(), 3);
@@ -1308,7 +1404,12 @@ mod tests {
             IrStmt::Raw("v8[v10] = v9;".into()),
         ];
         let out = DeadAssignPass.run(stmts);
-        assert_eq!(out.len(), 3, "const-class/index must survive when only used in aput Raw: {:?}", out);
+        assert_eq!(
+            out.len(),
+            3,
+            "const-class/index must survive when only used in aput Raw: {:?}",
+            out
+        );
         let regs = used_regs(&out);
         assert!(regs.contains(&9) && regs.contains(&10), "{:?}", regs);
     }
@@ -1344,14 +1445,33 @@ mod tests {
     #[test]
     fn dead_assign_removes_unused() {
         let stmts = vec![
-            IrStmt::Assign { dst: VarId::new(0, 1), rhs: IrExpr::Raw("0".into()), comment: None },
-            IrStmt::Assign { dst: VarId::new(0, 2), rhs: IrExpr::Raw("1".into()), comment: None },
-            IrStmt::Return { value: Some(IrExpr::Var(VarId::new(0, 2))), comment: None },
+            IrStmt::Assign {
+                dst: VarId::new(0, 1),
+                rhs: IrExpr::Raw("0".into()),
+                comment: None,
+            },
+            IrStmt::Assign {
+                dst: VarId::new(0, 2),
+                rhs: IrExpr::Raw("1".into()),
+                comment: None,
+            },
+            IrStmt::Return {
+                value: Some(IrExpr::Var(VarId::new(0, 2))),
+                comment: None,
+            },
         ];
         let out = DeadAssignPass.run(stmts);
-        assert_eq!(out.len(), 2, "first assign (v0_1) is dead, should be removed");
+        assert_eq!(
+            out.len(),
+            2,
+            "first assign (v0_1) is dead, should be removed"
+        );
         match &out[0] {
-            IrStmt::Assign { dst, rhs: IrExpr::Raw(s), .. } => {
+            IrStmt::Assign {
+                dst,
+                rhs: IrExpr::Raw(s),
+                ..
+            } => {
                 assert_eq!(dst.ver, 2);
                 assert_eq!(s, "1");
             }
@@ -1462,16 +1582,17 @@ mod tests {
                 comment: None,
             },
             IrStmt::Return {
-                value: Some(IrExpr::Raw(
-                    "new com.foo.Prompt[]{ v0_1, v1_1 }".into(),
-                )),
+                value: Some(IrExpr::Raw("new com.foo.Prompt[]{ v0_1, v1_1 }".into())),
                 comment: None,
             },
         ];
         let out = InlineFilledArrayPass.run(stmts);
         assert_eq!(out.len(), 1, "{:?}", out);
         match &out[0] {
-            IrStmt::Return { value: Some(IrExpr::Raw(r)), .. } => {
+            IrStmt::Return {
+                value: Some(IrExpr::Raw(r)),
+                ..
+            } => {
                 assert!(r.contains("com.foo.Prompt.A"), "{}", r);
                 assert!(r.contains("com.foo.Prompt.B"), "{}", r);
                 assert!(!r.contains("v0_1"), "{}", r);

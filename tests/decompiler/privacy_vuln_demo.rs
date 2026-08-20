@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use dex_decompiler::{
     default_config, load_dexes_from_path, parse_dex, scan_dex_parallel,
-    scan_pending_intents_dex_parallel, solve_dexes, Issue, SolveOptions, TaintConfig,
+    scan_pending_intents_dex_parallel, solve_dexes, Decompiler, Issue, SolveOptions, TaintConfig,
 };
 use serde::Deserialize;
 
@@ -21,6 +21,60 @@ fn load_demo_dex() -> dex_decompiler::DexFile {
     let path = demo_dir().join("classes.dex");
     let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     parse_dex(&data).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+}
+
+#[test]
+fn exception_handler_value_flow_uses_live_dex_edges() {
+    let dex = load_demo_dex();
+    let encoded = dex
+        .class_defs()
+        .flatten()
+        .find_map(|class_def| {
+            let class_name = dex
+                .get_type(class_def.class_idx)
+                .ok()
+                .map(|name| dex_decompiler::java::descriptor_to_java(&name))?;
+            if !class_name.ends_with("AdvancedPrivacyFlows") {
+                return None;
+            }
+            let class_data = dex.get_class_data(&class_def).ok()??;
+            class_data
+                .direct_methods
+                .iter()
+                .chain(class_data.virtual_methods.iter())
+                .find(|method| {
+                    dex.get_method_info(method.method_idx)
+                        .map(|info| info.name == "leakThroughException")
+                        .unwrap_or(false)
+                })
+                .cloned()
+        })
+        .expect("AdvancedPrivacyFlows.leakThroughException");
+    let owned = Decompiler::new(&dex)
+        .value_flow_analysis(&encoded)
+        .expect("live exception value flow");
+    assert!(
+        !owned.exceptional_edges.is_empty(),
+        "DEX try/catch table must produce exceptional CFG edges"
+    );
+    let ((source_offset, source_reg), _) = owned
+        .api_return_sources
+        .iter()
+        .find(|(_, method)| method.contains("AdvancedPrivacyFlows.deviceId"))
+        .expect("deviceId source invoke");
+    let flow = owned
+        .analysis()
+        .value_flow_from_seed(*source_offset, *source_reg);
+    assert!(
+        flow.reads.iter().any(|(offset, _)| {
+            owned
+                .invoke_method_map
+                .get(offset)
+                .map(|method| method.contains("android.util.Log.w"))
+                .unwrap_or(false)
+        }),
+        "definition before throw must reach Log.w in catch handler: {flow:?}"
+    );
 }
 
 fn solve_demo(cfg: &TaintConfig) -> Vec<Issue> {
@@ -100,7 +154,9 @@ fn has_flow(issues: &[Issue], method: &str, source: &str, sink: &str, rule: u32)
 }
 
 fn has_flow_any(issues: &[Issue], methods: &[&str], source: &str, sink: &str, rule: u32) -> bool {
-    methods.iter().any(|m| has_flow(issues, m, source, sink, rule))
+    methods
+        .iter()
+        .any(|m| has_flow(issues, m, source, sink, rule))
 }
 
 fn assert_flow(issues: &[Issue], method: &str, source: &str, sink: &str, rule: u32) {
@@ -144,7 +200,8 @@ struct ExpectedDetectors {
 
 fn load_expected() -> ExpectedFile {
     let path = demo_dir().join("expected.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse expected.json: {e}"))
 }
 
@@ -174,21 +231,21 @@ fn extra_pii_config() -> TaintConfig {
           "rules": [
             {
               "name": "Extra PII to network / cookies",
-              "code": 19,
+              "code": 91001,
               "description": "Catalog PII kinds may flow into network or cookie sinks",
               "sources": ["PhoneNumber", "Contacts", "Sms", "Account", "AdvertisingId", "Media", "Calendar", "Email"],
               "sinks": ["Network", "CookieWrite"]
             },
             {
               "name": "Extra PII to logging",
-              "code": 20,
+              "code": 91002,
               "description": "Catalog PII kinds may flow into logs",
               "sources": ["PhoneNumber", "Contacts", "Sms", "Account", "AdvertisingId", "Media", "Calendar", "Email"],
               "sinks": ["Logging"]
             },
             {
               "name": "DeviceId / Location dest stores and other-app",
-              "code": 21,
+              "code": 91003,
               "description": "DeviceId/Location may reach clipboard, prefs, cookies, or IPC launches",
               "sources": ["DeviceId", "Location"],
               "sinks": ["ClipboardWrite", "SharedPrefsWrite", "CookieWrite", "LaunchingComponent"]
@@ -247,7 +304,13 @@ fn assert_expected_flow(issues: &[Issue], flow: &ExpectedFlow) {
         return;
     }
     let names: Vec<&str> = flow.callable_any_of.iter().map(String::as_str).collect();
-    if !has_flow_any(issues, &names, &flow.source_kind, &flow.sink_kind, flow.rule_code) {
+    if !has_flow_any(
+        issues,
+        &names,
+        &flow.source_kind,
+        &flow.sink_kind,
+        flow.rule_code,
+    ) {
         panic!(
             "missing {}→{} rule {} in any of {:?}\n--- issues ---\n{}",
             flow.source_kind,
@@ -292,7 +355,11 @@ fn cipher_tito_reveals_device_id_through_cipher() {
     );
     let cipher_names: Vec<&str> = issues
         .iter()
-        .filter(|i| i.callable.contains("Cipher") || i.callable.contains("cipherhop") || i.callable.contains("CipherThen"))
+        .filter(|i| {
+            i.callable.contains("Cipher")
+                || i.callable.contains("cipherhop")
+                || i.callable.contains("CipherThen")
+        })
         .map(|i| i.callable.as_str())
         .collect();
     println!("cipher layer callables: {cipher_names:?} hop={cipher_hop}");
@@ -366,6 +433,14 @@ fn detectors_flag_ssl_weak_crypto_webview_and_world_readable() {
             expected.detectors.webview_any_of
         );
     }
+    assert!(
+        findings.iter().any(|finding| {
+            finding.method_name == "onMessage"
+                && finding.category == "insecure_logging"
+                && finding.source_desc.contains("callback parameter")
+        }),
+        "VF detectors did not seed lifecycle callback parameters\n--- findings ---\n{dump}"
+    );
 
     let _ = expected.detectors.optional;
     println!("detector categories: {:?}", cats);
@@ -392,9 +467,10 @@ fn pending_intent_mutable_empty() {
         lines.sort();
         lines.join("\n")
     };
-    if !findings.iter().any(|f| {
-        f.method_name.contains("mutableEmpty") && f.base_intent_empty && f.mutable_flag
-    }) {
+    if !findings
+        .iter()
+        .any(|f| f.method_name.contains("mutableEmpty") && f.base_intent_empty && f.mutable_flag)
+    {
         panic!("missing mutable empty PendingIntent in mutableEmpty\n--- findings ---\n{dump}");
     }
     println!("pending_intent findings:\n{dump}");
@@ -510,8 +586,8 @@ fn base_concat_and_field_hop_device_id_to_network() {
 #[test]
 fn apk_loads_via_load_dexes_from_path() {
     let path = demo_dir().join("privacy_vuln_demo.apk");
-    let dexes = load_dexes_from_path(&path)
-        .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+    let dexes =
+        load_dexes_from_path(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
     assert!(
         !dexes.is_empty(),
         "APK produced no DEX files: {}",

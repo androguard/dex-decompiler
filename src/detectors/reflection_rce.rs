@@ -38,10 +38,9 @@ pub fn scan_reflection_rce(
     );
     // Presence of invoke + forName in same method is medium surface.
     if out.is_empty() {
-        let has_for_name = owned
-            .invoke_method_map
-            .values()
-            .any(|m| m.contains("forName") || m.contains("getMethod") || m.contains("getDeclaredMethod"));
+        let has_for_name = owned.invoke_method_map.values().any(|m| {
+            m.contains("forName") || m.contains("getMethod") || m.contains("getDeclaredMethod")
+        });
         let has_invoke = owned
             .invoke_method_map
             .values()

@@ -64,7 +64,7 @@ pub fn minimal_dex_with_method_code(insns: &[u8]) -> Vec<u8> {
     push_uleb128(&mut data_section, 0); // virtual_methods_size
     push_uleb128(&mut data_section, 0); // method_idx_diff (first method -> index 0)
     push_uleb128(&mut data_section, 1); // access_flags (public)
-    // code_off = data_off + (current len + 2 for uleb) so code_item starts at data_off + class_data_len
+                                        // code_off = data_off + (current len + 2 for uleb) so code_item starts at data_off + class_data_len
     let data_off_val = 0x154u32;
     let code_item_start_in_data = (data_section.len() + 2) as u32; // +2 for uleb128(code_off)
     push_uleb128(&mut data_section, data_off_val + code_item_start_in_data);
@@ -144,17 +144,17 @@ pub fn minimal_dex_with_method_code(insns: &[u8]) -> Vec<u8> {
     out.resize(map_off as usize, 0);
     out.extend_from_slice(&12u32.to_le_bytes()); // map size
     let map_entries: [(u16, u32, u32); 12] = [
-        (0x0000, 1, 0), // header
-        (0x0002, 5, string_ids_off), // string_id
-        (0x0003, 2, type_ids_off), // type_id
-        (0x0004, 1, proto_ids_off), // proto_id
-        (0x0005, 0, field_ids_off), // field_id
-        (0x0006, 1, method_ids_off), // method_id
-        (0x0007, 1, class_defs_off), // class_def
-        (0x1000, 1, map_off), // map_list
-        (0x1001, 1, data_off + type_list_off as u32), // type_list
-        (0x2002, 5, data_off), // string_data (first at data_off)
-        (0x2000, 1, data_off + class_data_off as u32), // class_data
+        (0x0000, 1, 0),                                 // header
+        (0x0002, 5, string_ids_off),                    // string_id
+        (0x0003, 2, type_ids_off),                      // type_id
+        (0x0004, 1, proto_ids_off),                     // proto_id
+        (0x0005, 0, field_ids_off),                     // field_id
+        (0x0006, 1, method_ids_off),                    // method_id
+        (0x0007, 1, class_defs_off),                    // class_def
+        (0x1000, 1, map_off),                           // map_list
+        (0x1001, 1, data_off + type_list_off as u32),   // type_list
+        (0x2002, 5, data_off),                          // string_data (first at data_off)
+        (0x2000, 1, data_off + class_data_off as u32),  // class_data
         (0x2001, 1, data_off + code_item_start as u32), // code_item
     ];
     for (ty, size, offset) in map_entries {

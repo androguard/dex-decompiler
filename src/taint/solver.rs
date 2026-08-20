@@ -27,6 +27,8 @@ pub struct SolveOptions {
     /// (`class == prefix` or `class.starts_with(prefix + ".")`).
     /// Library classes are still always skipped via [`crate::detectors::is_library_class`].
     pub include_prefixes: Vec<String>,
+    /// Skip classes whose Java name matches any of these regular expressions.
+    pub exclude_regexps: Vec<String>,
 }
 
 impl SolveOptions {
@@ -57,6 +59,7 @@ impl SolveOptions {
                 "io.reactivex.".into(),
             ],
             include_prefixes: Vec::new(),
+            exclude_regexps: Vec::new(),
         }
     }
 }
@@ -77,6 +80,8 @@ struct MethodSummary {
     param_to_return: HashSet<u32>,
     /// Param index → sink kinds reached in this method (from that param).
     param_to_sinks: HashMap<u32, HashSet<String>>,
+    /// Taint loaded from class-level static fields at `(sget offset, destination register)`.
+    heap_injections: HashMap<(u32, u32), HashSet<String>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -106,6 +111,7 @@ impl LocalTaint {
             .insert(kind.to_string())
     }
 
+    #[cfg(test)]
     fn kinds_at_path(&self, offset: u32, reg: u32, path: &str) -> HashSet<String> {
         self.paths
             .get(&(offset, reg, path.to_string()))
@@ -118,6 +124,26 @@ impl LocalTaint {
         let mut out = HashSet::new();
         for ((_, r, p), kinds) in &self.paths {
             if *r == reg && p == path {
+                out.extend(kinds.iter().cloned());
+            }
+        }
+        out
+    }
+
+    fn path_kinds_on_reg_before(&self, reg: u32, path: &str, at: u32) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for ((off, r, p), kinds) in &self.paths {
+            if *off <= at && *r == reg && p == path {
+                out.extend(kinds.iter().cloned());
+            }
+        }
+        out
+    }
+
+    fn array_kinds_on_reg_before(&self, reg: u32, at: u32) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for ((off, r, path), kinds) in &self.paths {
+            if *off <= at && *r == reg && path.starts_with("array:") {
                 out.extend(kinds.iter().cloned());
             }
         }
@@ -160,6 +186,76 @@ pub(crate) fn param_reg(owned: &ValueFlowAnalysisOwned, idx: u32) -> Option<u32>
     param_reg_from_sizes(owned.registers_size, owned.ins_size, idx)
 }
 
+fn proto_param_widths(proto: &str) -> Vec<u32> {
+    let Some(params) = proto
+        .strip_prefix('(')
+        .and_then(|s| s.split_once(')'))
+        .map(|p| p.0)
+    else {
+        return Vec::new();
+    };
+    let bytes = params.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] as char {
+            'J' | 'D' => {
+                out.push(2);
+                i += 1;
+            }
+            'L' => {
+                out.push(1);
+                i += 1;
+                while i < bytes.len() && bytes[i] as char != ';' {
+                    i += 1;
+                }
+                i += usize::from(i < bytes.len());
+            }
+            '[' => {
+                out.push(1);
+                i += 1;
+                while i < bytes.len() && bytes[i] as char == '[' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] as char == 'L' {
+                    while i < bytes.len() && bytes[i] as char != ';' {
+                        i += 1;
+                    }
+                }
+                i += usize::from(i < bytes.len());
+            }
+            _ => {
+                out.push(1);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Valid incoming Dalvik word slots, excluding the high half of wide parameters.
+fn formal_param_slots(mref: &super::index::MethodRef, owned: &ValueFlowAnalysisOwned) -> Vec<u32> {
+    const ACC_STATIC: u32 = 0x8;
+    let is_static = mref.encoded.access_flags & ACC_STATIC != 0;
+    let mut slots = Vec::new();
+    let mut slot = 0u32;
+    if !is_static {
+        slots.push(0);
+        slot = 1;
+    }
+    for width in proto_param_widths(&mref.proto) {
+        if slot < owned.ins_size {
+            slots.push(slot);
+        }
+        slot += width;
+    }
+    if slots.is_empty() && owned.ins_size > 0 {
+        // Malformed/missing proto: preserve the old conservative word-slot behavior.
+        slots.extend(0..owned.ins_size.min(16));
+    }
+    slots
+}
+
 /// True for `return` / `return-wide` / `return-object` (not `return-void`).
 pub(crate) fn is_return_insn(label: &str) -> bool {
     matches!(
@@ -172,14 +268,20 @@ fn is_extra_put(method_ref: &str) -> bool {
     method_ref.contains("putExtra")
         || method_ref.contains("putString")
         || method_ref.contains("putCharSequence")
+        || method_ref.contains("putParcelable")
+        || method_ref.contains("putSerializable")
+        || method_ref.contains("putBundle")
+        || method_ref.contains("putPersistableBundle")
 }
 
 fn is_extra_get(method_ref: &str) -> bool {
-    method_ref.contains("getStringExtra")
-        || method_ref.contains("getParcelableExtra")
-        || method_ref.contains("getCharSequenceExtra")
-        || method_ref.contains("getSerializableExtra")
+    method_ref.contains("Extra")
         || method_ref.contains("Bundle.getString")
+        || method_ref.contains("Bundle.getCharSequence")
+        || method_ref.contains("Bundle.getParcelable")
+        || method_ref.contains("Bundle.getSerializable")
+        || method_ref.contains("Bundle.getBundle")
+        || method_ref.contains("PersistableBundle.get")
 }
 
 /// `const-string vN, "foo"` / `const-string/jumbo vN, "foo"`.
@@ -202,7 +304,11 @@ fn parse_const_string_label(label: &str) -> Option<(u32, String)> {
     Some((reg, inner.to_string()))
 }
 
-fn const_string_for_reg(owned: &ValueFlowAnalysisOwned, invoke_off: u32, reg: u32) -> Option<String> {
+fn const_string_for_reg(
+    owned: &ValueFlowAnalysisOwned,
+    invoke_off: u32,
+    reg: u32,
+) -> Option<String> {
     let mut best: Option<(u32, String)> = None;
     for (&off, label) in &owned.insn_at {
         if off > invoke_off {
@@ -215,6 +321,37 @@ fn const_string_for_reg(owned: &ValueFlowAnalysisOwned, invoke_off: u32, reg: u3
         }
     }
     best.map(|(_, s)| s)
+}
+
+fn parse_const_int_label(label: &str) -> Option<(u32, i64)> {
+    let opcode = label.split_whitespace().next()?;
+    if !opcode.starts_with("const") || opcode.starts_with("const-string") {
+        return None;
+    }
+    let rest = label[opcode.len()..].trim();
+    let (reg_part, value_part) = rest.split_once(',')?;
+    let reg = parse_reg_token(reg_part)?;
+    let value = value_part.trim().split_whitespace().next()?;
+    let parsed = if let Some(hex) = value.strip_prefix("-0x") {
+        -(i64::from_str_radix(hex, 16).ok()?)
+    } else if let Some(hex) = value.strip_prefix("0x") {
+        i64::from_str_radix(hex, 16).ok()?
+    } else {
+        value.parse().ok()?
+    };
+    Some((reg, parsed))
+}
+
+fn const_int_for_reg(owned: &ValueFlowAnalysisOwned, at_off: u32, reg: u32) -> Option<i64> {
+    owned
+        .insn_at
+        .iter()
+        .filter_map(|(&off, label)| {
+            let (r, value) = parse_const_int_label(label)?;
+            (off <= at_off && r == reg).then_some((off, value))
+        })
+        .max_by_key(|(off, _)| *off)
+        .map(|(_, value)| value)
 }
 
 fn parse_reg_token(s: &str) -> Option<u32> {
@@ -274,12 +411,53 @@ fn parse_instance_field_label(label: &str) -> Option<InstanceFieldOp> {
     }
 }
 
-
 #[derive(Debug)]
 #[allow(dead_code)]
 enum StaticFieldOp {
     Put { src: u32, path: String },
     Get { dest: u32, path: String },
+}
+
+#[derive(Debug)]
+enum ArrayOp {
+    Put { src: u32, array: u32, index: u32 },
+    Get { dest: u32, array: u32, index: u32 },
+}
+
+fn parse_array_label(label: &str) -> Option<ArrayOp> {
+    let opcode = label.split_whitespace().next()?;
+    let is_put = opcode.starts_with("aput");
+    let is_get = opcode.starts_with("aget");
+    if !is_put && !is_get {
+        return None;
+    }
+    let rest = label[opcode.len()..].trim();
+    let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let first = parse_reg_token(parts[0])?;
+    let array = parse_reg_token(parts[1])?;
+    let index = parse_reg_token(parts[2])?;
+    if is_put {
+        Some(ArrayOp::Put {
+            src: first,
+            array,
+            index,
+        })
+    } else {
+        Some(ArrayOp::Get {
+            dest: first,
+            array,
+            index,
+        })
+    }
+}
+
+fn array_path(owned: &ValueFlowAnalysisOwned, off: u32, index: u32) -> String {
+    const_int_for_reg(owned, off, index)
+        .map(|i| format!("array:{i}"))
+        .unwrap_or_else(|| "array:*".to_string())
 }
 
 /// `sget-object vN, Lpkg/Cls;.BASE:Type` or `pkg.Cls.BASE`.
@@ -393,11 +571,7 @@ fn recover_dest_url(
         }
     }
     // Prefer a full URL that already has a path.
-    if let Some(full) = https
-        .iter()
-        .find(|u| u.matches('/').count() >= 3)
-        .cloned()
-    {
+    if let Some(full) = https.iter().find(|u| u.matches('/').count() >= 3).cloned() {
         return Some(full);
     }
     if let Some(base) = https.into_iter().next() {
@@ -453,12 +627,13 @@ fn seed_param_register(
 }
 
 fn infer_param_to_sinks(
+    mref: &super::index::MethodRef,
     owned: &ValueFlowAnalysisOwned,
     config: &TaintConfig,
 ) -> HashMap<u32, HashSet<String>> {
     let analysis = owned.analysis();
     let mut out: HashMap<u32, HashSet<String>> = HashMap::new();
-    for param_idx in 0..owned.ins_size.min(16) {
+    for param_idx in formal_param_slots(mref, owned) {
         let Some(reg) = param_reg(owned, param_idx) else {
             continue;
         };
@@ -480,15 +655,12 @@ fn infer_param_to_sinks(
                 continue;
             };
             if probe.kinds_at(invoke_off, arg_reg).contains("__param") || arg_reg == reg {
-                out.entry(param_idx)
-                    .or_default()
-                    .insert(sink.kind.clone());
+                out.entry(param_idx).or_default().insert(sink.kind.clone());
             }
         }
     }
     out
 }
-
 
 fn propagate_path(
     local: &mut LocalTaint,
@@ -565,6 +737,10 @@ fn param_kinds_fingerprint(sum: &MethodSummary) -> u64 {
         len = len.wrapping_add(1);
         kind_sum = kind_sum.wrapping_add(kinds.len() as u64);
     }
+    for kinds in sum.heap_injections.values() {
+        len = len.wrapping_add(1);
+        kind_sum = kind_sum.wrapping_add(kinds.len() as u64);
+    }
     (len << 32) | (kind_sum & 0xffff_ffff)
 }
 
@@ -582,12 +758,151 @@ fn should_skip(class_name: &str, opts: &SolveOptions) -> bool {
     {
         return true;
     }
+    if crate::detectors::class_matches_exclude_regexps(class_name, &opts.exclude_regexps) {
+        return true;
+    }
     if !opts.include_prefixes.is_empty()
         && !crate::detectors::class_matches_prefixes(class_name, &opts.include_prefixes)
     {
         return true;
     }
     false
+}
+
+/// Compose app-method TITO and sink summaries through bounded helper chains.
+fn compose_method_summaries(
+    index: &MethodIndex,
+    call_graph: &CallGraph,
+    vf_cache: &HashMap<MethodId, ValueFlowAnalysisOwned>,
+    config: &TaintConfig,
+    summaries: &mut SummaryMap,
+) {
+    const MAX_ROUNDS: usize = 8;
+    const MAX_SINK_KINDS_PER_PARAM: usize = 64;
+    for _ in 0..MAX_ROUNDS {
+        let snapshot = summaries.clone();
+        let mut changed = false;
+        for (caller, edges) in &call_graph.outs {
+            let (Some(caller_ref), Some(owned)) = (index.get(*caller), vf_cache.get(caller)) else {
+                continue;
+            };
+            let analysis = owned.analysis();
+            for caller_param in formal_param_slots(caller_ref, owned) {
+                let Some(param_reg) = param_reg(owned, caller_param) else {
+                    continue;
+                };
+                let mut probe = LocalTaint::default();
+                seed_param_register(&mut probe, &analysis, owned, config, param_reg, "__summary");
+                for edge in edges {
+                    let Some(callee_sum) = snapshot.get(&edge.callee) else {
+                        continue;
+                    };
+                    for (callee_param, &arg_reg) in edge.arg_regs.iter().enumerate() {
+                        if !probe
+                            .kinds_at(edge.invoke_offset, arg_reg)
+                            .contains("__summary")
+                            && arg_reg != param_reg
+                        {
+                            continue;
+                        }
+                        if let Some(sinks) = callee_sum.param_to_sinks.get(&(callee_param as u32)) {
+                            let dst = Arc::make_mut(
+                                summaries
+                                    .entry(*caller)
+                                    .or_insert_with(|| Arc::new(MethodSummary::default())),
+                            )
+                            .param_to_sinks
+                            .entry(caller_param)
+                            .or_default();
+                            for sink in sinks.iter().take(MAX_SINK_KINDS_PER_PARAM) {
+                                if dst.len() >= MAX_SINK_KINDS_PER_PARAM {
+                                    break;
+                                }
+                                changed |= dst.insert(sink.clone());
+                            }
+                        }
+                        if callee_sum.param_to_return.contains(&(callee_param as u32)) {
+                            if let Some((mr_off, mr_reg)) =
+                                move_result_for_invoke(owned, edge.invoke_offset)
+                            {
+                                let flow = analysis.value_flow_from_seed(mr_off, mr_reg);
+                                if flow.reads.iter().any(|(off, _)| {
+                                    is_return_insn(
+                                        owned.insn_at.get(off).map(String::as_str).unwrap_or(""),
+                                    )
+                                }) {
+                                    changed |= Arc::make_mut(
+                                        summaries
+                                            .entry(*caller)
+                                            .or_insert_with(|| Arc::new(MethodSummary::default())),
+                                    )
+                                    .param_to_return
+                                    .insert(caller_param);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn compose_static_heap(
+    index: &MethodIndex,
+    vf_cache: &HashMap<MethodId, ValueFlowAnalysisOwned>,
+    config: &TaintConfig,
+    summaries: &mut SummaryMap,
+) -> HashSet<MethodId> {
+    const MAX_ROUNDS: usize = 4;
+    let mut affected = HashSet::new();
+    for _ in 0..MAX_ROUNDS {
+        let snapshot = summaries.clone();
+        let mut heap: HashMap<String, HashSet<String>> = HashMap::new();
+        for (&mid, owned) in vf_cache {
+            let local = compute_local_taint_uncached(mid, index, owned, config, &snapshot);
+            for (&off, label) in &owned.insn_at {
+                if let Some(StaticFieldOp::Put { src, path }) = parse_static_field_label(label) {
+                    heap.entry(path)
+                        .or_default()
+                        .extend(local.kinds_at(off, src));
+                }
+            }
+        }
+        let mut changed = false;
+        for (&mid, owned) in vf_cache {
+            for (&off, label) in &owned.insn_at {
+                let Some(StaticFieldOp::Get { dest, path }) = parse_static_field_label(label)
+                else {
+                    continue;
+                };
+                let Some(kinds) = heap.get(&path) else {
+                    continue;
+                };
+                let dst = Arc::make_mut(
+                    summaries
+                        .entry(mid)
+                        .or_insert_with(|| Arc::new(MethodSummary::default())),
+                )
+                .heap_injections
+                .entry((off, dest))
+                .or_default();
+                for kind in kinds {
+                    changed |= dst.insert(kind.clone());
+                }
+                if !kinds.is_empty() {
+                    affected.insert(mid);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    affected
 }
 
 /// Analyze a single DEX with the default Android options.
@@ -626,7 +941,8 @@ pub fn solve_dexes(
         .collect();
 
     let analyzed: HashSet<MethodId> = vf_cache.keys().copied().collect();
-    let call_graph = CallGraph::build_from_vf_cache(&index, &vf_cache, |id| analyzed.contains(&id))?;
+    let call_graph =
+        CallGraph::build_from_vf_cache(&index, &vf_cache, |id| analyzed.contains(&id))?;
     let field_consts = collect_class_field_strings(&vf_cache);
 
     let max_iter = if opts.max_iterations == 0 {
@@ -704,6 +1020,11 @@ pub fn solve_dexes(
         }
     }
 
+    compose_method_summaries(&index, &call_graph, &vf_cache, config, &mut summaries);
+    for mid in compose_static_heap(&index, &vf_cache, config, &mut summaries) {
+        worklist.push_back((mid, 0x4000_0000, "__heap".to_string()));
+    }
+
     // Interprocedural fixpoint.
     // First iter after pass-0 scans every call edge once so arg→param can start.
     // Later iters only scan outgoing edges of dirty methods + methods whose
@@ -720,6 +1041,11 @@ pub fn solve_dexes(
         let mut dirty: HashSet<MethodId> = HashSet::new();
         let mut return_grew: HashSet<MethodId> = HashSet::new();
         for (mid, param_idx, kind) in &batch {
+            if *param_idx == 0x4000_0000 {
+                dirty.insert(*mid);
+                progressed = true;
+                continue;
+            }
             let entry = summaries
                 .entry(*mid)
                 .or_insert_with(|| Arc::new(MethodSummary::default()));
@@ -848,6 +1174,10 @@ pub fn solve_dexes(
                         .and_then(|s| s.param_to_sinks.get(&(i as u32)))
                         .cloned()
                         .unwrap_or_default();
+                    let callee_returns_param = summaries_snap
+                        .get(&edge.callee)
+                        .map(|s| s.param_to_return.contains(&(i as u32)))
+                        .unwrap_or(false);
                     for kind in kinds {
                         if let Some(san) = config.find_sanitizer(&edge.method_ref) {
                             let set = sanitize_kinds(&HashSet::from([kind.clone()]), san);
@@ -856,14 +1186,8 @@ pub fn solve_dexes(
                             }
                         }
                         for sink_kind in &callee_sinks {
-                            let frames = interproc_frames(
-                                &index,
-                                owned,
-                                edge,
-                                &kind,
-                                sink_kind,
-                                dest_s,
-                            );
+                            let frames =
+                                interproc_frames(&index, owned, edge, &kind, sink_kind, dest_s);
                             emit_issue_frames(
                                 &index,
                                 edge.caller,
@@ -882,7 +1206,20 @@ pub fn solve_dexes(
                             .map(|s| s.contains(&kind))
                             .unwrap_or(false);
                         if !before {
-                            transfers.push((edge.callee, i as u32, kind));
+                            transfers.push((edge.callee, i as u32, kind.clone()));
+                        }
+                        if callee_returns_param
+                            && move_result_for_invoke(owned, edge.invoke_offset).is_some()
+                        {
+                            let key = 0x8000_0000u32 | edge.invoke_offset;
+                            let already = summaries_snap
+                                .get(&edge.caller)
+                                .and_then(|s| s.param_kinds.get(&key))
+                                .map(|ks| ks.contains(&kind))
+                                .unwrap_or(false);
+                            if !already {
+                                transfers.push((edge.caller, key, kind));
+                            }
                         }
                     }
                 }
@@ -1048,28 +1385,48 @@ fn analyze_method(
     field_consts: &HashMap<String, String>,
 ) {
     let Some(mref) = index.get(mid) else { return };
-    let Some(owned) = vf_cache.get(&mid) else { return };
+    let Some(owned) = vf_cache.get(&mid) else {
+        return;
+    };
     let dest_url = recover_dest_url(owned, field_consts);
     let dest_url_s = dest_url.as_deref();
 
     let mut local = LocalTaint::default();
+    let mut modeled_return_kinds = HashSet::new();
     let analysis = owned.analysis();
+    if let Some(sum) = summaries.get(&mid) {
+        for (&(off, reg), kinds) in &sum.heap_injections {
+            for kind in kinds {
+                propagate_register(&mut local, &analysis, off, reg, kind);
+            }
+        }
+    }
 
-    // 1) Seed from modeled sources (API returns).
+    // 1) Seed from modeled sources (API returns and callback/lifecycle arguments).
     if !seed_only_params {
         for &((offset, reg), ref method_ref) in &owned.api_return_sources {
-            if let Some(src) = config.find_source(method_ref) {
+            for src in config.find_sources(method_ref) {
                 if matches!(src.port, Port::Return) {
                     seed_and_propagate(
-                        &mut local,
-                        &analysis,
-                        owned,
-                        config,
-                        offset,
-                        reg,
-                        &src.kind,
+                        &mut local, &analysis, owned, config, offset, reg, &src.kind,
                     );
                 }
+            }
+        }
+        let callable = format!("{}.{}{}", mref.class_name, mref.method_name, mref.proto);
+        for src in config.find_sources(&callable) {
+            if src.port == Port::Return {
+                modeled_return_kinds.insert(src.kind.clone());
+                continue;
+            }
+            let Some(param_idx) = port_to_arg_index(&src.port) else {
+                continue;
+            };
+            if !formal_param_slots(mref, owned).contains(&param_idx) {
+                continue;
+            }
+            if let Some(reg) = param_reg(owned, param_idx) {
+                seed_param_register(&mut local, &analysis, owned, config, reg, &src.kind);
             }
         }
     }
@@ -1096,14 +1453,17 @@ fn analyze_method(
                 seed_param_register(&mut local, &analysis, owned, config, reg, kind);
                 // Re-scan sink reads after param seed (VF from 0 misses incoming params).
                 for (&roff, (reads, _)) in &owned.rw_map {
-                    if !reads.iter().any(|r| local.kinds_at(roff, *r).contains(kind.as_str())) {
+                    if !reads
+                        .iter()
+                        .any(|r| local.kinds_at(roff, *r).contains(kind.as_str()))
+                    {
                         continue;
                     }
                     for &rreg in reads {
                         if local.kinds_at(roff, rreg).contains(kind.as_str()) {
                             check_sink_at(
-                                mid, index, owned, config, &local, roff, rreg, kind,
-                                dest_url_s, issues, seen,
+                                mid, index, owned, config, &local, roff, rreg, kind, dest_url_s,
+                                issues, seen,
                             );
                         }
                     }
@@ -1160,6 +1520,7 @@ fn analyze_method(
             .entry(mid)
             .or_insert_with(|| Arc::new(MethodSummary::default())),
     );
+    sum.return_kinds.extend(modeled_return_kinds);
     for (&off, (reads, _writes)) in &owned.rw_map {
         if !is_return_insn(owned.insn_at.get(&off).map(String::as_str).unwrap_or("")) {
             continue;
@@ -1172,7 +1533,7 @@ fn analyze_method(
         }
     }
     // Infer param→return for interproc TITO of app methods.
-    for param_idx in 0..owned.ins_size.min(16) {
+    for param_idx in formal_param_slots(mref, owned) {
         if let Some(reg) = param_reg(owned, param_idx) {
             let flow = analysis.value_flow_from_seed(0, reg);
             for &(roff, _rreg) in &flow.reads {
@@ -1183,10 +1544,10 @@ fn analyze_method(
         }
     }
     // Structural + live-taint param→sink summaries (1-hop).
-    for (idx, sinks) in infer_param_to_sinks(owned, config) {
+    for (idx, sinks) in infer_param_to_sinks(mref, owned, config) {
         sum.param_to_sinks.entry(idx).or_default().extend(sinks);
     }
-    for param_idx in 0..owned.ins_size.min(16) {
+    for param_idx in formal_param_slots(mref, owned) {
         let Some(reg) = param_reg(owned, param_idx) else {
             continue;
         };
@@ -1244,7 +1605,28 @@ fn seed_and_propagate(
     apply_propagations(local, owned, config);
 }
 
-fn apply_propagations(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned, config: &TaintConfig) {
+fn propagate_register(
+    local: &mut LocalTaint,
+    analysis: &crate::decompile::value_flow::ValueFlowAnalysis<'_>,
+    offset: u32,
+    reg: u32,
+    kind: &str,
+) {
+    local.insert(offset, reg, kind);
+    let flow = analysis.value_flow_from_seed(offset, reg);
+    for &(woff, wreg) in &flow.writes {
+        local.insert(woff, wreg, kind);
+    }
+    for &(roff, rreg) in &flow.reads {
+        local.insert(roff, rreg, kind);
+    }
+}
+
+fn apply_propagations(
+    local: &mut LocalTaint,
+    owned: &ValueFlowAnalysisOwned,
+    config: &TaintConfig,
+) {
     let analysis = owned.analysis();
     // Fixed few rounds of TITO at invoke sites; forward-propagate onto object regs
     // so later startActivity/commit see putExtra/setData taint.
@@ -1332,40 +1714,91 @@ fn apply_propagations(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned, co
 
 fn apply_field_heap(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
     let analysis = owned.analysis();
-    // Puts before gets so HashMap iteration order cannot miss a same-method store.
-    let mut puts = Vec::new();
-    let mut gets = Vec::new();
+    #[derive(Debug)]
+    enum HeapOp {
+        InstancePut(u32, u32, String),
+        InstanceGet(u32, u32, String),
+        StaticPut(u32, String),
+        StaticGet(u32, String),
+        ArrayPut(u32, u32, String),
+        ArrayGet(u32, u32, String),
+    }
+    let mut ops = Vec::new();
     for (&off, label) in &owned.insn_at {
         match parse_instance_field_label(label) {
-            Some(InstanceFieldOp::Put { src, obj, path }) => puts.push((off, src, obj, path)),
-            Some(InstanceFieldOp::Get { dest, obj, path }) => gets.push((off, dest, obj, path)),
+            Some(InstanceFieldOp::Put { src, obj, path }) => {
+                ops.push((off, HeapOp::InstancePut(src, obj, path)))
+            }
+            Some(InstanceFieldOp::Get { dest, obj, path }) => {
+                ops.push((off, HeapOp::InstanceGet(dest, obj, path)))
+            }
+            None => {}
+        }
+        match parse_static_field_label(label) {
+            Some(StaticFieldOp::Put { src, path }) => ops.push((off, HeapOp::StaticPut(src, path))),
+            Some(StaticFieldOp::Get { dest, path }) => {
+                ops.push((off, HeapOp::StaticGet(dest, path)))
+            }
+            None => {}
+        }
+        match parse_array_label(label) {
+            Some(ArrayOp::Put { src, array, index }) => ops.push((
+                off,
+                HeapOp::ArrayPut(src, array, array_path(owned, off, index)),
+            )),
+            Some(ArrayOp::Get { dest, array, index }) => ops.push((
+                off,
+                HeapOp::ArrayGet(dest, array, array_path(owned, off, index)),
+            )),
             None => {}
         }
     }
-    puts.sort_by_key(|(off, _, _, _)| *off);
-    gets.sort_by_key(|(off, _, _, _)| *off);
-    for (off, src, obj, path) in puts {
-        for k in local.kinds_at(off, src) {
-            propagate_path(local, &analysis, off, obj, &path, &k);
-        }
-    }
-    for (off, dest, obj, path) in gets {
-        let mut kinds = local.path_kinds_on_reg(obj, &path);
-        kinds.extend(local.kinds_at_path(off, obj, &path));
-        if kinds.is_empty() {
-            // Unknown/missing path → conservative object-level.
-            kinds = local.kinds_at(off, obj);
-        }
-        for k in kinds {
-            if local.insert(off, dest, &k) {
-                let flow = analysis.value_flow_from_seed(off, dest);
-                for &(woff, wreg) in &flow.writes {
-                    local.insert(woff, wreg, &k);
+    ops.sort_by_key(|(off, _)| *off);
+    let mut static_heap: HashMap<String, HashSet<String>> = HashMap::new();
+    for (off, op) in ops {
+        let (dest, kinds) = match op {
+            HeapOp::InstancePut(src, obj, path) => {
+                for k in local.kinds_at(off, src) {
+                    propagate_path(local, &analysis, off, obj, &path, &k);
                 }
-                for &(roff, rreg) in &flow.reads {
-                    local.insert(roff, rreg, &k);
-                }
+                continue;
             }
+            HeapOp::InstanceGet(dest, obj, path) => {
+                let mut kinds = local.path_kinds_on_reg_before(obj, &path, off);
+                if kinds.is_empty() {
+                    kinds = local.kinds_at(off, obj);
+                }
+                (dest, kinds)
+            }
+            HeapOp::StaticPut(src, path) => {
+                static_heap
+                    .entry(path)
+                    .or_default()
+                    .extend(local.kinds_at(off, src));
+                continue;
+            }
+            HeapOp::StaticGet(dest, path) => {
+                (dest, static_heap.get(&path).cloned().unwrap_or_default())
+            }
+            HeapOp::ArrayPut(src, array, path) => {
+                for k in local.kinds_at(off, src) {
+                    propagate_path(local, &analysis, off, array, &path, &k);
+                }
+                continue;
+            }
+            HeapOp::ArrayGet(dest, array, path) => {
+                let kinds = if path == "array:*" {
+                    local.array_kinds_on_reg_before(array, off)
+                } else {
+                    let mut exact = local.path_kinds_on_reg_before(array, &path, off);
+                    exact.extend(local.path_kinds_on_reg_before(array, "array:*", off));
+                    exact
+                };
+                (dest, kinds)
+            }
+        };
+        for k in kinds {
+            propagate_register(local, &analysis, off, dest, &k);
         }
     }
     for (&invoke_off, method_ref) in &owned.invoke_method_map {
@@ -1383,9 +1816,11 @@ fn apply_field_heap(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
         let Some((mr_off, mr_reg)) = move_result_for_invoke(owned, invoke_off) else {
             continue;
         };
-        let kinds = match args.get(1).copied().and_then(|key_reg| {
-            const_string_for_reg(owned, invoke_off, key_reg)
-        }) {
+        let kinds = match args
+            .get(1)
+            .copied()
+            .and_then(|key_reg| const_string_for_reg(owned, invoke_off, key_reg))
+        {
             Some(key) => local.path_kinds_on_reg(obj, &format!("extra:{key}")),
             None => local.kinds_at(invoke_off, obj),
         };
@@ -1430,7 +1865,8 @@ fn check_sink_at(
     if let Some(idx) = port_to_arg_index(&sink.port) {
         if args.get(idx as usize) == Some(&reg) {
             emit_issue(
-                index, mid, config, kind, &sink.kind, offset, offset, method_ref, dest_url, issues, seen,
+                index, mid, config, kind, &sink.kind, offset, offset, method_ref, dest_url, issues,
+                seen,
             );
         }
     }
@@ -1558,7 +1994,15 @@ fn emit_issue(
         },
     ];
     emit_issue_frames(
-        index, mid, config, source_kind, sink_kind, sink_offset, frames, issues, seen,
+        index,
+        mid,
+        config,
+        source_kind,
+        sink_kind,
+        sink_offset,
+        frames,
+        issues,
+        seen,
     );
 }
 
@@ -1617,18 +2061,31 @@ fn compute_local_taint_uncached(
 ) -> LocalTaint {
     let mut local = LocalTaint::default();
     let analysis = owned.analysis();
+    if let Some(sum) = summaries.get(&mid) {
+        for (&(off, reg), kinds) in &sum.heap_injections {
+            for kind in kinds {
+                propagate_register(&mut local, &analysis, off, reg, kind);
+            }
+        }
+    }
     for &((offset, reg), ref method_ref) in &owned.api_return_sources {
-        if let Some(src) = config.find_source(method_ref) {
+        for src in config.find_sources(method_ref) {
             if matches!(src.port, Port::Return) {
-                seed_and_propagate(
-                    &mut local,
-                    &analysis,
-                    owned,
-                    config,
-                    offset,
-                    reg,
-                    &src.kind,
-                );
+                seed_and_propagate(&mut local, &analysis, owned, config, offset, reg, &src.kind);
+            }
+        }
+    }
+    if let Some(mref) = index.get(mid) {
+        let callable = format!("{}.{}{}", mref.class_name, mref.method_name, mref.proto);
+        for src in config.find_sources(&callable) {
+            let Some(param_idx) = port_to_arg_index(&src.port) else {
+                continue;
+            };
+            if !formal_param_slots(mref, owned).contains(&param_idx) {
+                continue;
+            }
+            if let Some(reg) = param_reg(owned, param_idx) {
+                seed_param_register(&mut local, &analysis, owned, config, reg, &src.kind);
             }
         }
     }
@@ -1651,7 +2108,6 @@ fn compute_local_taint_uncached(
         }
     }
     apply_propagations(&mut local, owned, config);
-    let _ = index;
     local
 }
 
@@ -1683,10 +2139,11 @@ fn compute_local_taint(
 
 #[cfg(test)]
 mod tests {
+    use super::super::models::SanitizerModel;
     use super::*;
     use crate::decompile::cfg::MethodCfg;
     use crate::decompile::value_flow::ValueFlowAnalysisOwned;
-    use super::super::models::SanitizerModel;
+    use dex_parser::EncodedMethod;
     use std::collections::HashMap;
 
     fn empty_cfg() -> MethodCfg {
@@ -1710,11 +2167,27 @@ mod tests {
         ValueFlowAnalysisOwned {
             cfg: empty_cfg(),
             rw_map,
+            exceptional_edges: vec![],
             api_return_sources,
             invoke_method_map,
             insn_at,
             registers_size,
             ins_size,
+        }
+    }
+
+    fn stub_method(proto: &str, access_flags: u32) -> super::super::index::MethodRef {
+        super::super::index::MethodRef {
+            id: MethodId(0),
+            class_name: "com.foo.Callback".into(),
+            method_name: "callback".into(),
+            proto: proto.into(),
+            dex_index: 0,
+            encoded: EncodedMethod {
+                method_idx: 0,
+                access_flags,
+                code_off: 1,
+            },
         }
     }
 
@@ -1790,7 +2263,10 @@ mod tests {
 
     #[test]
     fn empty_sanitizer_kinds_are_noop_star_clears() {
-        let kinds: HashSet<String> = ["DeviceId", "UserInput"].into_iter().map(str::to_string).collect();
+        let kinds: HashSet<String> = ["DeviceId", "UserInput"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         let noop = SanitizerModel {
             patterns: vec!["MessageDigest.digest".into()],
             kinds: vec![],
@@ -1834,7 +2310,9 @@ mod tests {
             local.kinds_at(0, 0).is_empty(),
             "const-key extra must not smear object-level taint"
         );
-        assert!(local.path_kinds_on_reg(0, "extra:url").contains("UserInput"));
+        assert!(local
+            .path_kinds_on_reg(0, "extra:url")
+            .contains("UserInput"));
         assert!(local.path_kinds_on_reg(0, "extra:theme").is_empty());
     }
 
@@ -1846,13 +2324,24 @@ mod tests {
         rw_map.insert(8, (vec![1, 0], vec![])); // iput v1, v0
         rw_map.insert(12, (vec![0], vec![2])); // iget v2, v0
         let mut insn_at = HashMap::new();
-        insn_at.insert(8, "iput-object v1, v0, Lcom/foo/Foo;.bar:Ljava/lang/String;".into());
-        insn_at.insert(12, "iget-object v2, v0, Lcom/foo/Foo;.bar:Ljava/lang/String;".into());
-        insn_at.insert(16, "iget-object v3, v0, Lcom/foo/Foo;.other:Ljava/lang/String;".into());
+        insn_at.insert(
+            8,
+            "iput-object v1, v0, Lcom/foo/Foo;.bar:Ljava/lang/String;".into(),
+        );
+        insn_at.insert(
+            12,
+            "iget-object v2, v0, Lcom/foo/Foo;.bar:Ljava/lang/String;".into(),
+        );
+        insn_at.insert(
+            16,
+            "iget-object v3, v0, Lcom/foo/Foo;.other:Ljava/lang/String;".into(),
+        );
         let owned = stub_owned(rw_map, Vec::new(), HashMap::new(), insn_at, 4, 0);
         apply_field_heap(&mut local, &owned);
         assert!(
-            local.kinds_at_path(8, 0, "field:com.foo.Foo.bar").contains("DeviceId"),
+            local
+                .kinds_at_path(8, 0, "field:com.foo.Foo.bar")
+                .contains("DeviceId"),
             "iput should taint field:Foo.bar"
         );
         assert!(
@@ -1881,7 +2370,9 @@ mod tests {
         let owned = stub_owned(rw_map, Vec::new(), invoke_method_map, insn_at, 4, 0);
         apply_propagations(&mut local, &owned, &cfg);
         assert!(
-            local.kinds_at_path(10, 0, "extra:url").contains("UserInput"),
+            local
+                .kinds_at_path(10, 0, "extra:url")
+                .contains("UserInput"),
             "putExtra(\"url\") should taint extra:url: {:?}",
             local.kinds_at_path(10, 0, "extra:url")
         );
@@ -1902,11 +2393,20 @@ mod tests {
         insn2.insert(4, "const-string v1, \"url\"".into());
         insn2.insert(16, "const-string v3, \"theme\"".into());
         insn2.insert(24, "move-result-object v4".into());
-        let owned2 = stub_owned(rw2, vec![((24, 4), "android.content.Intent.getStringExtra".into())], inv2, insn2, 5, 0);
+        let owned2 = stub_owned(
+            rw2,
+            vec![((24, 4), "android.content.Intent.getStringExtra".into())],
+            inv2,
+            insn2,
+            5,
+            0,
+        );
         let mut local2 = LocalTaint::default();
         local2.insert(10, 2, "UserInput");
         apply_propagations(&mut local2, &owned2, &cfg);
-        assert!(local2.kinds_at_path(10, 0, "extra:url").contains("UserInput"));
+        assert!(local2
+            .kinds_at_path(10, 0, "extra:url")
+            .contains("UserInput"));
         assert!(
             local2.kinds_at(24, 4).is_empty(),
             "getStringExtra(\"theme\") must not see extra:url: {:?}",
@@ -1924,9 +2424,8 @@ mod tests {
             parse_const_string_label("const-string/jumbo v0, \"theme\""),
             Some((0, "theme".into()))
         );
-        match parse_instance_field_label(
-            "iput-object v1, v0, Lcom/foo/Foo;.bar:Ljava/lang/String;",
-        ) {
+        match parse_instance_field_label("iput-object v1, v0, Lcom/foo/Foo;.bar:Ljava/lang/String;")
+        {
             Some(InstanceFieldOp::Put { src, obj, path }) => {
                 assert_eq!((src, obj, path.as_str()), (1, 0, "field:com.foo.Foo.bar"));
             }
@@ -1959,9 +2458,12 @@ mod tests {
             "incoming param must taint Writer.write arg: {:?}",
             local.kinds_at(8, 3)
         );
-        let sinks = infer_param_to_sinks(&owned, &cfg);
+        let sinks = infer_param_to_sinks(&stub_method("(Ljava/lang/String;)V", 0), &owned, &cfg);
         assert!(
-            sinks.get(&0).map(|s| s.contains("Network")).unwrap_or(false),
+            sinks
+                .get(&0)
+                .map(|s| s.contains("Network"))
+                .unwrap_or(false),
             "param 0 must reach Network: {sinks:?}"
         );
     }
@@ -1969,7 +2471,10 @@ mod tests {
     #[test]
     fn recover_dest_url_concatenates_base_and_path() {
         let mut insn_at = HashMap::new();
-        insn_at.insert(0, "sget-object v0, Lcom/foo/Api;.BASE:Ljava/lang/String;".into());
+        insn_at.insert(
+            0,
+            "sget-object v0, Lcom/foo/Api;.BASE:Ljava/lang/String;".into(),
+        );
         insn_at.insert(4, "const-string v1, \"/v1/concat\"".into());
         let owned = stub_owned(HashMap::new(), Vec::new(), HashMap::new(), insn_at, 4, 0);
         let mut fields = HashMap::new();
@@ -1986,9 +2491,7 @@ mod tests {
 
     #[test]
     fn parse_static_field_sget_sput() {
-        match parse_static_field_label(
-            "sget-object v0, Lcom/foo/Api;.BASE:Ljava/lang/String;",
-        ) {
+        match parse_static_field_label("sget-object v0, Lcom/foo/Api;.BASE:Ljava/lang/String;") {
             Some(StaticFieldOp::Get { dest, path }) => {
                 assert_eq!((dest, path.as_str()), (0, "field:com.foo.Api.BASE"));
             }
@@ -2001,5 +2504,81 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
     }
-}
 
+    #[test]
+    fn array_paths_are_index_sensitive_with_unknown_fallback() {
+        let mut rw_map = HashMap::new();
+        rw_map.insert(4, (vec![1, 0, 2], vec![]));
+        rw_map.insert(8, (vec![0, 3], vec![4]));
+        rw_map.insert(12, (vec![0, 2], vec![5]));
+        let mut insn_at = HashMap::new();
+        insn_at.insert(0, "const/4 v2, 0x1".into());
+        insn_at.insert(4, "aput-object v1, v0, v2".into());
+        insn_at.insert(8, "aget-object v4, v0, v3".into());
+        insn_at.insert(12, "aget-object v5, v0, v2".into());
+        let owned = stub_owned(rw_map, Vec::new(), HashMap::new(), insn_at, 6, 0);
+        let mut local = LocalTaint::default();
+        local.insert(4, 1, "UserInput");
+        apply_field_heap(&mut local, &owned);
+        assert!(local.kinds_at(12, 5).contains("UserInput"));
+        assert!(
+            local.kinds_at(8, 4).contains("UserInput"),
+            "unknown aget index must conservatively read known elements"
+        );
+    }
+
+    #[test]
+    fn static_field_store_load_is_path_sensitive() {
+        let mut rw_map = HashMap::new();
+        rw_map.insert(4, (vec![1], vec![]));
+        rw_map.insert(8, (vec![], vec![2]));
+        rw_map.insert(12, (vec![], vec![3]));
+        let mut insn_at = HashMap::new();
+        insn_at.insert(
+            4,
+            "sput-object v1, Lcom/foo/State;.token:Ljava/lang/String;".into(),
+        );
+        insn_at.insert(
+            8,
+            "sget-object v2, Lcom/foo/State;.token:Ljava/lang/String;".into(),
+        );
+        insn_at.insert(
+            12,
+            "sget-object v3, Lcom/foo/State;.other:Ljava/lang/String;".into(),
+        );
+        let owned = stub_owned(rw_map, Vec::new(), HashMap::new(), insn_at, 4, 0);
+        let mut local = LocalTaint::default();
+        local.insert(4, 1, "DeviceId");
+        apply_field_heap(&mut local, &owned);
+        assert!(local.kinds_at(8, 2).contains("DeviceId"));
+        assert!(local.kinds_at(12, 3).is_empty());
+    }
+
+    #[test]
+    fn formal_slots_skip_wide_high_words() {
+        let instance = stub_method("(JLjava/lang/String;D)V", 0);
+        let owned = stub_owned(
+            HashMap::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            10,
+            6,
+        );
+        assert_eq!(formal_param_slots(&instance, &owned), vec![0, 1, 3, 4]);
+
+        let static_method = stub_method("(JLjava/lang/String;D)V", 0x8);
+        let static_owned = stub_owned(
+            HashMap::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            10,
+            5,
+        );
+        assert_eq!(
+            formal_param_slots(&static_method, &static_owned),
+            vec![0, 2, 3]
+        );
+    }
+}

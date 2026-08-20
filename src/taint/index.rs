@@ -34,8 +34,12 @@ impl MethodIndex {
         let mut idx = MethodIndex::default();
         for (dex_index, dex) in dexes.iter().enumerate() {
             for class_result in dex.class_defs() {
-                let Ok(class_def) = class_result else { continue };
-                let Ok(class_type) = dex.get_type(class_def.class_idx) else { continue };
+                let Ok(class_def) = class_result else {
+                    continue;
+                };
+                let Ok(class_type) = dex.get_type(class_def.class_idx) else {
+                    continue;
+                };
                 let class_name = descriptor_to_java(&class_type);
                 // Hierarchy first so CHA can walk classes that have no indexed methods.
                 if class_def.superclass_idx != NO_INDEX {
@@ -53,7 +57,9 @@ impl MethodIndex {
                         .or_default()
                         .push(class_name.clone());
                 }
-                let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+                let Ok(Some(class_data)) = dex.get_class_data(&class_def) else {
+                    continue;
+                };
                 for encoded in class_data
                     .direct_methods
                     .iter()
@@ -62,7 +68,9 @@ impl MethodIndex {
                     if encoded.code_off == 0 {
                         continue;
                     }
-                    let Ok(info) = dex.get_method_info(encoded.method_idx) else { continue };
+                    let Ok(info) = dex.get_method_info(encoded.method_idx) else {
+                        continue;
+                    };
                     let method_name = info.name.to_string();
                     let params: String = info.params.concat();
                     let proto = format!("({}){}", params, info.return_type);
@@ -106,28 +114,26 @@ impl MethodIndex {
             None => (method_ref.trim(), None),
         };
         let (cls, name) = bare.rsplit_once('.')?;
-        let ids = self
-            .candidates_for_class_method(cls, name)
-            .or_else(|| {
-                let java_cls = cls
-                    .replace('/', ".")
-                    .trim_start_matches('L')
-                    .trim_end_matches(';')
-                    .to_string();
-                self.candidates_for_class_method(&java_cls, name)
-            })?;
+        let ids = self.candidates_for_class_method(cls, name).or_else(|| {
+            let java_cls = cls
+                .replace('/', ".")
+                .trim_start_matches('L')
+                .trim_end_matches(';')
+                .to_string();
+            self.candidates_for_class_method(&java_cls, name)
+        })?;
         self.pick_callee(ids, proto)
     }
 
     /// CHA: declared-type callee plus app subclasses that override the same name/proto.
     ///
     /// Library subclasses (`android.*`, `java.*`, … via [`is_library_class`]) are skipped
-    /// so `View#foo` cannot explode into every framework child. Cap: 8 callees,
+    /// so `View#foo` cannot explode into every framework child. Cap: 4 callees,
     /// BFS depth/nodes bounded.
     pub fn resolve_callees(&self, method_ref: &str) -> Vec<MethodId> {
-        const MAX_CALLEES: usize = 8;
-        const MAX_NODES: usize = 64;
-        const MAX_DEPTH: usize = 8;
+        const MAX_CALLEES: usize = 4;
+        const MAX_NODES: usize = 32;
+        const MAX_DEPTH: usize = 6;
 
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -164,7 +170,16 @@ impl MethodIndex {
             let Some(children) = self.subclasses.get(&cur) else {
                 continue;
             };
-            for child in children {
+            let mut prioritized: Vec<&String> = children.iter().collect();
+            prioritized.sort_by_key(|child| {
+                let same_package = child
+                    .rsplit_once('.')
+                    .zip(cur.rsplit_once('.'))
+                    .map(|((a, _), (b, _))| a == b)
+                    .unwrap_or(false);
+                (!same_package, child.as_str())
+            });
+            for child in prioritized {
                 if out.len() >= MAX_CALLEES {
                     break;
                 }
@@ -365,10 +380,7 @@ mod tests {
         // Fake a library child + an app child; only the app override is kept.
         idx.subclasses.insert(
             "android.view.View".into(),
-            vec![
-                "android.widget.Button".into(),
-                "com.foo.MyView".into(),
-            ],
+            vec!["android.widget.Button".into(), "com.foo.MyView".into()],
         );
         let app_id = MethodId(1);
         idx.by_class_method
@@ -386,7 +398,11 @@ mod tests {
         assert!(ids.contains(&app_id));
         assert!(ids.len() <= 8);
         assert!(
-            !ids.iter().any(|id| idx.get(*id).unwrap().class_name.starts_with("android.widget")),
+            !ids.iter().any(|id| idx
+                .get(*id)
+                .unwrap()
+                .class_name
+                .starts_with("android.widget")),
             "library subclass must be skipped: {ids:?}"
         );
     }

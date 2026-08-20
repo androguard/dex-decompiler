@@ -124,7 +124,6 @@ fn is_identifier_char_utf8(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.'
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +146,9 @@ mod tests {
     fn replace_identifier_fq_class() {
         let s = "import com.example.Main; com.example.Main x;";
         let out = replace_identifier_occurrences(s, "com.example.Main", "com.myname.MainActivity");
-        assert_eq!(out, "import com.myname.MainActivity; com.myname.MainActivity x;");
+        assert_eq!(
+            out,
+            "import com.myname.MainActivity; com.myname.MainActivity x;"
+        );
     }
 }

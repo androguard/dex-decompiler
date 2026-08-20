@@ -66,7 +66,13 @@ fn tokenize(src: &str) -> Vec<Tok> {
                 i += 1;
             }
             let s: String = chars[start..i].iter().collect();
-            if s.starts_with('$') && s.len() > 1 && s.chars().nth(1).map(|x| x.is_ascii_alphabetic() || x == '_').unwrap_or(false) {
+            if s.starts_with('$')
+                && s.len() > 1
+                && s.chars()
+                    .nth(1)
+                    .map(|x| x.is_ascii_alphabetic() || x == '_')
+                    .unwrap_or(false)
+            {
                 out.push(Tok::Meta(s[1..].to_string()));
             } else {
                 out.push(Tok::Ident(s));
@@ -154,10 +160,7 @@ fn quoted_meta_name(ident: &str) -> Option<&str> {
     let inner = &ident[1..ident.len() - 1];
     if inner.starts_with('$') && inner.len() > 1 {
         let name = &inner[1..];
-        if name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Some(name);
         }
     }
@@ -166,9 +169,7 @@ fn quoted_meta_name(ident: &str) -> Option<&str> {
 
 fn is_quoted_string_literal(ident: &str) -> bool {
     let b = ident.as_bytes();
-    b.len() >= 2
-        && (b[0] == b'"' || b[0] == b'\'')
-        && b[b.len() - 1] == b[0]
+    b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0]
 }
 
 /// Match pattern tokens against haystack starting at `hi` / `pi`. Returns next hay index on success.

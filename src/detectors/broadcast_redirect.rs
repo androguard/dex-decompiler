@@ -68,9 +68,10 @@ pub fn scan_broadcast_intent_redirect(
     // Co-occurrence: install/package broadcast string + nested launch APIs
     // (VF may miss a hop; still a strong Samsung #5-style signal).
     if findings.is_empty() && has_install_hint(owned) {
-        let has_nested_src = owned.api_return_sources.iter().any(|(_, m)| {
-            NESTED_SOURCES.iter().any(|s| m.contains(s))
-        });
+        let has_nested_src = owned
+            .api_return_sources
+            .iter()
+            .any(|(_, m)| NESTED_SOURCES.iter().any(|s| m.contains(s)));
         let has_launch = owned
             .invoke_method_map
             .values()
@@ -149,20 +150,15 @@ mod tests {
         let owned = ValueFlowAnalysisOwned {
             cfg: make_cfg(vec![0, 2]),
             rw_map,
-            api_return_sources: vec![(
-                (0, 0),
-                "android.content.Intent.getParcelableExtra".into(),
-            )],
+            exceptional_edges: vec![],
+            api_return_sources: vec![((0, 0), "android.content.Intent.getParcelableExtra".into())],
             invoke_method_map,
             insn_at,
             registers_size: 0,
             ins_size: 0,
         };
-        let findings = scan_broadcast_intent_redirect(
-            &owned,
-            "com.example.InstallReceiver",
-            "onReceive",
-        );
+        let findings =
+            scan_broadcast_intent_redirect(&owned, "com.example.InstallReceiver", "onReceive");
         assert!(
             findings
                 .iter()

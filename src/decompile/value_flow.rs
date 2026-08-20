@@ -15,6 +15,8 @@ pub type InvokeMethodMap = HashMap<u32, String>;
 pub struct ValueFlowAnalysisOwned {
     pub cfg: MethodCfg,
     pub rw_map: InstructionRwMap,
+    /// Conservative exceptional control-flow edges from protected blocks to catch handlers.
+    pub exceptional_edges: Vec<(BlockId, BlockId)>,
     /// For each (offset, reg) of a move-result that receives an invoke return, the method ref (e.g. "FusedLocationProviderClient.getLastLocation").
     pub api_return_sources: Vec<((u32, u32), String)>,
     /// For each invoke offset, the resolved method ref (e.g. "android.app.PendingIntent.getActivity").
@@ -35,24 +37,35 @@ impl ValueFlowAnalysisOwned {
 
     /// Build a value-flow analysis (reaching defs, def-use, use-def). The returned analysis borrows this struct.
     pub fn analysis(&self) -> ValueFlowAnalysis<'_> {
-        ValueFlowAnalysis::new(&self.cfg, &self.rw_map)
+        ValueFlowAnalysis::new_with_exceptional_edges(
+            &self.cfg,
+            &self.rw_map,
+            &self.exceptional_edges,
+        )
+    }
+
+    /// Follow an incoming method argument, which has no defining DEX instruction.
+    pub fn value_flow_from_entry_reg(&self, reg: u32) -> ValueFlowResult {
+        const ENTRY_DEF: u32 = u32::MAX;
+        let mut cfg = self.cfg.clone();
+        let Some(entry) = cfg.blocks.get_mut(cfg.entry) else {
+            return ValueFlowResult::default();
+        };
+        entry.instruction_offsets.insert(0, ENTRY_DEF);
+        let mut rw_map = self.rw_map.clone();
+        rw_map.insert(ENTRY_DEF, (vec![], vec![reg]));
+        ValueFlowAnalysis::new_with_exceptional_edges(&cfg, &rw_map, &self.exceptional_edges)
+            .value_flow_from_seed(ENTRY_DEF, reg)
     }
 
     /// Run value-flow from every move-result that receives the return of an invoke whose method ref
     /// contains any of the given patterns (e.g. "getLastLocation" or "FusedLocationProviderClient.getLastLocation").
     /// Merges reads and writes from all matching seeds (union, deduped).
-    pub fn value_flow_from_api_sources<P: AsRef<str>>(
-        &self,
-        patterns: &[P],
-    ) -> ValueFlowResult {
+    pub fn value_flow_from_api_sources<P: AsRef<str>>(&self, patterns: &[P]) -> ValueFlowResult {
         let seeds: Vec<(u32, u32)> = self
             .api_return_sources
             .iter()
-            .filter(|(_, method_ref)| {
-                patterns
-                    .iter()
-                    .any(|p| method_ref.contains(p.as_ref()))
-            })
+            .filter(|(_, method_ref)| patterns.iter().any(|p| method_ref.contains(p.as_ref())))
             .map(|&((offset, reg), _)| (offset, reg))
             .collect();
         let mut reads = HashSet::new();
@@ -89,8 +102,11 @@ fn extract_invoke_method_ref(ops_resolved: &str) -> Option<String> {
             _ => {}
         }
     }
-    let split_at = last_comma_at?;
-    let method_ref = inner[split_at + 1..].trim();
+    // Zero-argument invokes contain only the method reference and therefore no
+    // top-level comma (for example `pkg.Origin.source()`).
+    let method_ref = last_comma_at
+        .map(|split_at| inner[split_at + 1..].trim())
+        .unwrap_or(inner);
     let method_name = method_ref.split('(').next().unwrap_or(method_ref).trim();
     Some(method_name.to_string())
 }
@@ -129,7 +145,7 @@ pub fn build_api_return_sources<F>(
 where
     F: Fn(&str) -> String,
 {
-        let mut out = Vec::new();
+    let mut out = Vec::new();
     let mut last_invoke_method: Option<String> = None;
     for ins in instructions {
         let offset = (ins.offset as u32).wrapping_add(base_off);
@@ -139,9 +155,11 @@ where
             last_invoke_method = extract_invoke_method_ref(&resolved);
         } else if m.starts_with("move-result") {
             let (_, writes) = instruction_reads_writes(m, &resolved);
-            if writes.len() == 1 {
-                if let Some(method_ref) = last_invoke_method.take() {
-                    out.push(((offset, writes[0]), method_ref));
+            if let Some(method_ref) = last_invoke_method.take() {
+                // move-result-wide defines both register slots; either slot can be
+                // consumed by subsequent wide argument handling.
+                for reg in writes {
+                    out.push(((offset, reg), method_ref.clone()));
                 }
             }
         } else {
@@ -214,7 +232,16 @@ pub struct ValueFlowAnalysis<'a> {
 impl<'a> ValueFlowAnalysis<'a> {
     /// Build reaching definitions and def-use / use-def from CFG and per-instruction read/write map.
     pub fn new(cfg: &'a MethodCfg, rw_map: &'a InstructionRwMap) -> Self {
-        let predecessors = Self::predecessors(cfg);
+        Self::new_with_exceptional_edges(cfg, rw_map, &[])
+    }
+
+    /// Build reaching definitions including throw/catch control-flow edges.
+    pub fn new_with_exceptional_edges(
+        cfg: &'a MethodCfg,
+        rw_map: &'a InstructionRwMap,
+        exceptional_edges: &[(BlockId, BlockId)],
+    ) -> Self {
+        let predecessors = Self::predecessors(cfg, exceptional_edges);
         let (use_def, def_use) = Self::reaching_defs(cfg, rw_map, &predecessors);
         Self {
             rw_map,
@@ -223,9 +250,16 @@ impl<'a> ValueFlowAnalysis<'a> {
         }
     }
 
-    fn predecessors(cfg: &MethodCfg) -> HashMap<BlockId, Vec<BlockId>> {
+    fn predecessors(
+        cfg: &MethodCfg,
+        exceptional_edges: &[(BlockId, BlockId)],
+    ) -> HashMap<BlockId, Vec<BlockId>> {
         let mut pred: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-        for (from, to) in cfg.successor_edges() {
+        for (from, to) in cfg
+            .successor_edges()
+            .into_iter()
+            .chain(exceptional_edges.iter().copied())
+        {
             pred.entry(to).or_default().push(from);
         }
         pred
@@ -258,10 +292,7 @@ impl<'a> ValueFlowAnalysis<'a> {
                         for &p in preds {
                             if let Some(out) = out_block.get(&p) {
                                 for (reg, defs) in out {
-                                    merged
-                                        .entry(*reg)
-                                        .or_default()
-                                        .extend(defs.iter().copied());
+                                    merged.entry(*reg).or_default().extend(defs.iter().copied());
                                 }
                             }
                         }
@@ -337,10 +368,7 @@ impl<'a> ValueFlowAnalysis<'a> {
         }
         let reads: Vec<(u32, u32)> = read_set.into_iter().collect();
 
-        ValueFlowResult {
-            reads,
-            writes,
-        }
+        ValueFlowResult { reads, writes }
     }
 
     /// Def-use: for def (offset, reg), return all (offset_use, reg_use) that use that value.
@@ -373,8 +401,8 @@ mod tests {
     fn linear_const_move_return_bytecode() -> Vec<u8> {
         vec![
             0x12, 0x00, // const/4 v0, 0  -> offset 0
-            0x04, 0x10, // move v1, v0    -> offset 2
-            0x0f, 0x10, // return v1      -> offset 4
+            0x01, 0x01, // move v1, v0    -> offset 2
+            0x0f, 0x01, // return v1      -> offset 4
         ]
     }
 
@@ -382,9 +410,9 @@ mod tests {
     fn transitive_copy_bytecode() -> Vec<u8> {
         vec![
             0x12, 0x00, // const/4 v0, 0  -> 0
-            0x04, 0x10, // move v1, v0    -> 2
-            0x04, 0x21, // move v2, v1    -> 4
-            0x0f, 0x20, // return v2      -> 6
+            0x01, 0x01, // move v1, v0    -> 2
+            0x01, 0x12, // move v2, v1    -> 4
+            0x0f, 0x02, // return v2      -> 6
         ]
     }
 
@@ -392,8 +420,8 @@ mod tests {
     fn const_move_invoke_bytecode() -> Vec<u8> {
         vec![
             0x12, 0x00, // const/4 v0, 0  -> 0
-            0x04, 0x10, // move v1, v0    -> 2
-            0x6e, 0x11, 0x00, 0x00, 0x00, 0x00, // invoke-virtual {v1}, method@0  -> 4
+            0x01, 0x01, // move v1, v0    -> 2
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // invoke-virtual {v1}, method@0  -> 4
         ]
     }
 
@@ -402,10 +430,10 @@ mod tests {
     fn param_and_return_bytecode() -> Vec<u8> {
         vec![
             0x12, 0x00, // const/4 v0, 0  -> 0
-            0x04, 0x10, // move v1, v0    -> 2
-            0x6e, 0x11, 0x00, 0x00, 0x00, 0x00, // invoke-virtual {v1}  -> 4
-            0x04, 0x20, // move v2, v0    -> 10
-            0x0f, 0x20, // return v2      -> 12
+            0x01, 0x01, // move v1, v0    -> 2
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // invoke-virtual {v1}  -> 4
+            0x01, 0x02, // move v2, v0    -> 10
+            0x0f, 0x02, // return v2      -> 12
         ]
     }
 
@@ -415,14 +443,13 @@ mod tests {
         vec![
             0x6e, 0x10, 0x00, 0x00, 0x00, 0x00, // invoke-virtual {v0}  -> 0
             0x0a, 0x00, // move-result v0  -> 6
-            0x04, 0x10, // move v1, v0    -> 8
-            0x0f, 0x10, // return v1      -> 10
+            0x01, 0x01, // move v1, v0    -> 8
+            0x0f, 0x01, // return v1      -> 10
         ]
     }
 
     fn build_cfg_and_rw(bytecode: &[u8]) -> (MethodCfg, InstructionRwMap) {
-        let instructions =
-            dex_bytecode::decode_all(bytecode, 0).expect("decode");
+        let instructions = dex_bytecode::decode_all(bytecode, 0).expect("decode");
         let base_off = 0u32;
         let rw_map = build_instruction_rw_map(&instructions, base_off, |s| s.to_string());
         let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_no_branch);
@@ -434,73 +461,12 @@ mod tests {
         cfg.blocks[cfg.entry].instruction_offsets.clone()
     }
 
-    /// Override rw_map with expected read/write for const; move v1,v0; return v1.
-    fn rw_map_const_move_return(offsets: &[u32]) -> InstructionRwMap {
-        let mut m = InstructionRwMap::new();
-        if offsets.len() >= 3 {
-            m.insert(offsets[0], (vec![], vec![0]));       // const v0
-            m.insert(offsets[1], (vec![0], vec![1]));      // move v1, v0
-            m.insert(offsets[2], (vec![1], vec![]));       // return v1
-        }
-        m
-    }
-
-    /// Override rw_map for const; move v1,v0; move v2,v1; return v2.
-    fn rw_map_transitive(offsets: &[u32]) -> InstructionRwMap {
-        let mut m = InstructionRwMap::new();
-        if offsets.len() >= 4 {
-            m.insert(offsets[0], (vec![], vec![0]));
-            m.insert(offsets[1], (vec![0], vec![1]));
-            m.insert(offsets[2], (vec![1], vec![2]));
-            m.insert(offsets[3], (vec![2], vec![]));
-        }
-        m
-    }
-
-    /// Override rw_map for const; move v1,v0; invoke-virtual {v1} (value passed to function).
-    fn rw_map_const_move_invoke(offsets: &[u32]) -> InstructionRwMap {
-        let mut m = InstructionRwMap::new();
-        if offsets.len() >= 3 {
-            m.insert(offsets[0], (vec![], vec![0]));       // const v0
-            m.insert(offsets[1], (vec![0], vec![1]));    // move v1, v0
-            m.insert(offsets[2], (vec![1], vec![]));      // invoke reads v1
-        }
-        m
-    }
-
-    /// rw_map: one value flows to both invoke (param) and return.
-    /// const v0; move v1,v0; invoke v1; move v2,v0; return v2.
-    fn rw_map_param_and_return(offsets: &[u32]) -> InstructionRwMap {
-        let mut m = InstructionRwMap::new();
-        if offsets.len() >= 5 {
-            m.insert(offsets[0], (vec![], vec![0]));       // const v0
-            m.insert(offsets[1], (vec![0], vec![1]));     // move v1, v0
-            m.insert(offsets[2], (vec![1], vec![]));      // invoke reads v1
-            m.insert(offsets[3], (vec![0], vec![2]));     // move v2, v0
-            m.insert(offsets[4], (vec![2], vec![]));      // return v2
-        }
-        m
-    }
-
-    /// rw_map: move-result v0 (value from callee) -> move v1,v0 -> return v1.
-    fn rw_map_move_result_to_return(offsets: &[u32]) -> InstructionRwMap {
-        let mut m = InstructionRwMap::new();
-        if offsets.len() >= 4 {
-            m.insert(offsets[0], (vec![0], vec![]));      // invoke reads v0
-            m.insert(offsets[1], (vec![], vec![0]));       // move-result v0
-            m.insert(offsets[2], (vec![0], vec![1]));      // move v1, v0
-            m.insert(offsets[3], (vec![1], vec![]));       // return v1
-        }
-        m
-    }
-
     #[test]
     fn value_flow_seed_const_move_return() {
         let bytecode = linear_const_move_return_bytecode();
-        let (cfg, _) = build_cfg_and_rw(&bytecode);
+        let (cfg, rw_map) = build_cfg_and_rw(&bytecode);
         let offsets = entry_block_offsets(&cfg);
         assert!(offsets.len() >= 3, "expected at least 3 instructions");
-        let rw_map = rw_map_const_move_return(&offsets);
 
         let off_const = offsets[0];
         let off_move = offsets[1];
@@ -510,23 +476,40 @@ mod tests {
         let result = analysis.value_flow_from_seed(off_const, 0);
 
         let writes_set: HashSet<_> = result.writes.iter().copied().collect();
-        assert!(writes_set.contains(&(off_const, 0)), "writes should contain seed, got {:?}", result.writes);
-        assert!(writes_set.contains(&(off_move, 1)), "writes should contain copy, got {:?}", result.writes);
-        assert_eq!(result.writes.len(), 2, "expected 2 writes, got {:?}", result.writes);
+        assert!(
+            writes_set.contains(&(off_const, 0)),
+            "writes should contain seed, got {:?}",
+            result.writes
+        );
+        assert!(
+            writes_set.contains(&(off_move, 1)),
+            "writes should contain copy, got {:?}",
+            result.writes
+        );
+        assert_eq!(
+            result.writes.len(),
+            2,
+            "expected 2 writes, got {:?}",
+            result.writes
+        );
 
         let reads_set: HashSet<_> = result.reads.iter().copied().collect();
         assert!(reads_set.contains(&(off_move, 0)));
         assert!(reads_set.contains(&(off_return, 1)));
-        assert_eq!(result.reads.len(), 2, "expected 2 reads, got {:?}", result.reads);
+        assert_eq!(
+            result.reads.len(),
+            2,
+            "expected 2 reads, got {:?}",
+            result.reads
+        );
     }
 
     #[test]
     fn value_flow_transitive_copy() {
         let bytecode = transitive_copy_bytecode();
-        let (cfg, _) = build_cfg_and_rw(&bytecode);
+        let (cfg, rw_map) = build_cfg_and_rw(&bytecode);
         let offsets = entry_block_offsets(&cfg);
         assert!(offsets.len() >= 4, "expected at least 4 instructions");
-        let rw_map = rw_map_transitive(&offsets);
 
         let off_const = offsets[0];
         let off_move1 = offsets[1];
@@ -540,21 +523,30 @@ mod tests {
         assert!(writes_set.contains(&(off_const, 0)));
         assert!(writes_set.contains(&(off_move1, 1)));
         assert!(writes_set.contains(&(off_move2, 2)));
-        assert_eq!(result.writes.len(), 3, "expected 3 writes, got {:?}", result.writes);
+        assert_eq!(
+            result.writes.len(),
+            3,
+            "expected 3 writes, got {:?}",
+            result.writes
+        );
 
         let reads_set: HashSet<_> = result.reads.iter().copied().collect();
         assert!(reads_set.contains(&(off_move1, 0)));
         assert!(reads_set.contains(&(off_move2, 1)));
         assert!(reads_set.contains(&(off_return, 2)));
-        assert_eq!(result.reads.len(), 3, "expected 3 reads, got {:?}", result.reads);
+        assert_eq!(
+            result.reads.len(),
+            3,
+            "expected 3 reads, got {:?}",
+            result.reads
+        );
     }
 
     #[test]
     fn def_use_and_use_def() {
         let bytecode = linear_const_move_return_bytecode();
-        let (cfg, _) = build_cfg_and_rw(&bytecode);
+        let (cfg, rw_map) = build_cfg_and_rw(&bytecode);
         let offsets = entry_block_offsets(&cfg);
-        let rw_map = rw_map_const_move_return(&offsets);
 
         let off_const = offsets[0];
         let off_move = offsets[1];
@@ -563,20 +555,27 @@ mod tests {
         let analysis = ValueFlowAnalysis::new(&cfg, &rw_map);
 
         let uses = analysis.def_use(off_const, 0);
-        assert!(uses.contains(&(off_move, 0)), "def (const) should reach use at move, got {:?}", uses);
+        assert!(
+            uses.contains(&(off_move, 0)),
+            "def (const) should reach use at move, got {:?}",
+            uses
+        );
 
         let defs = analysis.use_def(off_return, 1);
-        assert!(defs.contains(&(off_move, 1)), "use (return v1) should be reached by move v1, got {:?}", defs);
+        assert!(
+            defs.contains(&(off_move, 1)),
+            "use (return v1) should be reached by move v1, got {:?}",
+            defs
+        );
     }
 
     /// Tainting tracks value when it is **returned**: seed at const, value flows to move then to return.
     #[test]
     fn value_flow_tracks_return_use() {
         let bytecode = linear_const_move_return_bytecode();
-        let (cfg, _) = build_cfg_and_rw(&bytecode);
+        let (cfg, rw_map) = build_cfg_and_rw(&bytecode);
         let offsets = entry_block_offsets(&cfg);
         assert!(offsets.len() >= 3);
-        let rw_map = rw_map_const_move_return(&offsets);
         let off_return = offsets[2];
 
         let analysis = ValueFlowAnalysis::new(&cfg, &rw_map);
@@ -584,7 +583,10 @@ mod tests {
 
         // The value is read at return v1 (v1 holds the tracked value).
         assert!(
-            result.reads.iter().any(|&(off, reg)| off == off_return && reg == 1),
+            result
+                .reads
+                .iter()
+                .any(|&(off, reg)| off == off_return && reg == 1),
             "reads should contain return (offset, v1), got reads={:?}",
             result.reads
         );
@@ -594,10 +596,9 @@ mod tests {
     #[test]
     fn value_flow_tracks_value_passed_to_invoke() {
         let bytecode = const_move_invoke_bytecode();
-        let (cfg, _) = build_cfg_and_rw(&bytecode);
+        let (cfg, rw_map) = build_cfg_and_rw(&bytecode);
         let offsets = entry_block_offsets(&cfg);
         assert!(offsets.len() >= 3, "expected const, move, invoke");
-        let rw_map = rw_map_const_move_invoke(&offsets);
         let off_invoke = offsets[2];
 
         let analysis = ValueFlowAnalysis::new(&cfg, &rw_map);
@@ -605,8 +606,14 @@ mod tests {
 
         // Writes: const v0, move v1.
         let writes_set: HashSet<_> = result.writes.iter().copied().collect();
-        assert!(writes_set.contains(&(offsets[0], 0)), "writes should contain const v0");
-        assert!(writes_set.contains(&(offsets[1], 1)), "writes should contain move v1");
+        assert!(
+            writes_set.contains(&(offsets[0], 0)),
+            "writes should contain const v0"
+        );
+        assert!(
+            writes_set.contains(&(offsets[1], 1)),
+            "writes should contain move v1"
+        );
 
         // The value is read at invoke (v1 passed as argument).
         assert!(
@@ -621,10 +628,12 @@ mod tests {
     #[test]
     fn value_flow_complex_param_and_return() {
         let bytecode = param_and_return_bytecode();
-        let (cfg, _) = build_cfg_and_rw(&bytecode);
+        let (cfg, rw_map) = build_cfg_and_rw(&bytecode);
         let offsets = entry_block_offsets(&cfg);
-        assert!(offsets.len() >= 5, "expected const, move, invoke, move, return");
-        let rw_map = rw_map_param_and_return(&offsets);
+        assert!(
+            offsets.len() >= 5,
+            "expected const, move, invoke, move, return"
+        );
         let off_invoke = offsets[2];
         let off_return = offsets[4];
 
@@ -657,10 +666,12 @@ mod tests {
     #[test]
     fn value_flow_complex_return_from_callee_to_return() {
         let bytecode = move_result_to_return_bytecode();
-        let (cfg, _) = build_cfg_and_rw(&bytecode);
+        let (cfg, rw_map) = build_cfg_and_rw(&bytecode);
         let offsets = entry_block_offsets(&cfg);
-        assert!(offsets.len() >= 4, "expected invoke, move-result, move, return");
-        let rw_map = rw_map_move_result_to_return(&offsets);
+        assert!(
+            offsets.len() >= 4,
+            "expected invoke, move-result, move, return"
+        );
         let off_move_result = offsets[1];
         let off_return = offsets[3];
 
@@ -684,5 +695,68 @@ mod tests {
             reads_set.contains(&(off_return, 1)),
             "reads should contain return v1 (value propagated from callee return)"
         );
+    }
+
+    #[test]
+    fn exceptional_predecessor_preserves_definition_in_handler() {
+        use super::super::cfg::{BlockEnd, CfgBlock};
+
+        let cfg = MethodCfg {
+            blocks: vec![
+                CfgBlock {
+                    start_offset: 0,
+                    end_offset: 2,
+                    end: BlockEnd::Exit,
+                    instruction_offsets: vec![0],
+                },
+                CfgBlock {
+                    start_offset: 10,
+                    end_offset: 12,
+                    end: BlockEnd::Exit,
+                    instruction_offsets: vec![10],
+                },
+            ],
+            block_by_start: HashMap::from([(0, 0), (10, 1)]),
+            loop_headers: HashSet::new(),
+            entry: 0,
+            folded_const_offsets: HashSet::new(),
+        };
+        let rw_map = HashMap::from([(0, (vec![], vec![0])), (10, (vec![0], vec![]))]);
+
+        let without_exception = ValueFlowAnalysis::new(&cfg, &rw_map);
+        assert!(without_exception
+            .value_flow_from_seed(0, 0)
+            .reads
+            .is_empty());
+
+        let with_exception =
+            ValueFlowAnalysis::new_with_exceptional_edges(&cfg, &rw_map, &[(0, 1)]);
+        assert!(with_exception
+            .value_flow_from_seed(0, 0)
+            .reads
+            .contains(&(10, 0)));
+    }
+
+    #[test]
+    fn incoming_parameter_has_synthetic_entry_definition() {
+        let bytecode = vec![
+            0x01, 0x01, // move v1, v0
+            0x0f, 0x01, // return v1
+        ];
+        let (cfg, rw_map) = build_cfg_and_rw(&bytecode);
+        let owned = ValueFlowAnalysisOwned {
+            cfg,
+            rw_map,
+            exceptional_edges: vec![],
+            api_return_sources: vec![],
+            invoke_method_map: HashMap::new(),
+            insn_at: HashMap::new(),
+            registers_size: 2,
+            ins_size: 1,
+        };
+        let flow = owned.value_flow_from_entry_reg(0);
+        assert!(flow.reads.contains(&(0, 0)));
+        assert!(flow.writes.contains(&(0, 1)));
+        assert!(flow.reads.contains(&(2, 1)));
     }
 }

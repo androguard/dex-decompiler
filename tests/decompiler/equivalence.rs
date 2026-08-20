@@ -129,7 +129,10 @@ fn test_decompiler_try_catch_handler_in_catch_block() {
         .unwrap_or(catch_rest.len());
     let catch_body = catch_rest[..catch_end].trim();
     assert!(
-        catch_body.len() > 20 || catch_body.contains("println") || catch_body.contains("test2") || catch_body.contains("n0 = 12"),
+        catch_body.len() > 20
+            || catch_body.contains("println")
+            || catch_body.contains("test2")
+            || catch_body.contains("n0 = 12"),
         "catch block should contain handler code, not just a comment; got: {:?}",
         catch_body
     );
@@ -164,16 +167,26 @@ fn test_decompiler_no_use_before_declare_in_conditions() {
     let lines: Vec<&str> = method_body.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if !trimmed.starts_with("if (") { continue; }
-        let cond_end = trimmed.find(") {").unwrap_or(trimmed.find(')').unwrap_or(trimmed.len()));
+        if !trimmed.starts_with("if (") {
+            continue;
+        }
+        let cond_end = trimmed
+            .find(") {")
+            .unwrap_or(trimmed.find(')').unwrap_or(trimmed.len()));
         let condition = &trimmed[4..cond_end];
         // Scan the if-body for typed declarations like "int n0 = ..."
         for body_line in &lines[i + 1..] {
             let bt = body_line.trim();
-            if bt == "}" || bt.starts_with("} else") { break; }
-            for type_kw in &["int ", "String ", "long ", "double ", "float ", "boolean ", "char ", "byte "] {
+            if bt == "}" || bt.starts_with("} else") {
+                break;
+            }
+            for type_kw in &[
+                "int ", "String ", "long ", "double ", "float ", "boolean ", "char ", "byte ",
+            ] {
                 if let Some(rest) = bt.strip_prefix(type_kw) {
-                    let var_end = rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(rest.len());
+                    let var_end = rest
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(rest.len());
                     let var_name = &rest[..var_end];
                     assert!(
                         !condition.contains(var_name),
@@ -259,7 +272,9 @@ fn test_decompiler_param_registers_not_misidentified() {
         if t.contains("[] ") && t.contains(" = new ") {
             if let Some(name_start) = t.find("[] ") {
                 let after_bracket = &t[name_start + 3..];
-                let name_end = after_bracket.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(after_bracket.len());
+                let name_end = after_bracket
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(after_bracket.len());
                 declared_array = Some(after_bracket[..name_end].to_string());
             }
         }
@@ -267,10 +282,14 @@ fn test_decompiler_param_registers_not_misidentified() {
             if t.contains('[') && !t.contains("new ") {
                 if let Some(bracket_pos) = t.find('[') {
                     let before = t[..bracket_pos].trim_start();
-                    let var = before.rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    let var = before
+                        .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                         .next()
                         .unwrap_or("");
-                    if !var.is_empty() && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && var != arr_name {
+                    if !var.is_empty()
+                        && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && var != arr_name
+                    {
                         if var.starts_with("arr") || var == "array" {
                             panic!(
                                 "Array usage '{}' uses name '{}' but declared name is '{}'. \

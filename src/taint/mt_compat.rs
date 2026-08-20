@@ -17,7 +17,10 @@ pub fn parse_mt_port(s: &str) -> Port {
         // MT uses Argument(0) for `this` on instance methods.
         return Port::This;
     }
-    if let Some(rest) = s.strip_prefix("Argument(").and_then(|r| r.strip_suffix(')')) {
+    if let Some(rest) = s
+        .strip_prefix("Argument(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
         if let Ok(idx) = rest.parse::<u32>() {
             return Port::Argument { index: idx };
         }
@@ -34,9 +37,7 @@ pub fn method_patterns(mt_method: &str) -> Vec<String> {
     let bare = mt_method.split(':').next().unwrap_or(mt_method);
     if let Some((cls, name)) = bare.split_once(';') {
         let name = name.trim_start_matches('.');
-        let java_cls = cls
-            .trim_start_matches('L')
-            .replace('/', ".");
+        let java_cls = cls.trim_start_matches('L').replace('/', ".");
         if !java_cls.is_empty() && !name.is_empty() {
             out.push(format!("{java_cls}.{name}"));
             if let Some(simple) = java_cls.rsplit('.').next() {
@@ -207,22 +208,27 @@ pub fn convert_rules_json(text: &str) -> Result<TaintConfig> {
 }
 
 /// Load models.json + rules.json (and optional field_models.json generations as sources) from a case dir.
-pub fn load_mt_case_config(models_path: &std::path::Path, rules_path: &std::path::Path) -> Result<TaintConfig> {
-    let mut cfg = convert_models_json(&std::fs::read_to_string(models_path).map_err(|e| {
-        DexDecompilerError::Decompilation(format!("read models: {e}"))
-    })?)?;
+pub fn load_mt_case_config(
+    models_path: &std::path::Path,
+    rules_path: &std::path::Path,
+) -> Result<TaintConfig> {
+    let mut cfg = convert_models_json(
+        &std::fs::read_to_string(models_path)
+            .map_err(|e| DexDecompilerError::Decompilation(format!("read models: {e}")))?,
+    )?;
     if rules_path.exists() {
-        cfg.merge(convert_rules_json(&std::fs::read_to_string(rules_path).map_err(|e| {
-            DexDecompilerError::Decompilation(format!("read rules: {e}"))
-        })?)?);
+        cfg.merge(convert_rules_json(
+            &std::fs::read_to_string(rules_path)
+                .map_err(|e| DexDecompilerError::Decompilation(format!("read rules: {e}")))?,
+        )?);
     }
-    let field_models = models_path
-        .parent()
-        .map(|p| p.join("field_models.json"));
+    let field_models = models_path.parent().map(|p| p.join("field_models.json"));
     if let Some(fp) = field_models {
         if fp.exists() {
             // Field models use a similar schema; attempt best-effort conversion.
-            if let Ok(extra) = convert_models_json(&std::fs::read_to_string(&fp).unwrap_or_default()) {
+            if let Ok(extra) =
+                convert_models_json(&std::fs::read_to_string(&fp).unwrap_or_default())
+            {
                 cfg.merge(extra);
             }
         }

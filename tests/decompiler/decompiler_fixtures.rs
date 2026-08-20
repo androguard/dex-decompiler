@@ -157,8 +157,7 @@ fn arrays_filled_new_and_element_init() {
     );
     let demo = method_region(&java, "demoArrays");
     assert!(
-        (demo.contains("copyOf") && demo.contains("a.length"))
-            || demo.contains("sum2d(m)"),
+        (demo.contains("copyOf") && demo.contains("a.length")) || demo.contains("sum2d(m)"),
         "demoArrays should inline length into copyOf or call sum2d; got:\n{demo}"
     );
     assert!(
@@ -389,10 +388,7 @@ fn algorithm_recursion_and_divide_conquer() {
         "fibonacciIterative should decompile to a counting for-loop; got:\n{fib}"
     );
     assert!(
-        !fib.contains("i0")
-            && !fib.contains("i3")
-            && !fib.contains("i4")
-            && !fib.contains("local"),
+        !fib.contains("i0") && !fib.contains("i3") && !fib.contains("i4") && !fib.contains("local"),
         "fibonacciIterative must not leak SSA temps; got:\n{fib}"
     );
     let demo = method_region(&java, "demoAlgorithms");
@@ -482,10 +478,12 @@ fn crypto_stream_xor_and_constant_time_compare() {
 #[test]
 fn apk_loads_via_load_dexes_from_path() {
     let path = super::try_catch_assertions::fixtures_apk_path();
-    let dexes = load_dexes_from_path(&path)
-        .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+    let dexes =
+        load_dexes_from_path(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
     assert!(!dexes.is_empty(), "APK produced no DEX files");
-    let java = Decompiler::new(&dexes[0]).decompile().expect("decompile apk dex");
+    let java = Decompiler::new(&dexes[0])
+        .decompile()
+        .expect("decompile apk dex");
     assert!(java.contains("ControlFlowFixtures"));
     assert!(java.contains("TryCatchFixtures"));
 }
@@ -541,7 +539,10 @@ fn merge_decompiles_with_array_alloc_and_loop_indices() {
 #[test]
 fn merge_decompiles_full_structure() {
     let body = method_region(&decompile_fixtures(), "merge");
-    assert!(body.contains("return out"), "merge must return out:\n{body}");
+    assert!(
+        body.contains("return out"),
+        "merge must return out:\n{body}"
+    );
     assert!(
         body.matches("while (").count() >= 3,
         "merge should have main + two tail while loops:\n{body}"

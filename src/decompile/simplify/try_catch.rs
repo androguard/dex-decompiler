@@ -492,10 +492,7 @@ pub(crate) fn restore_do_while_text_once(body: &str) -> String {
         {
             // `if (cond) { break; }` → while (!cond)
             invert_while_cond(&raw_cond)
-        } else if then_body.is_empty()
-            && else_body.len() == 1
-            && else_body[0].trim() == "break;"
-        {
+        } else if then_body.is_empty() && else_body.len() == 1 && else_body[0].trim() == "break;" {
             // `if (cond) { } else { break; }` → while (cond)
             raw_cond
         } else {
@@ -647,7 +644,8 @@ pub(crate) fn parse_switchmap_assignments(
 ) -> std::collections::HashMap<(String, i32), (String, String)> {
     let mut map = std::collections::HashMap::new();
     // Track local vars assigned from a SwitchMap field.
-    let mut local_to_key: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut local_to_key: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for line in body.lines() {
         let binding = strip_trailing_comment(line);
         let stmt = binding.trim();
@@ -770,7 +768,9 @@ pub(crate) fn restore_enum_switchmap_cases(body: &str) -> String {
                     if let Ok(n) = num_s.trim().parse::<i32>() {
                         if let Some((enum_ty, const_name)) = assignments.get(&(key.clone(), n)) {
                             let label = match &enum_simple {
-                                Some(s) if enum_ty == s || enum_ty.ends_with(&format!(".{}", s)) => {
+                                Some(s)
+                                    if enum_ty == s || enum_ty.ends_with(&format!(".{}", s)) =>
+                                {
                                     format!("{}.{}", s, const_name)
                                 }
                                 Some(s) if enum_ty.rsplit('.').next() == Some(s.as_str()) => {
@@ -1023,7 +1023,9 @@ pub(crate) fn is_twr_duplicate_body_try(try_body: &[&str]) -> bool {
         && (!joined.contains(".touch()") || joined.matches(".close()").count() >= 2)
 }
 
-pub(crate) fn collect_resource_decls_in_body(body_lines: &[&str]) -> (Vec<(String, String, String)>, usize) {
+pub(crate) fn collect_resource_decls_in_body(
+    body_lines: &[&str],
+) -> (Vec<(String, String, String)>, usize) {
     let mut decls = Vec::new();
     let mut i = 0usize;
     while i < body_lines.len() {
@@ -1041,7 +1043,10 @@ pub(crate) fn collect_resource_decls_in_body(body_lines: &[&str]) -> (Vec<(Strin
     (decls, i)
 }
 
-pub(crate) fn strip_resource_closes_from_body(body_lines: &[String], resources: &[&str]) -> Vec<String> {
+pub(crate) fn strip_resource_closes_from_body(
+    body_lines: &[String],
+    resources: &[&str],
+) -> Vec<String> {
     body_lines
         .iter()
         .filter(|l| {
@@ -1145,7 +1150,11 @@ pub(crate) fn is_twr_suppression_tail(lines: &[&str], open: usize) -> Option<usi
 
 /// Skip d8/javac TWR desugar tails: empty catch/finally, close-only tries, addSuppressed blocks.
 /// Skip d8/javac TWR desugar tails: empty catch/finally, close-only tries, addSuppressed blocks.
-pub(crate) fn skip_twr_boilerplate_after(lines: &[&str], mut i: usize, resources: &[&str]) -> usize {
+pub(crate) fn skip_twr_boilerplate_after(
+    lines: &[&str],
+    mut i: usize,
+    resources: &[&str],
+) -> usize {
     loop {
         while i < lines.len() && lines[i].trim().is_empty() {
             i += 1;
@@ -1287,10 +1296,8 @@ pub(crate) fn restore_d8_try_with_resources_once(body: &str) -> String {
             continue;
         }
 
-        let decl_idxs: std::collections::HashSet<usize> = decls_above
-            .iter()
-            .map(|(i, _, _, _)| *i)
-            .collect();
+        let decl_idxs: std::collections::HashSet<usize> =
+            decls_above.iter().map(|(i, _, _, _)| *i).collect();
         let indent = leading_indent(lines[try_i]);
         let resources_hdr: String = all_decls
             .iter()
@@ -1321,10 +1328,7 @@ pub(crate) fn restore_d8_try_with_resources_once(body: &str) -> String {
             if idx > try_i && idx <= boilerplate_end && line.trim().is_empty() {
                 continue;
             }
-            if idx > try_i
-                && line.trim() == "}"
-                && leading_indent(line).len() < indent.len()
-            {
+            if idx > try_i && line.trim() == "}" && leading_indent(line).len() < indent.len() {
                 continue;
             }
             out.push_str(line);
@@ -1427,7 +1431,10 @@ pub(crate) fn finally_body_only_closes_resources(
 /// Returns `(resource_name, lines_consumed)`.
 /// Consume one close-pattern unit for some resource in `remaining`.
 /// Returns `(resource_name, lines_consumed)`.
-pub(crate) fn take_one_resource_close_unit(slice: &[&str], remaining: &[String]) -> Option<(String, usize)> {
+pub(crate) fn take_one_resource_close_unit(
+    slice: &[&str],
+    remaining: &[String],
+) -> Option<(String, usize)> {
     if slice.is_empty() {
         return None;
     }
@@ -1703,4 +1710,3 @@ pub(crate) fn restore_try_with_resources_once(body: &str) -> String {
     }
     body.to_string()
 }
-

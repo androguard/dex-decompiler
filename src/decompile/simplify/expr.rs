@@ -190,7 +190,7 @@ pub(crate) fn strip_matching_decl_cast(decl_ty: &str, rhs: &str) -> String {
             // `Type x = (Type) new Type(...)` or `(Type) (Type) y` already partially stripped
             if inner.trim().starts_with("new ") || split_leading_cast(inner.trim()).is_none() {
                 // Prefer dropping when new Type or simple expr; keep one cast if inner still cast of different type
-                    if let Some((inner_ty, _)) = split_leading_cast(inner.trim()) {
+                if let Some((inner_ty, _)) = split_leading_cast(inner.trim()) {
                     if types_equal_for_cast(decl_ty, &inner_ty) {
                         return strip_redundant_casts_expr(&inner);
                     }
@@ -265,7 +265,11 @@ pub(crate) fn looks_like_type_name(ty: &str) -> bool {
         return false;
     }
     // Reject operators / keywords used as casts accidentally
-    if t.contains("==") || t.contains("&&") || t.contains("||") || t.contains('+') || t.contains(' ')
+    if t.contains("==")
+        || t.contains("&&")
+        || t.contains("||")
+        || t.contains('+')
+        || t.contains(' ')
     {
         // Allow generic `List<String>` and arrays `int[]`
         if !(t.contains('<') || t.contains('[') || t.contains('.')) {
@@ -396,13 +400,12 @@ pub(crate) fn rewrite_string_concat_indy_expr(expr: &str) -> Option<String> {
             let args = split_top_level_args(inner);
             if !args.is_empty() {
                 // makeConcatWithConstants often has recipe string first — drop string literal recipe if present
-                let parts: Vec<String> = if prefix.contains("WithConstants")
-                    && args[0].starts_with('"')
-                {
-                    args[1..].to_vec()
-                } else {
-                    args
-                };
+                let parts: Vec<String> =
+                    if prefix.contains("WithConstants") && args[0].starts_with('"') {
+                        args[1..].to_vec()
+                    } else {
+                        args
+                    };
                 if !parts.is_empty() {
                     return Some(parts.join(" + "));
                 }
@@ -536,10 +539,7 @@ pub(crate) fn parse_2d_array_row_refs_init(line: &str) -> Option<(String, String
     if inner.is_empty() {
         return None;
     }
-    let refs: Vec<String> = inner
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
+    let refs: Vec<String> = inner.split(',').map(|s| s.trim().to_string()).collect();
     if !refs.iter().all(|r| is_java_ident(r)) {
         return None;
     }
@@ -600,7 +600,11 @@ pub(crate) fn fold_2d_array_row_literals_once(body: &str) -> String {
         let remove: HashSet<usize> = row_lits.iter().map(|(j, _)| *j).collect();
         let new_line = format!(
             "{}{}[][] {} = new {}[][]{{ {} }};",
-            indent, elem_ty, dest_var, elem_ty, rows.join(", ")
+            indent,
+            elem_ty,
+            dest_var,
+            elem_ty,
+            rows.join(", ")
         );
         let mut out = String::new();
         for (i, line) in lines.iter().enumerate() {
@@ -707,7 +711,9 @@ fn fold_arrays_as_list_filled_array_once(body: &str) -> String {
         }
         let args: Vec<String> = elems.into_iter().map(|e| e.unwrap()).collect();
         let as_list = format!("Arrays.asList({})", args.join(", "));
-        let skip: HashSet<usize> = std::iter::once(i).chain(store_idxs.iter().copied()).collect();
+        let skip: HashSet<usize> = std::iter::once(i)
+            .chain(store_idxs.iter().copied())
+            .collect();
         let mut out = String::new();
         for (idx, line) in lines.iter().enumerate() {
             if skip.contains(&idx) {
@@ -890,4 +896,3 @@ fn inline_filled_array_into_calls_once(body: &str) -> String {
     }
     body.to_string()
 }
-

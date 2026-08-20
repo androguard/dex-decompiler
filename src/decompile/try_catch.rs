@@ -160,19 +160,13 @@ pub fn try_and_handler_byte_ranges_with_end(
     let try_start_byte = try_item.start_addr * 2;
     let try_end_byte = (try_item.start_addr + try_item.insn_count as u32) * 2;
     let code_end_byte = insns_size_16bit * 2;
-    let mut boundaries: Vec<u32> = handler
-        .handlers
-        .iter()
-        .map(|h| h.addr * 2)
-        .collect();
+    let mut boundaries: Vec<u32> = handler.handlers.iter().map(|h| h.addr * 2).collect();
     if let Some(a) = handler.catch_all_addr {
         boundaries.push(a * 2);
     }
     boundaries.sort_unstable();
     boundaries.dedup();
-    let last_cap = post_handler_end
-        .unwrap_or(code_end_byte)
-        .min(code_end_byte);
+    let last_cap = post_handler_end.unwrap_or(code_end_byte).min(code_end_byte);
     // Prefer ending last handler before continuation: if handlers sit after the try,
     // use max(try_end, last handler start) stretch only to last_cap.
     boundaries.push(last_cap);
@@ -356,10 +350,7 @@ pub fn split_pre_try_for_finally(pre_try: &str) -> (String, String) {
             inside.push(line);
         }
     }
-    (
-        join_nonempty_lines(&outside),
-        join_nonempty_lines(&inside),
-    )
+    (join_nonempty_lines(&outside), join_nonempty_lines(&inside))
 }
 
 /// Pure literal / alloc inits may stay before `try`; compound inits belong inside.
@@ -411,7 +402,8 @@ fn join_nonempty_lines(lines: &[&str]) -> String {
             out.push('\n');
         }
     }
-    if !lines.is_empty() && lines.last().is_some_and(|l| l.ends_with('\n')) && !out.ends_with('\n') {
+    if !lines.is_empty() && lines.last().is_some_and(|l| l.ends_with('\n')) && !out.ends_with('\n')
+    {
         out.push('\n');
     }
     out
@@ -464,8 +456,8 @@ pub fn try_handler_pairs(
 #[cfg(test)]
 mod tests {
     use super::{
-        EncodedCatchHandler, EncodedTypeAddr, TryItem, looks_like_finally,
-        try_and_handler_byte_ranges,
+        looks_like_finally, try_and_handler_byte_ranges, EncodedCatchHandler, EncodedTypeAddr,
+        TryItem,
     };
 
     #[test]
@@ -567,7 +559,10 @@ mod tests {
                     }
                 }
                 let all = types.join(",");
-                assert!(all.contains("RuntimeException") && all.contains("Exception"), "{all}");
+                assert!(
+                    all.contains("RuntimeException") && all.contains("Exception"),
+                    "{all}"
+                );
             }
         }
         assert!(found, "nestedTry missing from fixtures dex");
@@ -595,10 +590,16 @@ mod tests {
                     continue;
                 }
                 let code = dex.get_code_item(enc.code_off).unwrap();
-                assert!(code.tries_size > 0, "tryFinally needs try metadata in fixture dex");
+                assert!(
+                    code.tries_size > 0,
+                    "tryFinally needs try metadata in fixture dex"
+                );
                 let pairs = super::try_handler_pairs(data, enc.code_off, &code).unwrap();
                 let has_catch_all = pairs.iter().any(|(_, h)| h.catch_all_addr.is_some());
-                assert!(has_catch_all, "tryFinally fixture should use catch-all finally handler");
+                assert!(
+                    has_catch_all,
+                    "tryFinally fixture should use catch-all finally handler"
+                );
             }
         }
     }
@@ -660,7 +661,15 @@ mod tests {
         assert_eq!(try_start, 0);
         assert_eq!(try_end, 20);
         assert_eq!(handler_ranges.len(), 2);
-        assert_eq!(handler_ranges[0], (1, 40, 50), "first handler 20..25 in bytes");
-        assert_eq!(handler_ranges[1], (2, 50, 60), "second handler 25..30 in bytes");
+        assert_eq!(
+            handler_ranges[0],
+            (1, 40, 50),
+            "first handler 20..25 in bytes"
+        );
+        assert_eq!(
+            handler_ranges[1],
+            (2, 50, 60),
+            "second handler 25..30 in bytes"
+        );
     }
 }

@@ -166,13 +166,18 @@ pub(crate) fn fold_array_alloc_length_sum(body: &str) -> String {
         let stmt = binding.trim();
         let Some(eq) = stmt.find(" = ") else { continue };
         let lhs = stmt[..eq].trim();
-        let Some(arr_var) = lhs.strip_prefix("int[] ") else { continue };
+        let Some(arr_var) = lhs.strip_prefix("int[] ") else {
+            continue;
+        };
         let arr_var = arr_var.trim();
         if !is_java_ident(arr_var) {
             continue;
         }
         let rhs = stmt[eq + 3..].trim_end_matches(';').trim();
-        let Some(size_var) = rhs.strip_prefix("new int[").and_then(|s| s.strip_suffix(']')) else {
+        let Some(size_var) = rhs
+            .strip_prefix("new int[")
+            .and_then(|s| s.strip_suffix(']'))
+        else {
             continue;
         };
         let size_var = size_var.trim();
@@ -182,7 +187,11 @@ pub(crate) fn fold_array_alloc_length_sum(body: &str) -> String {
         let Some(sum_idx) = (0..alloc_idx).rev().find(|&i| {
             parse_simple_assign_line(lines[i]).is_some_and(|(v, r)| {
                 v == size_var
-                    && r.split('+').map(str::trim).filter(|p| !p.is_empty()).count() == 2
+                    && r.split('+')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .count()
+                        == 2
                     && r.contains(size_var)
             })
         }) else {
@@ -202,18 +211,18 @@ pub(crate) fn fold_array_alloc_length_sum(body: &str) -> String {
         } else {
             continue;
         };
-        let Some(base_idx) = (0..sum_idx).rev().find(|&i| {
-            parse_simple_assign_line(lines[i]).is_some_and(|(v, _)| v == size_var)
-        }) else {
+        let Some(base_idx) = (0..sum_idx)
+            .rev()
+            .find(|&i| parse_simple_assign_line(lines[i]).is_some_and(|(v, _)| v == size_var))
+        else {
             continue;
         };
         let Some((_, base_rhs)) = parse_simple_assign_line(lines[base_idx]) else {
             continue;
         };
         let reset_ok = lines.get(alloc_idx + 1).is_some_and(|l| {
-            parse_simple_assign_line(l).is_some_and(|(v, r)| {
-                v == size_var && matches!(r.trim(), "0" | "0L")
-            })
+            parse_simple_assign_line(l)
+                .is_some_and(|(v, r)| v == size_var && matches!(r.trim(), "0" | "0L"))
         });
         if !reset_ok {
             continue;
@@ -221,7 +230,10 @@ pub(crate) fn fold_array_alloc_length_sum(body: &str) -> String {
         let indent = leading_indent(line);
         replacements.insert(
             alloc_idx,
-            format!("{}int[] {} = new int[{} + {}];", indent, arr_var, addend, base_rhs),
+            format!(
+                "{}int[] {} = new int[{} + {}];",
+                indent, arr_var, addend, base_rhs
+            ),
         );
         remove.insert(base_idx);
         remove.insert(sum_idx);
@@ -273,9 +285,9 @@ pub(crate) fn fold_array_length_assigns(body: &str) -> String {
         if length_init_count.get(&var).copied().unwrap_or(0) != 1 {
             continue;
         }
-        let init_idx = lines.iter().position(|line| {
-            parse_array_length_assign(line).is_some_and(|(v, _)| v == var)
-        });
+        let init_idx = lines
+            .iter()
+            .position(|line| parse_array_length_assign(line).is_some_and(|(v, _)| v == var));
         let Some(init_idx) = init_idx else {
             continue;
         };
@@ -428,11 +440,7 @@ pub(crate) fn fold_length_sum_return(body: &str) -> String {
 
     let mut sum = terms.join(" + ");
     if let Some(tail) = tail {
-        sum = format!(
-            "{} + {}",
-            sum,
-            format_int_add_tail(&lines, &tail)
-        );
+        sum = format!("{} + {}", sum, format_int_add_tail(&lines, &tail));
     }
 
     let indent = leading_indent(lines[ret_idx]);
@@ -497,7 +505,11 @@ pub(crate) fn parse_index_lt_bound(cond: &str) -> Option<(String, String)> {
     Some((idx.to_string(), bound.to_string()))
 }
 
-pub(crate) fn resolve_length_bound(lines: &[&str], before: usize, bound: &str) -> Option<(String, String)> {
+pub(crate) fn resolve_length_bound(
+    lines: &[&str],
+    before: usize,
+    bound: &str,
+) -> Option<(String, String)> {
     if bound.ends_with(".length") {
         let arr = bound.strip_suffix(".length")?.trim();
         return Some((bound.to_string(), arr.to_string()));
@@ -515,7 +527,11 @@ pub(crate) fn resolve_length_bound(lines: &[&str], before: usize, bound: &str) -
     None
 }
 
-pub(crate) fn length_var_for_array_before(lines: &[&str], before: usize, arr: &str) -> Option<String> {
+pub(crate) fn length_var_for_array_before(
+    lines: &[&str],
+    before: usize,
+    arr: &str,
+) -> Option<String> {
     for line in lines[..before].iter().rev() {
         if line.trim().starts_with("while (") {
             break;
@@ -661,7 +677,11 @@ pub(crate) fn parse_int_literal_init(line: &str) -> Option<(String, String)> {
     }
 }
 
-pub(crate) fn find_int_init_before(lines: &[&str], while_idx: usize, idx_var: &str) -> Option<(usize, String)> {
+pub(crate) fn find_int_init_before(
+    lines: &[&str],
+    while_idx: usize,
+    idx_var: &str,
+) -> Option<(usize, String)> {
     for i in (0..while_idx).rev() {
         let line = lines[i].trim();
         if line.is_empty() || line == "}" || line == "} else {" {
@@ -852,11 +872,17 @@ pub(crate) fn parse_int_assign_rhs_line(line: &str) -> Option<(String, String)> 
 pub(crate) fn parse_zero_assign_to(line: &str, var: &str) -> bool {
     let binding = strip_trailing_comment(line);
     let t = binding.trim();
-        t == format!("{var} = 0;") || t == format!("int {var} = 0;")
-            || t == format!("{var} = 0") || t == format!("int {var} = 0")
+    t == format!("{var} = 0;")
+        || t == format!("int {var} = 0;")
+        || t == format!("{var} = 0")
+        || t == format!("int {var} = 0")
 }
 
-pub(crate) fn is_bound_computation_do_while(lines: &[&str], do_open: usize, do_close: usize) -> bool {
+pub(crate) fn is_bound_computation_do_while(
+    lines: &[&str],
+    do_open: usize,
+    do_close: usize,
+) -> bool {
     if lines.get(do_open).is_none_or(|l| l.trim() != "do {") {
         return false;
     }
@@ -877,7 +903,11 @@ pub(crate) fn is_bound_computation_do_while(lines: &[&str], do_open: usize, do_c
     })
 }
 
-pub(crate) fn polish_adjacent_array_swap_block(lines: &[&str], idx_var: &str, arr: &str) -> Option<String> {
+pub(crate) fn polish_adjacent_array_swap_block(
+    lines: &[&str],
+    idx_var: &str,
+    arr: &str,
+) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
@@ -994,13 +1024,15 @@ pub(crate) fn restore_while_true_nested_for_once(body: &str) -> String {
         while k < else_close && lines[k].trim().is_empty() {
             k += 1;
         }
-        if !parse_zero_assign_to(lines[k], inner_idx) && !parse_zero_assign_to(lines[k], &outer_tmp) {
+        if !parse_zero_assign_to(lines[k], inner_idx) && !parse_zero_assign_to(lines[k], &outer_tmp)
+        {
             continue;
         }
         k += 1;
         if k < else_close && lines[k].trim() == "do {" {
             if let Some(do_close) = find_closing_brace_line(&lines, k) {
-                if do_close + 1 < else_close && lines[do_close + 1].trim().starts_with("} while (") {
+                if do_close + 1 < else_close && lines[do_close + 1].trim().starts_with("} while (")
+                {
                     if is_bound_computation_do_while(&lines, k, do_close) {
                         k = do_close + 2;
                     }
@@ -1117,9 +1149,8 @@ pub(crate) fn restore_foreach_array_once(body: &str) -> String {
         if idx2 != idx_var {
             continue;
         }
-        let bound_resolved = resolve_length_bound(&lines, w, &bound).or_else(|| {
-            length_var_for_array_before(&lines, w, &arr2).map(|lv| (lv, arr2.clone()))
-        });
+        let bound_resolved = resolve_length_bound(&lines, w, &bound)
+            .or_else(|| length_var_for_array_before(&lines, w, &arr2).map(|lv| (lv, arr2.clone())));
         let Some((_len_var, arr)) = bound_resolved else {
             continue;
         };
@@ -1147,9 +1178,9 @@ pub(crate) fn restore_foreach_array_once(body: &str) -> String {
             continue;
         }
         let body_end = if has_inc { update_idx } else { update_idx + 1 };
-        let other_use = lines[k + 1..update_idx].iter().any(|l| {
-            line_uses_ident_as_var(l, &idx_var) || line_uses_ident_as_var(l, &bound)
-        });
+        let other_use = lines[k + 1..update_idx]
+            .iter()
+            .any(|l| line_uses_ident_as_var(l, &idx_var) || line_uses_ident_as_var(l, &bound));
         if other_use {
             continue;
         }
@@ -1312,7 +1343,8 @@ fn restore_d8_merge_loop_once(body: &str) -> String {
         let Some(cond) = parse_if_condition(lines[i]) else {
             continue;
         };
-        let Some((idx_i, bound)) = cond.split_once(" >= ").map(|(a, b)| (a.trim(), b.trim())) else {
+        let Some((idx_i, bound)) = cond.split_once(" >= ").map(|(a, b)| (a.trim(), b.trim()))
+        else {
             continue;
         };
         if let Some(arr) = bound.strip_suffix(".length") {
@@ -1327,56 +1359,61 @@ fn restore_d8_merge_loop_once(body: &str) -> String {
             continue;
         };
         let else_line = lines.get(bodies.then_hi).copied().unwrap_or("");
-        let (idx_j, right_arr, merge_lo, merge_hi) = if let Some(cond_j) = parse_else_if_condition(else_line) {
-            let Some((idx_j, bound_j)) = cond_j.split_once(" < ").map(|(a, b)| (a.trim(), b.trim())) else {
-                continue;
-            };
-            let right_arr = bound_j
-                .strip_suffix(".length")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "right".to_string());
-            (idx_j.to_string(), right_arr, bodies.else_lo, bodies.else_hi)
-        } else {
-            let else_start = skip_blank(&lines, bodies.else_lo, bodies.else_hi);
-            if else_start >= bodies.else_hi {
-                continue;
-            }
-            let mut right_arr = "right".to_string();
-            let mut j_if = else_start;
-            if let Some((lv2, arr)) = parse_array_length_assign(lines[else_start]) {
-                if len_var.as_deref().is_some_and(|v| v != lv2) && len_var.is_some() {
-                    // still ok — D8 reuses the same temp
+        let (idx_j, right_arr, merge_lo, merge_hi) =
+            if let Some(cond_j) = parse_else_if_condition(else_line) {
+                let Some((idx_j, bound_j)) =
+                    cond_j.split_once(" < ").map(|(a, b)| (a.trim(), b.trim()))
+                else {
+                    continue;
+                };
+                let right_arr = bound_j
+                    .strip_suffix(".length")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| "right".to_string());
+                (idx_j.to_string(), right_arr, bodies.else_lo, bodies.else_hi)
+            } else {
+                let else_start = skip_blank(&lines, bodies.else_lo, bodies.else_hi);
+                if else_start >= bodies.else_hi {
+                    continue;
                 }
-                right_arr = arr;
-                j_if = skip_blank(&lines, else_start + 1, bodies.else_hi);
-            }
-            if j_if >= bodies.else_hi {
-                continue;
-            }
-            let Some(cond_j) = parse_if_condition(lines[j_if]) else {
-                continue;
+                let mut right_arr = "right".to_string();
+                let mut j_if = else_start;
+                if let Some((lv2, arr)) = parse_array_length_assign(lines[else_start]) {
+                    if len_var.as_deref().is_some_and(|v| v != lv2) && len_var.is_some() {
+                        // still ok — D8 reuses the same temp
+                    }
+                    right_arr = arr;
+                    j_if = skip_blank(&lines, else_start + 1, bodies.else_hi);
+                }
+                if j_if >= bodies.else_hi {
+                    continue;
+                }
+                let Some(cond_j) = parse_if_condition(lines[j_if]) else {
+                    continue;
+                };
+                let Some((idx_j, bound_j)) =
+                    cond_j.split_once(" < ").map(|(a, b)| (a.trim(), b.trim()))
+                else {
+                    continue;
+                };
+                if let Some(arr) = bound_j.strip_suffix(".length") {
+                    right_arr = arr.trim().to_string();
+                }
+                let inner = find_if_else_bodies(&lines, j_if).or_else(|| {
+                    let close = find_closing_brace_line(&lines, j_if)?;
+                    Some(IfElseBodies {
+                        then_lo: j_if + 1,
+                        then_hi: close,
+                        else_lo: close,
+                        else_hi: close,
+                        _close: close,
+                    })
+                });
+                let Some(inner) = inner else {
+                    continue;
+                };
+                (idx_j.to_string(), right_arr, inner.then_lo, inner.then_hi)
             };
-            let Some((idx_j, bound_j)) = cond_j.split_once(" < ").map(|(a, b)| (a.trim(), b.trim())) else {
-                continue;
-            };
-            if let Some(arr) = bound_j.strip_suffix(".length") {
-                right_arr = arr.trim().to_string();
-            }
-            let inner = find_if_else_bodies(&lines, j_if).or_else(|| {
-                let close = find_closing_brace_line(&lines, j_if)?;
-                Some(IfElseBodies {
-                    then_lo: j_if + 1,
-                    then_hi: close,
-                    else_lo: close,
-                    else_hi: close,
-                    _close: close,
-                })
-            });
-            let Some(inner) = inner else {
-                continue;
-            };
-            (idx_j.to_string(), right_arr, inner.then_lo, inner.then_hi)
-        };
         let merge_body = strip_trailing_continues_in_range(&lines, merge_lo, merge_hi);
         if merge_body.trim().is_empty() {
             continue;
@@ -1441,7 +1478,8 @@ fn restore_d8_merge_drain_once(body: &str) -> String {
         let Some(cond) = parse_if_condition(lines[i]) else {
             continue;
         };
-        let Some((idx_i, bound)) = cond.split_once(" >= ").map(|(a, b)| (a.trim(), b.trim())) else {
+        let Some((idx_i, bound)) = cond.split_once(" >= ").map(|(a, b)| (a.trim(), b.trim()))
+        else {
             continue;
         };
         if let Some(arr) = bound.strip_suffix(".length") {
@@ -1483,9 +1521,7 @@ fn restore_d8_merge_drain_once(body: &str) -> String {
         let mut rebuilt = String::new();
         for (idx, line) in lines.iter().enumerate() {
             if idx == w {
-                rebuilt.push_str(&format!(
-                    "{indent}while ({idx_i} < {left_arr}.length) {{\n"
-                ));
+                rebuilt.push_str(&format!("{indent}while ({idx_i} < {left_arr}.length) {{\n"));
                 for bl in left_store.lines() {
                     rebuilt.push_str(bl);
                     rebuilt.push('\n');

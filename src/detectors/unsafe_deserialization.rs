@@ -47,7 +47,12 @@ pub fn scan_unsafe_deserialization(
             class_name,
             method_name,
             "unsafe_deserialization",
-            &["writeToParcel", "createFromParcel", "readObject", "writeObject"],
+            &[
+                "writeToParcel",
+                "createFromParcel",
+                "readObject",
+                "writeObject",
+            ],
         ));
     }
     out.extend(invoke_scan(

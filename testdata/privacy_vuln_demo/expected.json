@@ -148,7 +148,7 @@
       "method": "leakPhoneToNetwork",
       "source_kind": "PhoneNumber",
       "sink_kind": "Network",
-      "rule_code": 19,
+      "rule_code": 91001,
       "needs_cipher_tito": false,
       "needs_extra_pii": true,
       "dest": "https://api.demohunt.androguard.com/v1/phone"
@@ -157,7 +157,7 @@
       "method": "leakContactsToNetwork",
       "source_kind": "Contacts",
       "sink_kind": "Network",
-      "rule_code": 19,
+      "rule_code": 91001,
       "needs_cipher_tito": false,
       "needs_extra_pii": true,
       "dest": "https://api.demohunt.androguard.com/v1/contacts"
@@ -166,7 +166,7 @@
       "method": "leakSmsToLog",
       "source_kind": "Sms",
       "sink_kind": "Logging",
-      "rule_code": 20,
+      "rule_code": 91002,
       "needs_cipher_tito": false,
       "needs_extra_pii": true
     },
@@ -174,7 +174,7 @@
       "method": "leakAccountsToNetwork",
       "source_kind": "Account",
       "sink_kind": "Network",
-      "rule_code": 19,
+      "rule_code": 91001,
       "needs_cipher_tito": false,
       "needs_extra_pii": true,
       "dest": "https://api.demohunt.androguard.com/v1/accounts"
@@ -183,7 +183,7 @@
       "method": "leakAdvertisingIdToFirebase",
       "source_kind": "AdvertisingId",
       "sink_kind": "Network",
-      "rule_code": 19,
+      "rule_code": 91001,
       "needs_cipher_tito": false,
       "needs_extra_pii": true,
       "dest": "https://app-analytics.firebase.google.com/log"
@@ -192,7 +192,7 @@
       "method": "leakMediaToNetwork",
       "source_kind": "Media",
       "sink_kind": "Network",
-      "rule_code": 19,
+      "rule_code": 91001,
       "needs_cipher_tito": false,
       "needs_extra_pii": true,
       "dest": "https://api.demohunt.androguard.com/v1/media"
@@ -201,7 +201,7 @@
       "method": "leakCalendarToLog",
       "source_kind": "Calendar",
       "sink_kind": "Logging",
-      "rule_code": 20,
+      "rule_code": 91002,
       "needs_cipher_tito": false,
       "needs_extra_pii": true
     },
@@ -209,7 +209,7 @@
       "method": "leakEmailToNetwork",
       "source_kind": "Email",
       "sink_kind": "Network",
-      "rule_code": 19,
+      "rule_code": 91001,
       "needs_cipher_tito": false,
       "needs_extra_pii": true,
       "dest": "https://api.demohunt.androguard.com/v1/email"
@@ -218,7 +218,7 @@
       "method": "leakDeviceIdToClipboard",
       "source_kind": "DeviceId",
       "sink_kind": "ClipboardWrite",
-      "rule_code": 21,
+      "rule_code": 91003,
       "needs_cipher_tito": false,
       "needs_extra_pii": true
     },
@@ -226,7 +226,7 @@
       "method": "leakDeviceIdToSharedPrefs",
       "source_kind": "DeviceId",
       "sink_kind": "SharedPrefsWrite",
-      "rule_code": 21,
+      "rule_code": 91003,
       "needs_cipher_tito": false,
       "needs_extra_pii": true
     },
@@ -234,7 +234,7 @@
       "method": "leakDeviceIdToCookie",
       "source_kind": "DeviceId",
       "sink_kind": "CookieWrite",
-      "rule_code": 21,
+      "rule_code": 91003,
       "needs_cipher_tito": false,
       "needs_extra_pii": true
     },
@@ -242,7 +242,7 @@
       "method": "leakDeviceIdViaIntent",
       "source_kind": "DeviceId",
       "sink_kind": "LaunchingComponent",
-      "rule_code": 21,
+      "rule_code": 91003,
       "needs_cipher_tito": false,
       "needs_extra_pii": true
     },
@@ -250,7 +250,7 @@
       "method": "leakLocationViaBroadcast",
       "source_kind": "Location",
       "sink_kind": "LaunchingComponent",
-      "rule_code": 21,
+      "rule_code": 91003,
       "needs_cipher_tito": false,
       "needs_extra_pii": true
     },

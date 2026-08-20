@@ -5,7 +5,9 @@
 
 use dex_decompiler::{parse_dex, scan_pending_intents, Decompiler, ValueFlowAnalysisOwned};
 
-fn get_first_encoded_method(dex_bytes: &[u8]) -> Option<(dex_parser::EncodedMethod, String, String)> {
+fn get_first_encoded_method(
+    dex_bytes: &[u8],
+) -> Option<(dex_parser::EncodedMethod, String, String)> {
     let dex = parse_dex(dex_bytes).ok()?;
     let class_def = dex.class_defs().next()?.ok()?;
     let class_type = dex.get_type(class_def.class_idx).ok()?;

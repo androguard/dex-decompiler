@@ -9,8 +9,8 @@ use super::try_catch_assertions::{
 
 fn decompile_apk_fixtures() -> String {
     let path = fixtures_apk_path();
-    let dexes = load_dexes_from_path(&path)
-        .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+    let dexes =
+        load_dexes_from_path(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
     assert!(!dexes.is_empty(), "APK produced no DEX");
     let options = DecompilerOptions {
         only_package: Some("com.androguard.decompilefixtures".to_string()),
@@ -44,7 +44,10 @@ fn try_catch_fixture_code_from_dex(name: &str) -> CodeItem {
 #[test]
 fn apk_load_decompiles_try_catch_fixtures() {
     let java = decompile_apk_fixtures();
-    assert!(java.contains("class TryCatchFixtures"), "missing TryCatchFixtures class");
+    assert!(
+        java.contains("class TryCatchFixtures"),
+        "missing TryCatchFixtures class"
+    );
     assert_all_try_catch_fixtures(&java);
 }
 

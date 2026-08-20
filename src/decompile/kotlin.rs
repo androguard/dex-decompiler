@@ -81,7 +81,9 @@ impl KotlinClassInfo {
                 parts.push(format!("Kotlin {}", k.label()));
             } else if matches!(
                 k,
-                KotlinKind::File | KotlinKind::MultiFileClassFacade | KotlinKind::MultiFileClassPart
+                KotlinKind::File
+                    | KotlinKind::MultiFileClassFacade
+                    | KotlinKind::MultiFileClassPart
             ) {
                 parts.push(format!("Kotlin {}", k.label()));
             }
@@ -90,7 +92,12 @@ impl KotlinClassInfo {
             parts.push(format!("fq={fq}"));
         }
         if let Some(ref pn) = self.package_name {
-            if self.fq_name.as_ref().map(|f| !f.starts_with(pn.as_str())).unwrap_or(true) {
+            if self
+                .fq_name
+                .as_ref()
+                .map(|f| !f.starts_with(pn.as_str()))
+                .unwrap_or(true)
+            {
                 parts.push(format!("pn={pn}"));
             }
         }
@@ -100,7 +107,10 @@ impl KotlinClassInfo {
         }
         if !self.local_class_names.is_empty() {
             let n = self.local_class_names.len().min(4);
-            parts.push(format!("local=[{}]", self.local_class_names[..n].join(", ")));
+            parts.push(format!(
+                "local=[{}]",
+                self.local_class_names[..n].join(", ")
+            ));
         }
         if parts.is_empty() {
             None
@@ -260,10 +270,7 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    let cleaned: Vec<u8> = input
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let cleaned: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if cleaned.is_empty() {
         return Some(Vec::new());
     }
@@ -302,8 +309,9 @@ fn d1_looks_like_base64(d1: &[String]) -> bool {
     }
     // Real BitEncoding payloads use code units 0..=0x7f after packing and often include
     // non-base64 chars; synthetic tests use standard base64.
-    s.chars()
-        .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '/' | '=' | '\n' | '\r' | ' '))
+    s.chars().all(
+        |c| matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '/' | '=' | '\n' | '\r' | ' '),
+    )
 }
 
 /// Kotlin `BitEncoding.decodeBytes` — 8↔7 bit packing used by `@Metadata(d1=…)`.
@@ -895,14 +903,13 @@ fn apply_metadata_decode(info: &mut KotlinClassInfo, elems: &MetadataElements) {
     };
     // Real JVM metadata: length-delimited StringTableTypes then Class protobuf
     // (see JvmProtoBufUtil.readDataFrom / parseDelimitedFrom).
-    let (resolver, class_bytes) = if let Some((types_payload, class_rest)) =
-        take_length_delimited(&bytes)
-    {
-        let resolver = parse_string_table_types(types_payload, &elems.d2);
-        (resolver, class_rest.to_vec())
-    } else {
-        (JvmNameResolver::from_d2(&elems.d2), bytes.clone())
-    };
+    let (resolver, class_bytes) =
+        if let Some((types_payload, class_rest)) = take_length_delimited(&bytes) {
+            let resolver = parse_string_table_types(types_payload, &elems.d2);
+            (resolver, class_rest.to_vec())
+        } else {
+            (JvmNameResolver::from_d2(&elems.d2), bytes.clone())
+        };
 
     let mut best = decode_class_protobuf(&class_bytes, &resolver);
     if !best.decoded || (best.fq_name.is_none() && best.property_names.is_empty()) {
@@ -963,9 +970,9 @@ fn take_length_delimited(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     }
     let payload = &bytes[i..end];
     let fields = read_protobuf_fields(payload);
-    let looks_like_types = fields.iter().any(|(n, v)| {
-        (*n == 1 && matches!(v, ProtoVal::Len(_))) || *n == 5
-    });
+    let looks_like_types = fields
+        .iter()
+        .any(|(n, v)| (*n == 1 && matches!(v, ProtoVal::Len(_))) || *n == 5);
     if !looks_like_types {
         return None;
     }
@@ -1011,8 +1018,8 @@ pub fn analyze_kotlin_class(
     let has_invoke_suspend = method_names.iter().any(|n| n == "invokeSuspend");
     let looks_continuation = class_name.contains("Continuation")
         || method_names.iter().any(|n| n == "create" || n == "invoke");
-    info.is_coroutine = has_invoke_suspend
-        || (info.kind == Some(KotlinKind::SyntheticClass) && looks_continuation);
+    info.is_coroutine =
+        has_invoke_suspend || (info.kind == Some(KotlinKind::SyntheticClass) && looks_continuation);
 
     // Data class: prefer protobuf flag; else component1 + copy heuristic.
     if !info.is_data {
@@ -1423,7 +1430,10 @@ mod tests {
         apply_metadata_decode(&mut info, &elems);
         assert!(info.protobuf_decoded);
         assert_eq!(info.fq_name.as_deref(), Some("pkg.Outer.Inner"));
-        assert!(info.local_class_names.iter().any(|s| s.contains("Outer.Inner")));
+        assert!(info
+            .local_class_names
+            .iter()
+            .any(|s| s.contains("Outer.Inner")));
     }
 
     #[test]

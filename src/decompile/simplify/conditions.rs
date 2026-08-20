@@ -67,7 +67,10 @@ pub(crate) fn fold_equals_into_conditions_once(body: &str) -> String {
         if let Some(li) = lit_idx {
             // Only skip lit if unused elsewhere before if.
             let used_elsewhere = lines.iter().enumerate().any(|(k, l)| {
-                k != i && k != li && k < if_i && ident_occurs(l, parse_simple_assign_line(lines[li]).unwrap().0.as_str())
+                k != i
+                    && k != li
+                    && k < if_i
+                    && ident_occurs(l, parse_simple_assign_line(lines[li]).unwrap().0.as_str())
             });
             if !used_elsewhere {
                 skip.insert(li);
@@ -154,9 +157,10 @@ pub(crate) fn fold_instanceof_into_conditions_once(body: &str) -> String {
             rewrite_condition_with_equals(&cond, &zvar, &instanceof_expr)
         } else if !ident_occurs(&cond, &zvar)
             && dangling_false_instanceof_cond(&cond)
-            && !lines.iter().enumerate().any(|(k, l)| {
-                k != i && k != if_i && ident_used_as_rvalue(l, &zvar)
-            })
+            && !lines
+                .iter()
+                .enumerate()
+                .any(|(k, l)| k != i && k != if_i && ident_used_as_rvalue(l, &zvar))
         {
             format!("!({instanceof_expr})")
         } else {
@@ -239,7 +243,11 @@ pub(crate) fn collapse_double_not(cond: &str) -> String {
         if let Some(inner) = c.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
             let inner = inner.trim();
             if let Some(inner2) = inner.strip_prefix('!') {
-                let inner2 = inner2.trim().trim_start_matches('(').trim_end_matches(')').trim();
+                let inner2 = inner2
+                    .trim()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .trim();
                 c = inner2.to_string();
                 continue;
             }
@@ -287,7 +295,10 @@ pub(crate) fn drop_string_lits_folded_into_if(body: &str) -> String {
             continue;
         }
         let used_later = lines.iter().enumerate().any(|(k, l)| {
-            k > i && k != j && ident_occurs(l, &var) && assign_lhs_var(l).as_deref() != Some(var.as_str())
+            k > i
+                && k != j
+                && ident_occurs(l, &var)
+                && assign_lhs_var(l).as_deref() != Some(var.as_str())
         });
         // If used later as a different value, still safe to drop THIS assign only when
         // the next if already has the literal inlined.
@@ -764,7 +775,10 @@ pub(crate) fn polish_booleanish_int_args(body: &str) -> String {
                         while b < bytes.len() && bytes[b].is_ascii_whitespace() {
                             b += 1;
                         }
-                        if b < bytes.len() && bytes[b] == b')' && looks_like_boolean_api_method(name) {
+                        if b < bytes.len()
+                            && bytes[b] == b')'
+                            && looks_like_boolean_api_method(name)
+                        {
                             out.push('.');
                             out.push_str(name);
                             out.push('(');
@@ -812,7 +826,9 @@ pub(crate) fn polish_null_in_condition(cond: &str) -> String {
     for (suf, null_suf) in [(" == 0", " == null"), (" != 0", " != null")] {
         if let Some(name) = c.strip_suffix(suf) {
             let name = name.trim();
-            if is_java_ident(name) && !looks_like_primitive_local(name) && !looks_like_boolean_local(name)
+            if is_java_ident(name)
+                && !looks_like_primitive_local(name)
+                && !looks_like_boolean_local(name)
             {
                 return format!("{}{}", name, null_suf);
             }
@@ -1014,7 +1030,10 @@ fn flatten_returning_if_else_once(body: &str) -> String {
             continue;
         };
         let else_body = &lines[then_close + 1..else_close];
-        let else_first = else_body.iter().find(|l| !l.trim().is_empty()).map(|l| l.trim());
+        let else_first = else_body
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim());
         // Keep `if { return } else { return }` as if/else. Only lift an else that
         // is itself an `if` (sequential instanceof-style tests).
         if else_first.is_none_or(|t| !t.starts_with("if (")) {
@@ -1030,7 +1049,10 @@ fn flatten_returning_if_else_once(body: &str) -> String {
         for (idx, line) in lines.iter().enumerate() {
             if idx == then_close {
                 out.push_str(&format!("{}}}", indent));
-                if else_close < lines.len().saturating_sub(1) || body.ends_with('\n') || !else_body.is_empty() {
+                if else_close < lines.len().saturating_sub(1)
+                    || body.ends_with('\n')
+                    || !else_body.is_empty()
+                {
                     out.push('\n');
                 }
                 continue;
@@ -1459,4 +1481,3 @@ pub(crate) fn fold_assign_ternary_once(body: &str) -> String {
     }
     body.to_string()
 }
-

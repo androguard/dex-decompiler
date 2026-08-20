@@ -87,7 +87,12 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
                     let then_expr = parse_return_expr(then_line).unwrap();
                     let else_expr = parse_return_expr(return_b_line).unwrap();
                     let indent = leading_indent(line);
-                    writeln!(out, "{}return {} ? {} : {};", indent, cond, then_expr, else_expr).ok();
+                    writeln!(
+                        out,
+                        "{}return {} ? {} : {};",
+                        indent, cond, then_expr, else_expr
+                    )
+                    .ok();
                     skip_unreachable_indent = Some(indent.len());
                     i += 5;
                     continue;
@@ -131,10 +136,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
         }
 
         // Try: invoke + return; (void call) → emit as normal Java call "method(args);" then "return;"
-        if is_invoke_line(line)
-            && i + 1 < lines.len()
-            && is_return_void_line(&lines[i + 1])
-        {
+        if is_invoke_line(line) && i + 1 < lines.len() && is_return_void_line(&lines[i + 1]) {
             if let Some((args, method_ref)) = parse_invoke_args_and_method(line) {
                 let indent = leading_indent(line);
                 let call = format!("{}({});", method_ref, args);
@@ -167,7 +169,12 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
                     j += 1;
                     continue;
                 }
-                if jline.contains(" = ") && !jline.contains(".append(") && !jline.contains(".toString(") && !jline.contains("new ") && !jline.contains(".println(") {
+                if jline.contains(" = ")
+                    && !jline.contains(".append(")
+                    && !jline.contains(".toString(")
+                    && !jline.contains("new ")
+                    && !jline.contains(".println(")
+                {
                     if let Some(eq) = jline.find(" = ") {
                         let var = jline[..eq].trim();
                         let val = jline[eq + 3..].trim_end_matches(';').trim();
@@ -195,11 +202,14 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
                     let indent = leading_indent(line);
                     let inline_const = |s: &str| -> String {
                         for (cvar, cval) in &const_assigns {
-                            if s == cvar { return cval.clone(); }
+                            if s == cvar {
+                                return cval.clone();
+                            }
                         }
                         s.to_string()
                     };
-                    let parts_inlined: Vec<String> = parts.iter().map(|p| inline_const(p)).collect();
+                    let parts_inlined: Vec<String> =
+                        parts.iter().map(|p| inline_const(p)).collect();
                     let concat = parts_inlined.join(" + ");
 
                     if dest == "return" {
@@ -211,10 +221,15 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
                     if j + 1 < lines.len() {
                         if let Some((print_obj, print_arg)) = parse_println(&lines[j + 1]) {
                             if print_arg == dest {
-                                let receiver = const_assigns.iter()
+                                let receiver = const_assigns
+                                    .iter()
                                     .rfind(|(_, v)| v == "System.out")
                                     .map(|(k, _)| k.as_str());
-                                let obj = if receiver.is_some_and(|r| r == print_obj || print_obj.starts_with("local") || print_obj.starts_with("v")) {
+                                let obj = if receiver.is_some_and(|r| {
+                                    r == print_obj
+                                        || print_obj.starts_with("local")
+                                        || print_obj.starts_with("v")
+                                }) {
                                     "System.out"
                                 } else {
                                     &print_obj
@@ -340,7 +355,11 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
             let comment_part = line.get(binding.len()..).unwrap_or("");
             if stmt.ends_with(".<init>();") {
                 let prefix = stmt.trim_end_matches(".<init>();");
-                if prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !prefix.is_empty() {
+                if prefix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !prefix.is_empty()
+                {
                     writeln!(simplified, "{}super();{}", ind, comment_part).ok();
                     continue;
                 }
@@ -365,4 +384,3 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = repair_ssa_temp_increments(&out);
     out
 }
-

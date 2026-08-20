@@ -36,9 +36,9 @@ fn emulator_const_and_add() {
 fn emulator_branch_taken() {
     let instructions = vec![
         make_ins(0, 0, "const/4", "v0, 0x0"),
-        make_ins(1, 2, "if-eqz", "v0, 0x2"),       // branch +2 code units = +4 bytes → offset 6
-        make_ins(2, 4, "const/4", "v1, 0x1"),        // skipped
-        make_ins(3, 6, "const/4", "v1, 0x2"),        // target
+        make_ins(1, 2, "if-eqz", "v0, 0x2"), // branch +2 code units = +4 bytes → offset 6
+        make_ins(2, 4, "const/4", "v1, 0x1"), // skipped
+        make_ins(3, 6, "const/4", "v1, 0x2"), // target
         make_ins(4, 8, "return-void", ""),
     ];
     let resolved = instructions.iter().map(|i| i.operands.clone()).collect();
@@ -54,8 +54,8 @@ fn emulator_branch_taken() {
 fn emulator_branch_not_taken() {
     let instructions = vec![
         make_ins(0, 0, "const/4", "v0, 0x1"),
-        make_ins(1, 2, "if-eqz", "v0, 0x2"),        // branch +2 code units = +4 bytes
-        make_ins(2, 4, "const/4", "v1, 0xa"),         // NOT skipped
+        make_ins(1, 2, "if-eqz", "v0, 0x2"), // branch +2 code units = +4 bytes
+        make_ins(2, 4, "const/4", "v1, 0xa"), // NOT skipped
         make_ins(3, 6, "const/4", "v1, 0x14"),
         make_ins(4, 8, "return-void", ""),
     ];
@@ -71,12 +71,12 @@ fn emulator_branch_not_taken() {
 #[test]
 fn emulator_array_operations() {
     let instructions = vec![
-        make_ins(0, 0, "const/4", "v0, 0x3"),        // size=3
-        make_ins(1, 2, "new-array", "v1, v0, [I"),    // v1 = new int[3]
-        make_ins(2, 4, "const/4", "v2, 0x7"),         // value=7
-        make_ins(3, 6, "const/4", "v3, 0x1"),         // index=1
-        make_ins(4, 8, "aput", "v2, v1, v3"),          // v1[1] = 7
-        make_ins(5, 10, "aget", "v4, v1, v3"),         // v4 = v1[1]
+        make_ins(0, 0, "const/4", "v0, 0x3"),      // size=3
+        make_ins(1, 2, "new-array", "v1, v0, [I"), // v1 = new int[3]
+        make_ins(2, 4, "const/4", "v2, 0x7"),      // value=7
+        make_ins(3, 6, "const/4", "v3, 0x1"),      // index=1
+        make_ins(4, 8, "aput", "v2, v1, v3"),      // v1[1] = 7
+        make_ins(5, 10, "aget", "v4, v1, v3"),     // v4 = v1[1]
         make_ins(6, 12, "return", "v4"),
     ];
     let resolved = vec![
@@ -104,7 +104,7 @@ fn emulator_array_operations() {
 fn emulator_parameter_registers() {
     // Static method with registers_size=3, ins_size=2 → p0=v1, p1=v2
     let instructions = vec![
-        make_ins(0, 0, "add-int", "v0, v1, v2"),  // v0 = p0 + p1
+        make_ins(0, 0, "add-int", "v0, v1, v2"), // v0 = p0 + p1
         make_ins(1, 2, "return", "v0"),
     ];
     let resolved = instructions.iter().map(|i| i.operands.clone()).collect();
@@ -135,9 +135,9 @@ fn emulator_division_by_zero() {
 #[test]
 fn emulator_array_index_out_of_bounds() {
     let instructions = vec![
-        make_ins(0, 0, "const/4", "v0, 0x2"),        // size=2
+        make_ins(0, 0, "const/4", "v0, 0x2"), // size=2
         make_ins(1, 2, "new-array", "v1, v0, [I"),
-        make_ins(2, 4, "const/4", "v2, 0x5"),         // index=5 (out of bounds)
+        make_ins(2, 4, "const/4", "v2, 0x5"), // index=5 (out of bounds)
         make_ins(3, 6, "aget", "v3, v1, v2"),
     ];
     let resolved = vec![
@@ -152,7 +152,10 @@ fn emulator_array_index_out_of_bounds() {
     emu.step().unwrap();
     let result = emu.step();
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("array index out of bounds"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("array index out of bounds"));
 }
 
 #[test]
@@ -290,8 +293,8 @@ fn stub_math_operations() {
     ];
     let mut emu = Emulator::new(instructions, resolved, 4, 0, true, vec![]);
     emu.run_to_end().unwrap();
-    assert_eq!(emu.registers[2], Value::Int(3));  // max(-5, 3) = 3
-    assert_eq!(emu.registers[3], Value::Int(5));  // abs(-5) = 5
+    assert_eq!(emu.registers[2], Value::Int(3)); // max(-5, 3) = 3
+    assert_eq!(emu.registers[3], Value::Int(5)); // abs(-5) = 5
 }
 
 /// Integer.parseInt stub.
@@ -423,7 +426,10 @@ fn stub_unknown_invoke_produces_unknown_result() {
     if let Value::Unknown(ref s) = emu.registers[1] {
         assert!(s.contains("com.example.Unknown.foo"));
     } else {
-        panic!("expected Unknown value for unrecognized method, got {:?}", emu.registers[1]);
+        panic!(
+            "expected Unknown value for unrecognized method, got {:?}",
+            emu.registers[1]
+        );
     }
 }
 
@@ -454,12 +460,18 @@ fn emulator_from_dex_method() {
             Ok(Some(cd)) => cd,
             _ => continue,
         };
-        for encoded in class_data.direct_methods.iter().chain(class_data.virtual_methods.iter()) {
+        for encoded in class_data
+            .direct_methods
+            .iter()
+            .chain(class_data.virtual_methods.iter())
+        {
             let info = match dex.get_method_info(encoded.method_idx) {
                 Ok(mi) => mi,
                 Err(_) => continue,
             };
-            if info.name != "testException2" { continue; }
+            if info.name != "testException2" {
+                continue;
+            }
 
             let params = vec![
                 dex_decompiler::emulator::Value::Int(5),
@@ -471,7 +483,9 @@ fn emulator_from_dex_method() {
 
             // Step a few times — should not panic
             for _ in 0..5 {
-                if emu.finished { break; }
+                if emu.finished {
+                    break;
+                }
                 let _ = emu.step();
             }
             assert!(emu.step_count > 0);

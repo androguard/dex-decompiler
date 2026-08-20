@@ -188,7 +188,15 @@ impl Emulator {
         is_static: bool,
         params: Vec<Value>,
     ) -> Self {
-        Self::new_with_heap(instructions, resolved_operands, registers_size, ins_size, is_static, params, Vec::new())
+        Self::new_with_heap(
+            instructions,
+            resolved_operands,
+            registers_size,
+            ins_size,
+            is_static,
+            params,
+            Vec::new(),
+        )
     }
 
     /// Same as `new` but starts with pre-allocated heap objects (e.g. for array params).

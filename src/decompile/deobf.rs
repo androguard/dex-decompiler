@@ -50,8 +50,12 @@ pub fn build_deobf_rename_map(dexes: &[&DexFile], opts: &DeobfuscateOptions) -> 
 
     for dex in dexes {
         for class_result in dex.class_defs() {
-            let Ok(class_def) = class_result else { continue };
-            let Ok(class_type) = dex.get_type(class_def.class_idx) else { continue };
+            let Ok(class_def) = class_result else {
+                continue;
+            };
+            let Ok(class_type) = dex.get_type(class_def.class_idx) else {
+                continue;
+            };
             let class_name = descriptor_to_java(&class_type);
             if is_whitelisted(&class_name, opts) {
                 continue;
@@ -60,10 +64,7 @@ pub fn build_deobf_rename_map(dexes: &[&DexFile], opts: &DeobfuscateOptions) -> 
             let simple = class_name.rsplit('.').next().unwrap_or(class_name.as_str());
             if needs_rename(simple, opts) {
                 class_n += 1;
-                let pkg = class_name
-                    .rsplit_once('.')
-                    .map(|(p, _)| p)
-                    .unwrap_or("");
+                let pkg = class_name.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
                 let new_simple = format!("C{class_n:04}");
                 let out_class = if pkg.is_empty() {
                     new_simple
@@ -128,7 +129,11 @@ fn needs_rename(name: &str, opts: &DeobfuscateOptions) -> bool {
     if len < opts.min_len || len > opts.max_len {
         return true;
     }
-    if opts.rename_non_printable && name.chars().any(|c| c.is_control() || !is_printable_ascii_or_ident(c)) {
+    if opts.rename_non_printable
+        && name
+            .chars()
+            .any(|c| c.is_control() || !is_printable_ascii_or_ident(c))
+    {
         // Allow Unicode letters in identifiers; flag control chars and spaces.
         if name.chars().any(|c| c.is_control() || c == ' ') {
             return true;

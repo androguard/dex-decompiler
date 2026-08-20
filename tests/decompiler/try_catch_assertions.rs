@@ -68,7 +68,10 @@ pub fn assert_nested_try(body: &str) {
     assert!(body.contains("catch (Exception"), "{body}");
     let re = body.find("catch (RuntimeException").unwrap();
     let ex = body.find("catch (Exception").unwrap();
-    assert!(re < ex, "RuntimeException catch should be inner; got:\n{body}");
+    assert!(
+        re < ex,
+        "RuntimeException catch should be inner; got:\n{body}"
+    );
     assert!(
         body.contains("/ x") || body.contains("/x"),
         "nestedTry should divide (can throw); got:\n{body}"
@@ -77,7 +80,10 @@ pub fn assert_nested_try(body: &str) {
         !body.contains("x * 2") && !body.contains("* 2"),
         "nestedTry must not collapse to bare multiply; got:\n{body}"
     );
-    assert!(body.contains("return -1") && body.contains("return -2"), "{body}");
+    assert!(
+        body.contains("return -1") && body.contains("return -2"),
+        "{body}"
+    );
     assert!(!body.contains("catch (Throwable"), "{body}");
 }
 
@@ -90,7 +96,10 @@ pub fn assert_simple_try_catch(body: &str) {
 }
 
 pub fn assert_multi_catch(body: &str) {
-    assert!(body.contains("try {") && body.contains("toString()"), "{body}");
+    assert!(
+        body.contains("try {") && body.contains("toString()"),
+        "{body}"
+    );
     assert!(
         body.contains("NullPointerException") && body.contains("ClassCastException"),
         "{body}"
@@ -103,7 +112,10 @@ pub fn assert_try_finally(body: &str) {
         body.contains("try {") && body.contains("finally {"),
         "tryFinally should decompile to try/finally; got:\n{body}"
     );
-    assert!(body.contains("int acc = 0") || body.contains("acc = acc + x") || body.contains("acc += x"), "{body}");
+    assert!(
+        body.contains("int acc = 0") || body.contains("acc = acc + x") || body.contains("acc += x"),
+        "{body}"
+    );
     assert!(
         body.contains("acc = acc + x")
             || body.contains("acc += x")
@@ -132,7 +144,10 @@ pub fn assert_try_with_resources(twr: &str) {
         twr.contains("try (") && twr.contains("StubResource"),
         "tryWithResources should use try-with-resources; got:\n{twr}"
     );
-    assert!(twr.contains("touch()") && twr.contains("return 42"), "{twr}");
+    assert!(
+        twr.contains("touch()") && twr.contains("return 42"),
+        "{twr}"
+    );
     assert!(
         !twr.contains(".close()") && !twr.contains("addSuppressed"),
         "{twr}"
@@ -156,10 +171,7 @@ pub fn assert_try_with_resources_two(twr_two: &str) {
         !twr_two.contains(".close()") && !twr_two.contains("addSuppressed"),
         "{twr_two}"
     );
-    let brace_only = twr_two
-        .lines()
-        .filter(|l| l.trim() == "}")
-        .count();
+    let brace_only = twr_two.lines().filter(|l| l.trim() == "}").count();
     assert!(
         brace_only <= 2,
         "tryWithResourcesTwo should not have stray closing braces; got:\n{twr_two}"

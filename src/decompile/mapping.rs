@@ -177,10 +177,7 @@ fn extract_pg_member_name(s: &str) -> String {
             .unwrap_or(before)
             .to_string();
     }
-    s.split_whitespace()
-        .last()
-        .unwrap_or(s)
-        .to_string()
+    s.split_whitespace().last().unwrap_or(s).to_string()
 }
 
 /// Tiny v1: `c\torig\tobfuscated`, `f\torig\tobfuscated\towner`, `m\torigDescName\tobfuscated\towner`
@@ -214,11 +211,7 @@ fn parse_tiny(text: &str) -> RenameMap {
             "m" if parts.len() >= 4 => {
                 // orig may be `name` or `name(desc)`
                 let orig_raw = parts[1];
-                let orig = orig_raw
-                    .split('(')
-                    .next()
-                    .unwrap_or(orig_raw)
-                    .to_string();
+                let orig = orig_raw.split('(').next().unwrap_or(orig_raw).to_string();
                 let obf = parts[2].to_string();
                 let owner_obf = parts[3].replace('/', ".");
                 if orig != obf {
@@ -395,7 +388,10 @@ com.example.Hello -> a.a:
     1:3:void greet(java.lang.String) -> b
 "#;
         let map = parse_proguard(text);
-        assert_eq!(map.class.get("a.a").map(|s| s.as_str()), Some("com.example.Hello"));
+        assert_eq!(
+            map.class.get("a.a").map(|s| s.as_str()),
+            Some("com.example.Hello")
+        );
         assert_eq!(map.field.get("a.a#a").map(|s| s.as_str()), Some("name"));
         assert_eq!(map.method.get("a.a#b").map(|s| s.as_str()), Some("greet"));
     }
@@ -404,7 +400,10 @@ com.example.Hello -> a.a:
     fn tiny_class() {
         let text = "tiny\t2\t0\nc\tcom/example/Hello\ta/a\nf\tname\ta\ta/a\nm\tgreet\tb\ta/a\n";
         let map = parse_tiny(text);
-        assert_eq!(map.class.get("a.a").map(|s| s.as_str()), Some("com.example.Hello"));
+        assert_eq!(
+            map.class.get("a.a").map(|s| s.as_str()),
+            Some("com.example.Hello")
+        );
         assert_eq!(map.field.get("a.a#a").map(|s| s.as_str()), Some("name"));
         assert_eq!(map.method.get("a.a#b").map(|s| s.as_str()), Some("greet"));
     }
@@ -413,7 +412,10 @@ com.example.Hello -> a.a:
     fn enigma_class() {
         let text = "CLASS a/a com/example/Hello\n\tFIELD a name\n\tMETHOD b greet\n";
         let map = parse_enigma(text);
-        assert_eq!(map.class.get("a.a").map(|s| s.as_str()), Some("com.example.Hello"));
+        assert_eq!(
+            map.class.get("a.a").map(|s| s.as_str()),
+            Some("com.example.Hello")
+        );
         assert_eq!(map.field.get("a.a#a").map(|s| s.as_str()), Some("name"));
         assert_eq!(map.method.get("a.a#b").map(|s| s.as_str()), Some("greet"));
     }
@@ -428,7 +430,10 @@ com.example.Hello -> a.a:
         let map = parse_proguard(text);
         let out = save_mapping_str(&map, MappingFormat::ProGuard);
         let again = parse_proguard(&out);
-        assert_eq!(again.class.get("a.a").map(|s| s.as_str()), Some("com.example.Hello"));
+        assert_eq!(
+            again.class.get("a.a").map(|s| s.as_str()),
+            Some("com.example.Hello")
+        );
         assert_eq!(again.field.get("a.a#a").map(|s| s.as_str()), Some("name"));
         assert_eq!(again.method.get("a.a#b").map(|s| s.as_str()), Some("greet"));
     }
@@ -436,8 +441,7 @@ com.example.Hello -> a.a:
     #[test]
     fn tiny_and_enigma_roundtrip() {
         let mut map = RenameMap::new();
-        map.class
-            .insert("a.a".into(), "com.example.Hello".into());
+        map.class.insert("a.a".into(), "com.example.Hello".into());
         map.field.insert("a.a#a".into(), "name".into());
         map.method.insert("a.a#b".into(), "greet".into());
         for fmt in [MappingFormat::Tiny, MappingFormat::Enigma] {
@@ -451,7 +455,10 @@ com.example.Hello -> a.a:
                 },
             )
             .unwrap();
-            assert_eq!(again.class.get("a.a").map(|s| s.as_str()), Some("com.example.Hello"));
+            assert_eq!(
+                again.class.get("a.a").map(|s| s.as_str()),
+                Some("com.example.Hello")
+            );
             assert_eq!(again.field.get("a.a#a").map(|s| s.as_str()), Some("name"));
             assert_eq!(again.method.get("a.a#b").map(|s| s.as_str()), Some("greet"));
         }

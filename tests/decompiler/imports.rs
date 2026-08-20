@@ -36,7 +36,10 @@ fn test_decompiled_class_has_import_before_class_declaration() {
     let dc = Decompiler::new(&dex);
     let java = dc.decompile().unwrap();
     let import_pos = java.find("import java.util.List;").expect("import line");
-    let class_pos = java.find("class Test ").or_else(|| java.find("class Test{")).expect("class decl");
+    let class_pos = java
+        .find("class Test ")
+        .or_else(|| java.find("class Test{"))
+        .expect("class decl");
     assert!(
         import_pos < class_pos,
         "import should appear before class declaration"

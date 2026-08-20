@@ -1,6 +1,9 @@
 //! Solver semantic tests aligned with Mariana Trench simple_flows / sanitizers.
 
-use dex_decompiler::{load_mt_case_config, parse_dex, solve_dexes, SolveOptions};
+use dex_decompiler::{
+    find_method_callers, load_mt_case_config, parse_dex, solve_dexes, Decompiler, MethodIndex,
+    SolveOptions,
+};
 use std::path::PathBuf;
 
 fn e2e(case: &str) -> PathBuf {
@@ -106,6 +109,126 @@ fn solve_with_mt_simple_flows_config_on_testdata_smoke() {
     let result = solve_dexes(&[&dex], &cfg, &opts).unwrap();
     // Smoke: finishes and produces a report (issue count may be 0 on this fixture).
     assert_eq!(result.report.tool, "dex-decompiler-taint");
+}
+
+#[test]
+fn live_simple_flow_dex_reports_positive_and_not_clean_control() {
+    let dir = e2e("simple_flows");
+    let mut cfg = load_mt_case_config(&dir.join("models.json"), &dir.join("rules.json")).unwrap();
+    for source in &mut cfg.sources {
+        if source.kind == "Source" {
+            source.patterns = vec!["mt.live.Origin.source".into()];
+        }
+    }
+    for sink in &mut cfg.sinks {
+        if sink.kind == "Sink" {
+            sink.patterns = vec!["Origin.sink".into()];
+        }
+    }
+    let source = cfg
+        .find_source("mt.live.Origin.source")
+        .expect("live source model was not installed");
+    assert!(matches!(source.port, dex_decompiler::Port::Return));
+    let sink = cfg
+        .find_sink("mt.live.Origin.sink")
+        .expect("live sink model was not installed");
+    assert!(matches!(sink.port, dex_decompiler::Port::This));
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/mariana_trench/live_solver/classes.dex");
+    let data = std::fs::read(&path).expect("live_solver/classes.dex");
+    let dex = parse_dex(&data).unwrap();
+    let index = MethodIndex::from_dexes(&[&dex]);
+    let direct = index
+        .methods
+        .iter()
+        .find(|method| method.method_name == "directFlow")
+        .expect("directFlow");
+    let owned = Decompiler::new(&dex)
+        .value_flow_analysis(&direct.encoded)
+        .unwrap();
+    let ((source_offset, source_reg), _) = owned
+        .api_return_sources
+        .iter()
+        .find(|(_, method)| method.contains("Origin.source"))
+        .expect("live source invoke");
+    let flow = owned
+        .analysis()
+        .value_flow_from_seed(*source_offset, *source_reg);
+    assert!(
+        flow.reads.iter().any(|(offset, _)| owned
+            .invoke_method_map
+            .get(offset)
+            .map(|method| method.contains("Origin.sink"))
+            .unwrap_or(false)),
+        "live local flow missing: {flow:?}"
+    );
+    let lambda_impl = index
+        .methods
+        .iter()
+        .find(|method| method.method_name.starts_with("lambda$lambdaFlow"))
+        .expect("lambda implementation");
+    let callers = find_method_callers(&dex, lambda_impl.encoded.method_idx).unwrap();
+    assert!(
+        callers
+            .callers
+            .iter()
+            .any(|caller| caller.method_name == "lambdaFlow"
+                && caller.invoke_kind.starts_with("invoke-custom")),
+        "xref did not resolve invoke-custom implementation: {callers:#?}"
+    );
+    let mut opts = SolveOptions::default_android();
+    opts.max_iterations = 8;
+
+    let result = solve_dexes(&[&dex], &cfg, &opts).unwrap();
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|issue| issue.callable.contains("directFlow")
+                && issue.source_kind == "Source"
+                && issue.sink_kind == "Sink"),
+        "actual solver did not report directFlow (stats={:#?}): {:#?}",
+        result.report.stats,
+        result.issues,
+    );
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|issue| issue.callable.contains("helperFlow")
+                && issue.source_kind == "Source"
+                && issue.sink_kind == "Sink"),
+        "actual solver did not report multi-hop helperFlow: {:#?}",
+        result.issues
+    );
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|issue| issue.callable.contains("executorFlow")
+                && issue.source_kind == "Source"
+                && issue.sink_kind == "Sink"),
+        "actual solver did not follow Executor callback shim: {:#?}",
+        result.issues
+    );
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|issue| issue.callable.contains("lambdaFlow")
+                && issue.source_kind == "Source"
+                && issue.sink_kind == "Sink"),
+        "actual solver did not follow invoke-custom lambdaFlow: {:#?}",
+        result.issues
+    );
+    assert!(
+        result
+            .issues
+            .iter()
+            .all(|issue| !issue.callable.contains("cleanFlow")),
+        "clean control unexpectedly tainted: {:#?}",
+        result.issues
+    );
 }
 
 #[test]

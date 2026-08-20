@@ -147,9 +147,15 @@ mod tests {
     #[test]
     fn descriptor_array() {
         assert_eq!(descriptor_to_java("[I"), "int[]");
-        assert_eq!(descriptor_to_java("[Ljava/lang/String;"), "java.lang.String[]");
+        assert_eq!(
+            descriptor_to_java("[Ljava/lang/String;"),
+            "java.lang.String[]"
+        );
         assert_eq!(descriptor_to_java("[[I"), "int[][]");
-        assert_eq!(descriptor_to_java("[[Ljava/lang/Object;"), "java.lang.Object[][]");
+        assert_eq!(
+            descriptor_to_java("[[Ljava/lang/Object;"),
+            "java.lang.Object[][]"
+        );
     }
 
     #[test]

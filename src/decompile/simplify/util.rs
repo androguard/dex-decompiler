@@ -77,7 +77,9 @@ pub(crate) fn parse_invoke_args_and_method(line: &str) -> Option<(String, String
 pub(crate) fn is_invoke_line(line: &str) -> bool {
     let binding = strip_trailing_comment(line);
     let stmt = binding.trim();
-    stmt.starts_with("invoke-") && stmt.contains('(') && (stmt.ends_with(" );") || stmt.ends_with(");"))
+    stmt.starts_with("invoke-")
+        && stmt.contains('(')
+        && (stmt.ends_with(" );") || stmt.ends_with(");"))
 }
 
 /// Match "Type? var = expr;" → Some((var, expr)). Type is optional (e.g. `String result = "x";`).
@@ -133,7 +135,11 @@ fn rhs_until_top_level_semicolon(rest: &str) -> Option<String> {
             b')' | b'}' | b']' => depth -= 1,
             b';' if depth <= 0 => {
                 let rhs = rest[..i].trim();
-                return if rhs.is_empty() { None } else { Some(rhs.to_string()) };
+                return if rhs.is_empty() {
+                    None
+                } else {
+                    Some(rhs.to_string())
+                };
             }
             _ => {}
         }
@@ -202,11 +208,7 @@ pub(crate) fn parse_move_result_line(line: &str) -> Option<String> {
     }
     // vN / vN_k register forms
     if let Some(rest) = lhs.strip_prefix('v') {
-        if !rest.is_empty()
-            && rest
-                .chars()
-                .all(|c| c.is_ascii_digit() || c == '_')
-        {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '_') {
             return Some(lhs.to_string());
         }
     }
@@ -332,7 +334,11 @@ pub(crate) fn parse_init_call(line: &str) -> Option<(String, Option<String>)> {
     let start = init_pos + ".<init>(".len();
     let end = stmt.rfind(");")?;
     let inner = stmt[start..end].trim();
-    let arg = if inner.is_empty() { None } else { Some(inner.to_string()) };
+    let arg = if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_string())
+    };
     Some((var, arg))
 }
 
@@ -440,10 +446,14 @@ pub(crate) fn collect_idents_in_line(line: &str) -> Vec<String> {
 /// Extract the register number from SSA variable names like "v2", "local2", "localN".
 pub(crate) fn extract_reg_number(var: &str) -> Option<&str> {
     if let Some(n) = var.strip_prefix("local") {
-        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) { return Some(n); }
+        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+            return Some(n);
+        }
     }
     if let Some(n) = var.strip_prefix('v') {
-        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) { return Some(n); }
+        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+            return Some(n);
+        }
     }
     None
 }
@@ -547,7 +557,8 @@ pub(crate) fn is_cheap_literal_rhs(rhs: &str) -> bool {
 /// Not a class literal (`Foo.class` / `pkg.Foo.class`).
 pub(crate) fn is_simple_field_path(s: &str) -> bool {
     let s = s.trim();
-    if !s.contains('.') || s.contains('(') || s.contains(')') || s.contains(' ') || s.contains('[') {
+    if !s.contains('.') || s.contains('(') || s.contains(')') || s.contains(' ') || s.contains('[')
+    {
         return false;
     }
     // `Type.class` is a const-class literal, not a field access.
@@ -574,10 +585,7 @@ pub(crate) fn is_temp_like_name(var: &str) -> bool {
     }
     let b = var.as_bytes();
     // i0 / s0 / v0 / o0 / …
-    if b.len() >= 2
-        && b[0].is_ascii_alphabetic()
-        && b[1..].iter().all(|c| c.is_ascii_digit())
-    {
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1..].iter().all(|c| c.is_ascii_digit()) {
         return true;
     }
     // k_0 / j_0 (SSA copies of loop indexes)
@@ -593,7 +601,11 @@ pub(crate) fn is_temp_like_name(var: &str) -> bool {
         let (prefix, digits) = var.split_at(i + 1);
         if !digits.is_empty()
             && digits.bytes().all(|c| c.is_ascii_digit())
-            && prefix.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false)
+            && prefix
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_lowercase())
+                .unwrap_or(false)
         {
             return true;
         }
@@ -673,7 +685,13 @@ pub(crate) fn parse_equals_assign(line: &str) -> Option<(String, String)> {
     let (var, rhs) = parse_simple_assign_line(line)?;
     let rhs = rhs.trim();
     // x.equals(y) or x.endsWith(y) / startsWith / contains
-    for meth in ["equals", "endsWith", "startsWith", "contains", "equalsIgnoreCase"] {
+    for meth in [
+        "equals",
+        "endsWith",
+        "startsWith",
+        "contains",
+        "equalsIgnoreCase",
+    ] {
         if let Some(dot) = rhs.find(&format!(".{}(", meth)) {
             if rhs.ends_with(')') {
                 return Some((var, rhs.to_string()));
@@ -711,8 +729,7 @@ pub(crate) fn rewrite_condition_with_equals(cond: &str, var: &str, equals_expr: 
         return equals_expr.to_string();
     }
     // Negative: !var / var == 0 / var == null
-    if c == format!("!{}", var) || c == format!("{} == 0", var) || c == format!("{} == null", var)
-    {
+    if c == format!("!{}", var) || c == format!("{} == 0", var) || c == format!("{} == null", var) {
         return format!("!({})", equals_expr);
     }
     // Fallback: replace ident
@@ -727,7 +744,13 @@ pub(crate) fn condition_has_string_predicate(cond: &str) -> bool {
         .and_then(|s| s.strip_suffix(')'))
         .map(|s| s.trim())
         .unwrap_or(c);
-    for meth in ["equals", "endsWith", "startsWith", "contains", "equalsIgnoreCase"] {
+    for meth in [
+        "equals",
+        "endsWith",
+        "startsWith",
+        "contains",
+        "equalsIgnoreCase",
+    ] {
         if inner.contains(&format!(".{}(", meth)) {
             return true;
         }
@@ -974,8 +997,16 @@ pub(crate) fn split_top_level_bool_op(cond: &str, op: &str) -> Vec<String> {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
             _ if depth == 0 && i + oplen <= chars.len() => {
-                if chars[i..i + oplen].iter().copied().eq(ochars.iter().copied()) {
-                    let piece = chars[start..i].iter().collect::<String>().trim().to_string();
+                if chars[i..i + oplen]
+                    .iter()
+                    .copied()
+                    .eq(ochars.iter().copied())
+                {
+                    let piece = chars[start..i]
+                        .iter()
+                        .collect::<String>()
+                        .trim()
+                        .to_string();
                     if !piece.is_empty() {
                         out.push(piece);
                     }
@@ -1217,7 +1248,11 @@ pub(crate) fn split_top_level_args(args: &str) -> Vec<String> {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
             ',' if depth == 0 => {
-                let piece = chars[start..i].iter().collect::<String>().trim().to_string();
+                let piece = chars[start..i]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
                 if !piece.is_empty() {
                     out.push(piece);
                 }
@@ -1302,7 +1337,9 @@ pub(crate) fn is_cast_expr(s: &str) -> bool {
     if !s.starts_with('(') {
         return false;
     }
-    let Some(close) = s.find(')') else { return false };
+    let Some(close) = s.find(')') else {
+        return false;
+    };
     if close + 1 >= s.len() || s.as_bytes()[close + 1] != b' ' {
         return false;
     }
@@ -1311,8 +1348,14 @@ pub(crate) fn is_cast_expr(s: &str) -> bool {
         return false;
     }
     // Type name: Ident or pkg.Ident (allow [] for arrays)
-    let ok_ty = ty.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '[' || c == ']')
-        && ty.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false);
+    let ok_ty = ty
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '[' || c == ']')
+        && ty
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false);
     if !ok_ty {
         return false;
     }
@@ -1331,13 +1374,19 @@ pub(crate) fn is_cast_expr_shallow(s: &str) -> bool {
     if !s.starts_with('(') {
         return false;
     }
-    let Some(close) = s.find(')') else { return false };
+    let Some(close) = s.find(')') else {
+        return false;
+    };
     if close + 1 >= s.len() {
         return false;
     }
     let ty = s[1..close].trim();
     !ty.is_empty()
-        && ty.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+        && ty
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
 }
 
 /// `k_0` / `i0` is an SSA copy of `k` / `i`.
@@ -1381,7 +1430,12 @@ pub(crate) fn is_index_increment(line: &str, i: &str) -> bool {
 
 /// True when every use of `var` after its definition is only `var.length` (or embedded in a sum).
 /// True when every use of `var` after its definition is only `var.length` (or embedded in a sum).
-pub(crate) fn all_uses_are_length_member(lines: &[&str], var: &str, def_idx: usize, end_idx: usize) -> bool {
+pub(crate) fn all_uses_are_length_member(
+    lines: &[&str],
+    var: &str,
+    def_idx: usize,
+    end_idx: usize,
+) -> bool {
     let uses: Vec<&str> = lines[def_idx + 1..end_idx]
         .iter()
         .copied()
@@ -1494,9 +1548,8 @@ pub(crate) fn is_simple_arith_expr(rhs: &str) -> bool {
     if rhs.contains("new ") || rhs.contains("->") {
         return false;
     }
-    rhs.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '_' || " +-*/%()[].".contains(c)
-    })
+    rhs.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || " +-*/%()[].".contains(c))
 }
 
 /// True if `rhs` is safe to inline into a single use.
@@ -1507,7 +1560,9 @@ pub(crate) fn is_inlineable_rhs(rhs: &str) -> bool {
         return false;
     }
     // String / char literals
-    if (rhs.starts_with('"') && rhs.ends_with('"')) || (rhs.starts_with('\'') && rhs.ends_with('\'') && rhs.len() >= 3) {
+    if (rhs.starts_with('"') && rhs.ends_with('"'))
+        || (rhs.starts_with('\'') && rhs.ends_with('\'') && rhs.len() >= 3)
+    {
         return true;
     }
     // null / booleans

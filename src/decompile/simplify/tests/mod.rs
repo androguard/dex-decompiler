@@ -1,9 +1,5 @@
 //! Simplify pass tests grouped by topic.
 
-use super::{
-    java_string_hash_code, merge_duplicate_finally, normalize_java_indent,
-    restore_string_switch, simplify_method_body, simplify_synchronized_blocks,
-};
 use super::cleanup::*;
 use super::conditions::*;
 use super::expr::*;
@@ -11,10 +7,13 @@ use super::format::*;
 use super::loops::*;
 use super::try_catch::*;
 use super::util::*;
+use super::{
+    java_string_hash_code, merge_duplicate_finally, normalize_java_indent, restore_string_switch,
+    simplify_method_body, simplify_synchronized_blocks,
+};
 
 mod parsing {
     use super::*;
-
 }
 
 mod pipeline {
@@ -93,7 +92,8 @@ mod pipeline {
     #[test]
     fn simplify_invoke_move_result_only() {
         // Resolved invoke has "Receiver, MethodRef" - method ref is last (e.g. Class.method(Params)).
-        let body = "        invoke-virtual( v0, Foo.bar(A, B) );  // x\n        v2 = <result>;  // y";
+        let body =
+            "        invoke-virtual( v0, Foo.bar(A, B) );  // x\n        v2 = <result>;  // y";
         let simplified = simplify_method_body(body, false);
         assert!(
             simplified.contains("v2 = Foo.bar(v0);"),
@@ -182,7 +182,11 @@ mod pipeline {
             "expected 'System.out.println(\"test2 \" + n0);' in {:?}",
             simplified
         );
-        assert!(!simplified.contains("StringBuilder"), "StringBuilder should be gone: {:?}", simplified);
+        assert!(
+            !simplified.contains("StringBuilder"),
+            "StringBuilder should be gone: {:?}",
+            simplified
+        );
     }
 
     #[test]
@@ -208,13 +212,21 @@ mod pipeline {
                 n0 = 12;\n\
                 System.out.println(n0);";
         let simplified = simplify_method_body(body, false);
-        assert!(!simplified.contains("move-exception"), "move-exception should be removed: {:?}", simplified);
+        assert!(
+            !simplified.contains("move-exception"),
+            "move-exception should be removed: {:?}",
+            simplified
+        );
         assert!(
             simplified.contains("System.out.println(12);"),
             "single-use numeric should be inlined: {:?}",
             simplified
         );
-        assert!(!simplified.contains("n0 = 12"), "n0 assignment should be removed: {:?}", simplified);
+        assert!(
+            !simplified.contains("n0 = 12"),
+            "n0 assignment should be removed: {:?}",
+            simplified
+        );
     }
 
     #[test]
@@ -260,7 +272,11 @@ mod pipeline {
             "expected inlined string constant: {:?}",
             simplified
         );
-        assert!(!simplified.contains("str0"), "str0 assignment should be removed: {:?}", simplified);
+        assert!(
+            !simplified.contains("str0"),
+            "str0 assignment should be removed: {:?}",
+            simplified
+        );
     }
 
     /// OVAA LoginActivity.onCreate pattern: reuse `i0` for layout then button id across an if.
@@ -364,8 +380,16 @@ mod pipeline {
             "expected inlined receiver + request code: {:?}",
             simplified
         );
-        assert!(!simplified.contains("int i0"), "i0 should be removed: {:?}", simplified);
-        assert!(!simplified.contains("s0 ="), "s0 temps should be removed: {:?}", simplified);
+        assert!(
+            !simplified.contains("int i0"),
+            "i0 should be removed: {:?}",
+            simplified
+        );
+        assert!(
+            !simplified.contains("s0 ="),
+            "s0 temps should be removed: {:?}",
+            simplified
+        );
     }
 
     #[test]
@@ -425,7 +449,8 @@ mod pipeline {
                 bar(requestCode);";
         let simplified = simplify_method_body(body, false);
         assert!(
-            simplified.contains("requestCode = 1001") || simplified.contains("int requestCode = 1001"),
+            simplified.contains("requestCode = 1001")
+                || simplified.contains("int requestCode = 1001"),
             "named local should keep assignment: {:?}",
             simplified
         );
@@ -448,7 +473,11 @@ mod pipeline {
             "expected System.out.println(\"hello\") in {:?}",
             simplified
         );
-        assert!(!simplified.contains("local0 = System.out"), "dead assignment should be removed: {:?}", simplified);
+        assert!(
+            !simplified.contains("local0 = System.out"),
+            "dead assignment should be removed: {:?}",
+            simplified
+        );
     }
 
     #[test]
@@ -460,8 +489,16 @@ mod pipeline {
             "expected return \"bad_name\"; in {:?}",
             simplified
         );
-        assert!(!simplified.contains("String result"), "assignment should be removed: {:?}", simplified);
-        assert!(!simplified.contains("return result"), "return result should be folded: {:?}", simplified);
+        assert!(
+            !simplified.contains("String result"),
+            "assignment should be removed: {:?}",
+            simplified
+        );
+        assert!(
+            !simplified.contains("return result"),
+            "return result should be folded: {:?}",
+            simplified
+        );
     }
 
     #[test]
@@ -497,8 +534,13 @@ mod pipeline {
         let simplified = simplify_method_body(body, true);
         let super_line = simplified.lines().find(|l| l.contains("super();")).unwrap();
         let spaces = super_line.len() - super_line.trim_start().len();
-        assert_eq!(spaces, 8, "body statements should be 8 spaces, got {:?}: {:?}", spaces, simplified);
-    }}
+        assert_eq!(
+            spaces, 8,
+            "body statements should be 8 spaces, got {:?}: {:?}",
+            spaces, simplified
+        );
+    }
+}
 
 mod string_switch {
     use super::*;
@@ -750,7 +792,11 @@ mod string_switch {
             "expected positive else-if:\n{}",
             out
         );
-        assert!(out.contains("baz();") && out.contains("bar();") && out.contains("foo();"), "{}", out);
+        assert!(
+            out.contains("baz();") && out.contains("bar();") && out.contains("foo();"),
+            "{}",
+            out
+        );
     }
 
     #[test]
@@ -866,17 +912,17 @@ mod string_switch {
         }
 "#;
         let out = simplify_method_body(body, false);
-        assert!(
-            out.contains("else if (b)"),
-            "expected else if:\n{}",
-            out
-        );
+        assert!(out.contains("else if (b)"), "expected else if:\n{}", out);
         assert!(
             !out.contains("} else {\n            if (b)"),
             "should not nest else/if:\n{}",
             out
         );
-        assert!(out.contains("foo();") && out.contains("bar();") && out.contains("baz();"), "{}", out);
+        assert!(
+            out.contains("foo();") && out.contains("bar();") && out.contains("baz();"),
+            "{}",
+            out
+        );
     }
 
     #[test]
@@ -997,7 +1043,11 @@ mod string_switch {
             out
         );
         assert!(out.contains("work();"), "{}", out);
-        assert!(!out.contains("while (true)"), "while(true) should be gone:\n{}", out);
+        assert!(
+            !out.contains("while (true)"),
+            "while(true) should be gone:\n{}",
+            out
+        );
     }
 
     #[test]
@@ -1094,7 +1144,11 @@ mod string_switch {
 "#;
         let out2 = simplify_method_body(body2, false);
         assert!(out2.contains("switch (color)"), "map form:\n{}", out2);
-        assert!(!out2.contains("$SwitchMap$"), "map assign dropped:\n{}", out2);
+        assert!(
+            !out2.contains("$SwitchMap$"),
+            "map assign dropped:\n{}",
+            out2
+        );
 
         let body3 = r#"        switch (color.ordinal()) {
             case 0:
@@ -1243,7 +1297,10 @@ mod string_switch {
             }\n\
         }\n";
         let out = restore_while_true_nested_for(body);
-        assert!(out.contains("for (int i = 0; i < n - 1; i++)"), "minimal outer for:\n{out}");
+        assert!(
+            out.contains("for (int i = 0; i < n - 1; i++)"),
+            "minimal outer for:\n{out}"
+        );
     }
 
     #[test]
@@ -1273,7 +1330,10 @@ mod string_switch {
             }\n\
         }\n";
         let out = restore_while_true_nested_for(body);
-        assert!(out.contains("for (int i = 0; i < n - 1; i++)"), "outer for:\n{out}");
+        assert!(
+            out.contains("for (int i = 0; i < n - 1; i++)"),
+            "outer for:\n{out}"
+        );
         assert!(
             out.contains("for (int j = 0; j < n - i - 1; j++)"),
             "inner for:\n{out}"
@@ -1368,7 +1428,10 @@ mod string_switch {
             }\n\
         }\n";
         let out = simplify_method_body(body, false);
-        assert!(out.contains("for (int i = 0; i < n - 1; i++)"), "outer for:\n{out}");
+        assert!(
+            out.contains("for (int i = 0; i < n - 1; i++)"),
+            "outer for:\n{out}"
+        );
         assert!(
             out.contains("for (int j = 0; j < n - i - 1; j++)"),
             "inner for:\n{out}"
@@ -1407,7 +1470,10 @@ mod string_switch {
             }\n\
         }\n";
         let out = simplify_method_body(body, false);
-        assert!(out.contains("for (int i = 0; i < n - 1; i++)"), "outer for:\n{out}");
+        assert!(
+            out.contains("for (int i = 0; i < n - 1; i++)"),
+            "outer for:\n{out}"
+        );
         assert!(
             out.contains("for (int j = 0; j < n - i - 1; j++)"),
             "inner for:\n{out}"

@@ -309,7 +309,9 @@ fn read_encoded_value(data: &[u8], pos: &mut usize) -> Option<EncodedValue> {
                 buf[i] = *data.get(*pos)?;
                 *pos += 1;
             }
-            Some(EncodedValue::Double(f64::from_bits(u64::from_le_bytes(buf))))
+            Some(EncodedValue::Double(f64::from_bits(u64::from_le_bytes(
+                buf,
+            ))))
         }
         0x17 => {
             // string (uleb128 index, size = value_arg+1 bytes as unsigned)
@@ -668,7 +670,11 @@ fn parse_type_sig(s: &str) -> Option<(String, usize)> {
                                 continue;
                             }
                             if bytes[i] == b'+' || bytes[i] == b'-' {
-                                let bound_kind = if bytes[i] == b'+' { " extends " } else { " super " };
+                                let bound_kind = if bytes[i] == b'+' {
+                                    " extends "
+                                } else {
+                                    " super "
+                                };
                                 i += 1;
                                 let (inner, n) = parse_type_sig(&s[i..])?;
                                 args.push(format!("?{}{}", bound_kind, inner));
@@ -730,7 +736,10 @@ mod tests {
     fn signature_type_params() {
         let s = signature_to_java_generics("<T:Ljava/lang/Object;>Ljava/lang/Object;").unwrap();
         assert_eq!(s, "<T>");
-        let s2 = signature_to_java_generics("<K:Ljava/lang/Object;V:Ljava/lang/Object;>Ljava/lang/Object;").unwrap();
+        let s2 = signature_to_java_generics(
+            "<K:Ljava/lang/Object;V:Ljava/lang/Object;>Ljava/lang/Object;",
+        )
+        .unwrap();
         assert_eq!(s2, "<K, V>");
     }
 
@@ -742,10 +751,8 @@ mod tests {
 
     #[test]
     fn signature_method_with_type_param() {
-        let m = signature_method_to_java(
-            "<T:Ljava/lang/Object;>(Ljava/util/List<TT;>;)TT;",
-        )
-        .unwrap();
+        let m =
+            signature_method_to_java("<T:Ljava/lang/Object;>(Ljava/util/List<TT;>;)TT;").unwrap();
         assert_eq!(m.type_params.as_deref(), Some("<T>"));
         assert_eq!(m.params, vec!["java.util.List<T>"]);
         assert_eq!(m.return_type, "T");

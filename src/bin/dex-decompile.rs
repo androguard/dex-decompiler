@@ -10,11 +10,10 @@ use colored::Colorize;
 use dex_decompiler::{
     build_deobf_rename_map, default_config, extract_android_manifest_from_apk, load_android_rules,
     load_dexes_from_path, load_dexes_from_paths, load_mapping_file, looks_like_text_xml,
-    mapping_format_from_path, save_mapping_file,
-    merge_rename_maps, parse_dex, scan_dex_parallel, scan_dex_semgrep_with_progress, scan_xml_semgrep,
-    scan_pending_intents_dex_parallel, solve_dexes, write_issues_json, DecompilationMode, Decompiler,
-    DecompilerOptions, DeobfuscateOptions, DexFile, EncodedMethod, RenameMap, SolveOptions,
-    TaintConfig,
+    mapping_format_from_path, merge_rename_maps, parse_dex, save_mapping_file, scan_dex_parallel,
+    scan_dex_semgrep_with_progress, scan_pending_intents_dex_parallel, scan_xml_semgrep,
+    solve_dexes, write_issues_json, DecompilationMode, Decompiler, DecompilerOptions,
+    DeobfuscateOptions, DexFile, EncodedMethod, RenameMap, SolveOptions, TaintConfig,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -61,7 +60,8 @@ fn build_rename_map(args: &Args, dexes: &[&DexFile]) -> Option<RenameMap> {
     }
     for s in &args.rename_package {
         if let Some((k, v)) = s.split_once('=') {
-            map.package.insert(k.trim().to_string(), v.trim().to_string());
+            map.package
+                .insert(k.trim().to_string(), v.trim().to_string());
             any = true;
         }
     }
@@ -73,7 +73,8 @@ fn build_rename_map(args: &Args, dexes: &[&DexFile]) -> Option<RenameMap> {
     }
     for s in &args.rename_method {
         if let Some((k, v)) = s.split_once('=') {
-            map.method.insert(k.trim().to_string(), v.trim().to_string());
+            map.method
+                .insert(k.trim().to_string(), v.trim().to_string());
             any = true;
         }
     }
@@ -203,16 +204,28 @@ fn run_emulate_verbose(emu: &mut dex_decompiler::emulator::Emulator) -> Result<(
             let heap_str: Vec<String> = snap
                 .heap
                 .iter()
-                .map(|h| {
-                    match &h.object {
-                        dex_decompiler::emulator::HeapObjectKind::Array { element_type, values } => {
-                            let vals: Vec<String> = values.iter().map(|v| v.display_short_hex()).take(5).collect();
-                            let more = if values.len() > 5 { "..." } else { "" };
-                            format!("@{}={}[{}]({}){}", h.index, element_type, values.len(), vals.join(", "), more)
-                        }
-                        dex_decompiler::emulator::HeapObjectKind::Instance { class, .. } => {
-                            format!("@{}={}", h.index, class)
-                        }
+                .map(|h| match &h.object {
+                    dex_decompiler::emulator::HeapObjectKind::Array {
+                        element_type,
+                        values,
+                    } => {
+                        let vals: Vec<String> = values
+                            .iter()
+                            .map(|v| v.display_short_hex())
+                            .take(5)
+                            .collect();
+                        let more = if values.len() > 5 { "..." } else { "" };
+                        format!(
+                            "@{}={}[{}]({}){}",
+                            h.index,
+                            element_type,
+                            values.len(),
+                            vals.join(", "),
+                            more
+                        )
+                    }
+                    dex_decompiler::emulator::HeapObjectKind::Instance { class, .. } => {
+                        format!("@{}={}", h.index, class)
                     }
                 })
                 .collect();
@@ -244,8 +257,15 @@ fn run_emulate_progress(emu: &mut dex_decompiler::emulator::Emulator) -> Result<
         pb.set_position(result.step_count as u64);
         let ins = &result.instruction;
         let regs = format_registers_short_hex(&result.state_after.registers);
-        let reg_short = if regs.len() > 60 { format!("{}...", &regs[..60]) } else { regs };
-        let msg = format!("0x{:04x} {} {} | {}", ins.offset, ins.mnemonic, ins.operands, reg_short);
+        let reg_short = if regs.len() > 60 {
+            format!("{}...", &regs[..60])
+        } else {
+            regs
+        };
+        let msg = format!(
+            "0x{:04x} {} {} | {}",
+            ins.offset, ins.mnemonic, ins.operands, reg_short
+        );
         pb.set_message(msg);
     }
     pb.finish_with_message(format!("Done ({} steps)", emu.step_count));
@@ -284,16 +304,28 @@ fn run_emulate_interactive(emu: &mut dex_decompiler::emulator::Emulator) -> Resu
             let heap_str: Vec<String> = snap
                 .heap
                 .iter()
-                .map(|h| {
-                    match &h.object {
-                        dex_decompiler::emulator::HeapObjectKind::Array { element_type, values } => {
-                            let vals: Vec<String> = values.iter().map(|v| v.display_short_hex()).take(5).collect();
-                            let more = if values.len() > 5 { "..." } else { "" };
-                            format!("@{}={}[{}]({}){}", h.index, element_type, values.len(), vals.join(", "), more)
-                        }
-                        dex_decompiler::emulator::HeapObjectKind::Instance { class, .. } => {
-                            format!("@{}={}", h.index, class)
-                        }
+                .map(|h| match &h.object {
+                    dex_decompiler::emulator::HeapObjectKind::Array {
+                        element_type,
+                        values,
+                    } => {
+                        let vals: Vec<String> = values
+                            .iter()
+                            .map(|v| v.display_short_hex())
+                            .take(5)
+                            .collect();
+                        let more = if values.len() > 5 { "..." } else { "" };
+                        format!(
+                            "@{}={}[{}]({}){}",
+                            h.index,
+                            element_type,
+                            values.len(),
+                            vals.join(", "),
+                            more
+                        )
+                    }
+                    dex_decompiler::emulator::HeapObjectKind::Instance { class, .. } => {
+                        format!("@{}={}", h.index, class)
                     }
                 })
                 .collect();
@@ -365,7 +397,12 @@ fn parse_array_token(token: &str) -> Option<(String, Vec<dex_decompiler::emulato
 /// Parse --emulate-params into (params, initial_heap). Supports int, long, string, null, and arrays:
 /// "[1,2,3]" = int array, "[B]0,1,2" or "[byte]0,1,2" = byte array. Arrays are pushed to initial_heap
 /// and params get Value::Ref(index).
-fn parse_emulate_params(s: &str) -> (Vec<dex_decompiler::emulator::Value>, Vec<dex_decompiler::emulator::HeapObject>) {
+fn parse_emulate_params(
+    s: &str,
+) -> (
+    Vec<dex_decompiler::emulator::Value>,
+    Vec<dex_decompiler::emulator::HeapObject>,
+) {
     use dex_decompiler::emulator::{HeapObject, HeapObjectKind, Value};
     let tokens = split_params_top_level(s);
     let mut params = Vec::new();
@@ -436,7 +473,12 @@ fn main() -> Result<()> {
         let max_steps = args.emulate_max_steps.unwrap_or(10_000);
         emu.max_steps = max_steps;
 
-        println!("{}", format!("=== Emulate {}#{} ===", class_name, method_name).cyan().bold());
+        println!(
+            "{}",
+            format!("=== Emulate {}#{} ===", class_name, method_name)
+                .cyan()
+                .bold()
+        );
         if !params.is_empty() {
             println!("{} {:?}", "Params:".dimmed(), params);
         }
@@ -484,7 +526,9 @@ fn main() -> Result<()> {
     if let Some(ref taint_method) = args.taint_method {
         let (class_name, method_name) = match taint_method.split_once('#') {
             Some((c, m)) => (c.trim(), m.trim()),
-            None => anyhow::bail!("--taint-method must be CLASS#METHOD (e.g. com.example.Main#onCreate)"),
+            None => anyhow::bail!(
+                "--taint-method must be CLASS#METHOD (e.g. com.example.Main#onCreate)"
+            ),
         };
         let mut encoded = None;
         let mut dex = None;
@@ -517,11 +561,18 @@ fn main() -> Result<()> {
             let title = format!("Value flow from API sources: {}", args.taint_api.join(", "));
             (result, title)
         } else if let (Some(taint_offset), Some(taint_reg)) = (
-            args.taint_offset.as_ref().and_then(|s| parse_offset(s).ok()),
+            args.taint_offset
+                .as_ref()
+                .and_then(|s| parse_offset(s).ok()),
             args.taint_reg,
         ) {
-            let result = owned.analysis().value_flow_from_seed(taint_offset, taint_reg);
-            let title = format!("Value flow from seed (offset=0x{:x}, reg=v{})", taint_offset, taint_reg);
+            let result = owned
+                .analysis()
+                .value_flow_from_seed(taint_offset, taint_reg);
+            let title = format!(
+                "Value flow from seed (offset=0x{:x}, reg=v{})",
+                taint_offset, taint_reg
+            );
             (result, title)
         } else {
             anyhow::bail!(
@@ -579,7 +630,8 @@ fn main() -> Result<()> {
             default_config()
         };
         if let Some(extra) = &args.taint_config_extra {
-            let more = TaintConfig::from_path(Path::new(extra)).context("load extra taint config")?;
+            let more =
+                TaintConfig::from_path(Path::new(extra)).context("load extra taint config")?;
             config.merge(more);
         }
         let mut opts = SolveOptions::default_android();
@@ -654,13 +706,7 @@ fn main() -> Result<()> {
                 .unwrap_or_default();
             println!(
                 "  [{}] {} — {}{}  {}#{}  sink @ 0x{:x}",
-                f.severity,
-                f.category,
-                f.title,
-                cwe,
-                f.class_name,
-                f.method_name,
-                f.sink_offset
+                f.severity, f.category, f.title, cwe, f.class_name, f.method_name, f.sink_offset
             );
             if !f.message.is_empty() {
                 println!("      {}", f.message.lines().next().unwrap_or(""));
@@ -693,12 +739,16 @@ fn main() -> Result<()> {
 
             // Plaintext XML / decoded AndroidManifest.xml input.
             if looks_like_text_xml(&data)
-                || p
-                    .extension()
+                || p.extension()
                     .and_then(|e| e.to_str())
                     .is_some_and(|e| e.eq_ignore_ascii_case("xml"))
             {
-                eprintln!("Semgrep (native): scanning XML {} ({} rule{})…", path, rules.len(), if rules.len() == 1 { "" } else { "s" });
+                eprintln!(
+                    "Semgrep (native): scanning XML {} ({} rule{})…",
+                    path,
+                    rules.len(),
+                    if rules.len() == 1 { "" } else { "s" }
+                );
                 if let Ok(text) = std::str::from_utf8(&data) {
                     all.extend(scan_xml_semgrep(text, path, &rules));
                 }
@@ -706,12 +756,9 @@ fn main() -> Result<()> {
             }
 
             eprintln!("Semgrep (native): loading DEX from {}…", path);
-            let dexes = load_dexes_from_path(p).with_context(|| format!("load DEX/APK {}", path))?;
-            eprintln!(
-                "Semgrep (native): {} DEX file(s) in {}",
-                dexes.len(),
-                path
-            );
+            let dexes =
+                load_dexes_from_path(p).with_context(|| format!("load DEX/APK {}", path))?;
+            eprintln!("Semgrep (native): {} DEX file(s) in {}", dexes.len(), path);
             for (dex_i, dex) in dexes.iter().enumerate() {
                 let label = if dexes.len() == 1 {
                     path.to_string()
@@ -775,11 +822,7 @@ fn main() -> Result<()> {
                         }
                     }
                 };
-                all.extend(scan_dex_semgrep_with_progress(
-                    dex,
-                    &rules,
-                    Some(progress),
-                ));
+                all.extend(scan_dex_semgrep_with_progress(dex, &rules, Some(progress)));
                 if let Some(pb) = pb {
                     pb.finish_with_message(format!("done ({label})"));
                 } else {
@@ -790,10 +833,7 @@ fn main() -> Result<()> {
             // XML/MASTG manifest rules need decoded text XML (APK stores binary AXML).
             if let Ok(manifest) = extract_android_manifest_from_apk(&data) {
                 if looks_like_text_xml(&manifest) {
-                    eprintln!(
-                        "Semgrep (native): scanning {}!AndroidManifest.xml…",
-                        path
-                    );
+                    eprintln!("Semgrep (native): scanning {}!AndroidManifest.xml…", path);
                     if let Ok(text) = std::str::from_utf8(&manifest) {
                         all.extend(scan_xml_semgrep(
                             text,
@@ -814,10 +854,7 @@ fn main() -> Result<()> {
                 if sibling.is_file() && sibling != p {
                     if let Ok(bytes) = fs::read(&sibling) {
                         if looks_like_text_xml(&bytes) {
-                            eprintln!(
-                                "Semgrep (native): scanning sibling {}…",
-                                sibling.display()
-                            );
+                            eprintln!("Semgrep (native): scanning sibling {}…", sibling.display());
                             if let Ok(text) = std::str::from_utf8(&bytes) {
                                 all.extend(scan_xml_semgrep(
                                     text,
@@ -842,13 +879,7 @@ fn main() -> Result<()> {
                 .unwrap_or_default();
             println!(
                 "  [{}] {}  {}#{}{}  {}  ({})",
-                f.severity,
-                f.rule_id,
-                f.class_name,
-                f.method_name,
-                off,
-                f.sink_desc,
-                f.match_kind
+                f.severity, f.rule_id, f.class_name, f.method_name, off, f.sink_desc, f.match_kind
             );
             if !f.message.is_empty() {
                 println!("      {}", f.message.lines().next().unwrap_or(""));
@@ -858,17 +889,11 @@ fn main() -> Result<()> {
     }
 
     // Decompile: DEX and/or APK inputs; multi-DEX merged into one output tree.
-    let owned_dexes = load_dexes_from_paths(
-        &args
-            .input
-            .iter()
-            .map(Path::new)
-            .collect::<Vec<_>>(),
-    )
-    .context("load DEX/APK inputs")?;
+    let owned_dexes = load_dexes_from_paths(&args.input.iter().map(Path::new).collect::<Vec<_>>())
+        .context("load DEX/APK inputs")?;
     let dex_refs: Vec<&DexFile> = owned_dexes.iter().collect();
-    let mode = parse_decompilation_mode(&args.decompilation_mode)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let mode =
+        parse_decompilation_mode(&args.decompilation_mode).map_err(|e| anyhow::anyhow!(e))?;
     let rename_map = build_rename_map(&args, &dex_refs);
     if let Some(ref save_path) = args.save_mapping {
         if let Some(ref map) = rename_map {
@@ -920,8 +945,7 @@ fn main() -> Result<()> {
             .ok()
             .and_then(|v| serde_json::to_string_pretty(&v).ok())
             .unwrap_or(combined);
-        fs::write(Path::new(json_path), pretty)
-            .with_context(|| format!("write {}", json_path))?;
+        fs::write(Path::new(json_path), pretty).with_context(|| format!("write {}", json_path))?;
         if args.output_dir.is_none() && args.output.is_none() {
             return Ok(());
         }
@@ -980,7 +1004,11 @@ fn main() -> Result<()> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "dex-decompile", version, about = "DEX to Java decompiler (pure Rust)")]
+#[command(
+    name = "dex-decompile",
+    version,
+    about = "DEX to Java decompiler (pure Rust)"
+)]
 struct Args {
     /// Input DEX and/or APK/ZIP path(s). APK entries yield all classes*.dex. May be repeated.
     #[arg(short, long, required = true, num_args = 1..)]
@@ -995,7 +1023,11 @@ struct Args {
     output_dir: Option<String>,
 
     /// Decompilation mode: restructure (default), simple, or fallback (jadx-like).
-    #[arg(short = 'm', long = "decompilation-mode", default_value = "restructure")]
+    #[arg(
+        short = 'm',
+        long = "decompilation-mode",
+        default_value = "restructure"
+    )]
     decompilation_mode: String,
 
     /// Disable use of DEX debug_info for local/parameter names.

@@ -13,7 +13,11 @@ impl Emulator {
                 step_count: self.step_count,
                 instruction: InstructionInfo {
                     index: self.pc.min(self.instructions.len().saturating_sub(1)),
-                    offset: self.instructions.get(self.pc).map(|i| i.offset).unwrap_or(0),
+                    offset: self
+                        .instructions
+                        .get(self.pc)
+                        .map(|i| i.offset)
+                        .unwrap_or(0),
                     mnemonic: "nop".into(),
                     operands: String::new(),
                 },
@@ -87,75 +91,53 @@ impl Emulator {
                 Ok("nop".into())
             }
 
-            "const/4" | "const/16" | "const" | "const/high16" => {
-                self.exec_const(resolved)
-            }
+            "const/4" | "const/16" | "const" | "const/high16" => self.exec_const(resolved),
             "const-wide/16" | "const-wide/32" | "const-wide" | "const-wide/high16" => {
                 self.exec_const_wide(resolved)
             }
-            "const-string" | "const-string/jumbo" => {
-                self.exec_const_string(resolved)
-            }
+            "const-string" | "const-string/jumbo" => self.exec_const_string(resolved),
 
-            "move" | "move/from16" | "move/16"
-            | "move-wide" | "move-wide/from16" | "move-wide/16"
-            | "move-object" | "move-object/from16" | "move-object/16" => {
+            "move" | "move/from16" | "move/16" | "move-wide" | "move-wide/from16"
+            | "move-wide/16" | "move-object" | "move-object/from16" | "move-object/16" => {
                 self.exec_move(resolved)
             }
             "move-result" | "move-result-wide" | "move-result-object" => {
                 self.exec_move_result(resolved)
             }
-            "move-exception" => {
-                self.exec_move_exception(resolved)
-            }
+            "move-exception" => self.exec_move_exception(resolved),
 
             "return-void" => {
                 self.finished = true;
                 self.return_value = None;
                 Ok("return void".into())
             }
-            "return" | "return-wide" | "return-object" => {
-                self.exec_return(resolved)
-            }
+            "return" | "return-wide" | "return-object" => self.exec_return(resolved),
 
-            "add-int" | "sub-int" | "mul-int" | "div-int" | "rem-int"
-            | "and-int" | "or-int" | "xor-int"
-            | "shl-int" | "shr-int" | "ushr-int" => {
-                self.exec_binop_int(m, resolved)
-            }
-            "add-int/2addr" | "sub-int/2addr" | "mul-int/2addr" | "div-int/2addr" | "rem-int/2addr"
-            | "and-int/2addr" | "or-int/2addr" | "xor-int/2addr"
+            "add-int" | "sub-int" | "mul-int" | "div-int" | "rem-int" | "and-int" | "or-int"
+            | "xor-int" | "shl-int" | "shr-int" | "ushr-int" => self.exec_binop_int(m, resolved),
+            "add-int/2addr" | "sub-int/2addr" | "mul-int/2addr" | "div-int/2addr"
+            | "rem-int/2addr" | "and-int/2addr" | "or-int/2addr" | "xor-int/2addr"
             | "shl-int/2addr" | "shr-int/2addr" | "ushr-int/2addr" => {
                 self.exec_binop_int_2addr(m, resolved)
             }
-            "add-int/lit8" | "add-int/lit16"
-            | "rsub-int" | "rsub-int/lit8"
-            | "mul-int/lit8" | "mul-int/lit16"
-            | "div-int/lit8" | "div-int/lit16"
-            | "rem-int/lit8" | "rem-int/lit16"
-            | "and-int/lit8" | "and-int/lit16"
-            | "or-int/lit8" | "or-int/lit16"
-            | "xor-int/lit8" | "xor-int/lit16"
-            | "shl-int/lit8" | "shr-int/lit8" | "ushr-int/lit8" => {
-                self.exec_binop_int_lit(m, resolved)
-            }
+            "add-int/lit8" | "add-int/lit16" | "rsub-int" | "rsub-int/lit8" | "mul-int/lit8"
+            | "mul-int/lit16" | "div-int/lit8" | "div-int/lit16" | "rem-int/lit8"
+            | "rem-int/lit16" | "and-int/lit8" | "and-int/lit16" | "or-int/lit8"
+            | "or-int/lit16" | "xor-int/lit8" | "xor-int/lit16" | "shl-int/lit8"
+            | "shr-int/lit8" | "ushr-int/lit8" => self.exec_binop_int_lit(m, resolved),
 
-            "add-long" | "sub-long" | "mul-long" | "div-long" | "rem-long"
-            | "and-long" | "or-long" | "xor-long"
-            | "add-long/2addr" | "sub-long/2addr" | "mul-long/2addr" | "div-long/2addr" | "rem-long/2addr"
-            | "and-long/2addr" | "or-long/2addr" | "xor-long/2addr" => {
-                self.exec_binop_long(m, resolved)
-            }
+            "add-long" | "sub-long" | "mul-long" | "div-long" | "rem-long" | "and-long"
+            | "or-long" | "xor-long" | "add-long/2addr" | "sub-long/2addr" | "mul-long/2addr"
+            | "div-long/2addr" | "rem-long/2addr" | "and-long/2addr" | "or-long/2addr"
+            | "xor-long/2addr" => self.exec_binop_long(m, resolved),
 
             "add-float" | "sub-float" | "mul-float" | "div-float" | "rem-float"
-            | "add-float/2addr" | "sub-float/2addr" | "mul-float/2addr" | "div-float/2addr" | "rem-float/2addr" => {
-                self.exec_binop_float(m, resolved)
-            }
+            | "add-float/2addr" | "sub-float/2addr" | "mul-float/2addr" | "div-float/2addr"
+            | "rem-float/2addr" => self.exec_binop_float(m, resolved),
 
             "add-double" | "sub-double" | "mul-double" | "div-double" | "rem-double"
-            | "add-double/2addr" | "sub-double/2addr" | "mul-double/2addr" | "div-double/2addr" | "rem-double/2addr" => {
-                self.exec_binop_double(m, resolved)
-            }
+            | "add-double/2addr" | "sub-double/2addr" | "mul-double/2addr" | "div-double/2addr"
+            | "rem-double/2addr" => self.exec_binop_double(m, resolved),
 
             "neg-int" => self.exec_unary_int(resolved, |a| -a, "neg"),
             "not-int" => self.exec_unary_int(resolved, |a| !a, "not"),
@@ -176,39 +158,33 @@ impl Emulator {
                 self.exec_if_zero(m, &ins.operands)
             }
 
-            "goto" | "goto/16" | "goto/32" => {
-                self.exec_goto(m, &ins.operands)
-            }
+            "goto" | "goto/16" | "goto/32" => self.exec_goto(m, &ins.operands),
 
             "new-array" => self.exec_new_array(resolved),
-            "aget" | "aget-wide" | "aget-object" | "aget-boolean" | "aget-byte" | "aget-char" | "aget-short" => {
-                self.exec_aget(resolved)
-            }
-            "aput" | "aput-wide" | "aput-object" | "aput-boolean" | "aput-byte" | "aput-char" | "aput-short" => {
-                self.exec_aput(resolved)
-            }
+            "aget" | "aget-wide" | "aget-object" | "aget-boolean" | "aget-byte" | "aget-char"
+            | "aget-short" => self.exec_aget(resolved),
+            "aput" | "aput-wide" | "aput-object" | "aput-boolean" | "aput-byte" | "aput-char"
+            | "aput-short" => self.exec_aput(resolved),
             "array-length" => self.exec_array_length(resolved),
 
             "new-instance" => self.exec_new_instance(resolved),
 
-            "sget" | "sget-wide" | "sget-object" | "sget-boolean" | "sget-byte" | "sget-char" | "sget-short" => {
-                self.exec_sget(resolved)
-            }
-            "sput" | "sput-wide" | "sput-object" | "sput-boolean" | "sput-byte" | "sput-char" | "sput-short" => {
+            "sget" | "sget-wide" | "sget-object" | "sget-boolean" | "sget-byte" | "sget-char"
+            | "sget-short" => self.exec_sget(resolved),
+            "sput" | "sput-wide" | "sput-object" | "sput-boolean" | "sput-byte" | "sput-char"
+            | "sput-short" => {
                 self.pc += 1;
                 Ok(format!("sput {}", resolved))
             }
-            "iget" | "iget-wide" | "iget-object" | "iget-boolean" | "iget-byte" | "iget-char" | "iget-short" => {
-                self.exec_iget(resolved)
-            }
-            "iput" | "iput-wide" | "iput-object" | "iput-boolean" | "iput-byte" | "iput-char" | "iput-short" => {
+            "iget" | "iget-wide" | "iget-object" | "iget-boolean" | "iget-byte" | "iget-char"
+            | "iget-short" => self.exec_iget(resolved),
+            "iput" | "iput-wide" | "iput-object" | "iput-boolean" | "iput-byte" | "iput-char"
+            | "iput-short" => {
                 self.pc += 1;
                 Ok(format!("iput {}", resolved))
             }
 
-            m if m.starts_with("invoke-") => {
-                self.exec_invoke(resolved)
-            }
+            m if m.starts_with("invoke-") => self.exec_invoke(resolved),
 
             "fill-array-data" | "filled-new-array" | "filled-new-array/range" => {
                 self.pc += 1;
@@ -223,11 +199,9 @@ impl Emulator {
                 Ok(format!("throw v{}", reg))
             }
 
-            "check-cast" | "instance-of" | "monitor-enter" | "monitor-exit"
-            | "packed-switch" | "sparse-switch"
-            | "cmpg-float" | "cmpl-float" | "cmpg-double" | "cmpl-double" | "cmp-long" => {
-                self.exec_compare_or_stub(m, &ins.operands, resolved)
-            }
+            "check-cast" | "instance-of" | "monitor-enter" | "monitor-exit" | "packed-switch"
+            | "sparse-switch" | "cmpg-float" | "cmpl-float" | "cmpg-double" | "cmpl-double"
+            | "cmp-long" => self.exec_compare_or_stub(m, &ins.operands, resolved),
 
             _ => {
                 self.pc += 1;
@@ -276,7 +250,10 @@ impl Emulator {
 
     fn exec_move_result(&mut self, ops: &str) -> Result<String, EmulatorError> {
         let reg = parse_single_reg(&ops)?;
-        let val = self.last_invoke_result.take().unwrap_or(Value::Unknown("move-result".into()));
+        let val = self
+            .last_invoke_result
+            .take()
+            .unwrap_or(Value::Unknown("move-result".into()));
         let desc = format!("v{} = {}", reg, val.display_short());
         self.set_reg(reg, val)?;
         self.pc += 1;
@@ -307,7 +284,14 @@ impl Emulator {
         let result = self.int_op(mnemonic, va, vb)?;
         self.set_reg(dst, Value::Int(result))?;
         self.pc += 1;
-        Ok(format!("v{} = {} {} {} = {}", dst, va, op_symbol(mnemonic), vb, result))
+        Ok(format!(
+            "v{} = {} {} {} = {}",
+            dst,
+            va,
+            op_symbol(mnemonic),
+            vb,
+            result
+        ))
     }
 
     fn exec_binop_int_2addr(&mut self, mnemonic: &str, ops: &str) -> Result<String, EmulatorError> {
@@ -318,7 +302,14 @@ impl Emulator {
         let result = self.int_op(base, va, vb)?;
         self.set_reg(dst, Value::Int(result))?;
         self.pc += 1;
-        Ok(format!("v{} = {} {} {} = {}", dst, va, op_symbol(base), vb, result))
+        Ok(format!(
+            "v{} = {} {} {} = {}",
+            dst,
+            va,
+            op_symbol(base),
+            vb,
+            result
+        ))
     }
 
     fn exec_binop_int_lit(&mut self, mnemonic: &str, ops: &str) -> Result<String, EmulatorError> {
@@ -333,7 +324,14 @@ impl Emulator {
         };
         self.set_reg(dst, Value::Int(result))?;
         self.pc += 1;
-        Ok(format!("v{} = {} {} {} = {}", dst, va, op_symbol(base_op), lit_i, result))
+        Ok(format!(
+            "v{} = {} {} {} = {}",
+            dst,
+            va,
+            op_symbol(base_op),
+            lit_i,
+            result
+        ))
     }
 
     fn int_op(&self, mnemonic: &str, a: i32, b: i32) -> Result<i32, EmulatorError> {
@@ -342,11 +340,15 @@ impl Emulator {
             "sub-int" => a.wrapping_sub(b),
             "mul-int" => a.wrapping_mul(b),
             "div-int" => {
-                if b == 0 { return Err(EmulatorError::DivisionByZero(self.pc)); }
+                if b == 0 {
+                    return Err(EmulatorError::DivisionByZero(self.pc));
+                }
                 a.wrapping_div(b)
             }
             "rem-int" => {
-                if b == 0 { return Err(EmulatorError::DivisionByZero(self.pc)); }
+                if b == 0 {
+                    return Err(EmulatorError::DivisionByZero(self.pc));
+                }
                 a.wrapping_rem(b)
             }
             "and-int" => a & b,
@@ -427,7 +429,12 @@ impl Emulator {
     }
 
     // ---- unary / conversion ----
-    fn exec_unary_int<F: Fn(i32) -> i32>(&mut self, ops: &str, f: F, label: &str) -> Result<String, EmulatorError> {
+    fn exec_unary_int<F: Fn(i32) -> i32>(
+        &mut self,
+        ops: &str,
+        f: F,
+        label: &str,
+    ) -> Result<String, EmulatorError> {
         let (dst, src) = parse_two_regs(&ops)?;
         let va = self.get_reg(src)?.as_int().unwrap_or(0);
         let r = f(va);
@@ -505,7 +512,15 @@ impl Emulator {
             "if-le" => va <= vb,
             _ => false,
         };
-        let desc = format!("if v{}({}) {} v{}({}) → {}", ra, va, cond_symbol(mnemonic), rb, vb, taken);
+        let desc = format!(
+            "if v{}({}) {} v{}({}) → {}",
+            ra,
+            va,
+            cond_symbol(mnemonic),
+            rb,
+            vb,
+            taken
+        );
         if taken {
             self.jump_by_offset(offset);
         } else {
@@ -559,7 +574,10 @@ impl Emulator {
             self.pc = idx;
         } else {
             // Fallback: find nearest instruction at or after target.
-            let nearest = self.instructions.iter().position(|i| i.offset >= target_byte);
+            let nearest = self
+                .instructions
+                .iter()
+                .position(|i| i.offset >= target_byte);
             self.pc = nearest.unwrap_or(self.instructions.len());
             if self.pc >= self.instructions.len() {
                 self.finished = true;
@@ -586,7 +604,10 @@ impl Emulator {
         });
         self.set_reg(dst, Value::Ref(heap_idx))?;
         self.pc += 1;
-        Ok(format!("v{} = new {}[{}] → @{}", dst, type_name, size, heap_idx))
+        Ok(format!(
+            "v{} = new {}[{}] → @{}",
+            dst, type_name, size, heap_idx
+        ))
     }
 
     fn exec_aget(&mut self, ops: &str) -> Result<String, EmulatorError> {
@@ -598,12 +619,22 @@ impl Emulator {
                 if let Some(obj) = self.heap.get(heap_idx) {
                     if let HeapObjectKind::Array { ref values, .. } = obj.kind {
                         if idx < 0 || idx as usize >= values.len() {
-                            return Err(EmulatorError::ArrayIndexOutOfBounds(self.pc, idx, values.len()));
+                            return Err(EmulatorError::ArrayIndexOutOfBounds(
+                                self.pc,
+                                idx,
+                                values.len(),
+                            ));
                         }
                         let val = values[idx as usize].clone();
                         self.set_reg(dst, val.clone())?;
                         self.pc += 1;
-                        return Ok(format!("v{} = @{}[{}] = {}", dst, heap_idx, idx, val.display_short()));
+                        return Ok(format!(
+                            "v{} = @{}[{}] = {}",
+                            dst,
+                            heap_idx,
+                            idx,
+                            val.display_short()
+                        ));
                     }
                 }
                 self.set_reg(dst, Value::Unknown("aget".into()))?;
@@ -613,7 +644,11 @@ impl Emulator {
             _ => {
                 self.set_reg(dst, Value::Unknown("aget".into()))?;
                 self.pc += 1;
-                Ok(format!("v{} = aget (non-ref: {})", dst, arr_val.display_short()))
+                Ok(format!(
+                    "v{} = aget (non-ref: {})",
+                    dst,
+                    arr_val.display_short()
+                ))
             }
         }
     }
@@ -628,7 +663,11 @@ impl Emulator {
                 if let Some(obj) = self.heap.get_mut(heap_idx) {
                     if let HeapObjectKind::Array { ref mut values, .. } = obj.kind {
                         if idx < 0 || idx as usize >= values.len() {
-                            return Err(EmulatorError::ArrayIndexOutOfBounds(self.pc, idx, values.len()));
+                            return Err(EmulatorError::ArrayIndexOutOfBounds(
+                                self.pc,
+                                idx,
+                                values.len(),
+                            ));
                         }
                         values[idx as usize] = val.clone();
                         self.pc += 1;
@@ -653,8 +692,12 @@ impl Emulator {
                 if let Some(obj) = self.heap.get(heap_idx) {
                     if let HeapObjectKind::Array { ref values, .. } = obj.kind {
                         values.len() as i32
-                    } else { 0 }
-                } else { 0 }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
             }
             _ => 0,
         };
@@ -727,7 +770,12 @@ impl Emulator {
         Ok(format!("invoke {} (no stub)", method_sig))
     }
 
-    fn exec_compare_or_stub(&mut self, mnemonic: &str, ops: &str, _resolved: &str) -> Result<String, EmulatorError> {
+    fn exec_compare_or_stub(
+        &mut self,
+        mnemonic: &str,
+        ops: &str,
+        _resolved: &str,
+    ) -> Result<String, EmulatorError> {
         match mnemonic {
             "cmp-long" | "cmpl-float" | "cmpg-float" | "cmpl-double" | "cmpg-double" => {
                 let (dst, a, b) = parse_three_regs_str(ops)?;
@@ -740,12 +788,24 @@ impl Emulator {
                     "cmpl-float" | "cmpg-float" => {
                         let va = get_float(&self.registers, a);
                         let vb = get_float(&self.registers, b);
-                        if va < vb { -1 } else if va > vb { 1 } else { 0 }
+                        if va < vb {
+                            -1
+                        } else if va > vb {
+                            1
+                        } else {
+                            0
+                        }
                     }
                     "cmpl-double" | "cmpg-double" => {
                         let va = get_double(&self.registers, a);
                         let vb = get_double(&self.registers, b);
-                        if va < vb { -1 } else if va > vb { 1 } else { 0 }
+                        if va < vb {
+                            -1
+                        } else if va > vb {
+                            1
+                        } else {
+                            0
+                        }
                     }
                     _ => 0,
                 };
@@ -767,7 +827,10 @@ fn parse_reg(s: &str) -> Result<u32, EmulatorError> {
     let s = s.trim();
     s.strip_prefix('v')
         .and_then(|n| n.parse().ok())
-        .ok_or(EmulatorError::Unsupported(0, format!("expected register, got '{}'", s)))
+        .ok_or(EmulatorError::Unsupported(
+            0,
+            format!("expected register, got '{}'", s),
+        ))
 }
 
 fn parse_single_reg(ops: &str) -> Result<u32, EmulatorError> {
@@ -778,7 +841,10 @@ fn parse_single_reg(ops: &str) -> Result<u32, EmulatorError> {
 fn parse_two_regs(ops: &str) -> Result<(u32, u32), EmulatorError> {
     let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
     if parts.len() < 2 {
-        return Err(EmulatorError::Unsupported(0, format!("expected 2 regs: '{}'", ops)));
+        return Err(EmulatorError::Unsupported(
+            0,
+            format!("expected 2 regs: '{}'", ops),
+        ));
     }
     Ok((parse_reg(parts[0])?, parse_reg(parts[1])?))
 }
@@ -786,9 +852,16 @@ fn parse_two_regs(ops: &str) -> Result<(u32, u32), EmulatorError> {
 fn parse_three_regs_str(ops: &str) -> Result<(u32, u32, u32), EmulatorError> {
     let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
     if parts.len() < 3 {
-        return Err(EmulatorError::Unsupported(0, format!("expected 3 regs: '{}'", ops)));
+        return Err(EmulatorError::Unsupported(
+            0,
+            format!("expected 3 regs: '{}'", ops),
+        ));
     }
-    Ok((parse_reg(parts[0])?, parse_reg(parts[1])?, parse_reg(parts[2])?))
+    Ok((
+        parse_reg(parts[0])?,
+        parse_reg(parts[1])?,
+        parse_reg(parts[2])?,
+    ))
 }
 
 fn parse_literal(s: &str) -> i64 {
@@ -856,7 +929,10 @@ fn branch_offset_signed(mnemonic: &str, raw: i64) -> i64 {
 fn parse_reg_and_literal(ops: &str) -> Result<(u32, i64), EmulatorError> {
     let parts: Vec<&str> = ops.splitn(2, ',').map(str::trim).collect();
     if parts.len() < 2 {
-        return Err(EmulatorError::Unsupported(0, format!("expected reg,lit: '{}'", ops)));
+        return Err(EmulatorError::Unsupported(
+            0,
+            format!("expected reg,lit: '{}'", ops),
+        ));
     }
     Ok((parse_reg(parts[0])?, parse_literal(parts[1])))
 }
@@ -864,9 +940,16 @@ fn parse_reg_and_literal(ops: &str) -> Result<(u32, i64), EmulatorError> {
 fn parse_two_regs_and_literal(ops: &str) -> Result<(u32, u32, i64), EmulatorError> {
     let parts: Vec<&str> = ops.splitn(3, ',').map(str::trim).collect();
     if parts.len() < 3 {
-        return Err(EmulatorError::Unsupported(0, format!("expected reg,reg,lit: '{}'", ops)));
+        return Err(EmulatorError::Unsupported(
+            0,
+            format!("expected reg,reg,lit: '{}'", ops),
+        ));
     }
-    Ok((parse_reg(parts[0])?, parse_reg(parts[1])?, parse_literal(parts[2])))
+    Ok((
+        parse_reg(parts[0])?,
+        parse_reg(parts[1])?,
+        parse_literal(parts[2]),
+    ))
 }
 
 fn op_symbol(m: &str) -> &str {
@@ -905,11 +988,15 @@ fn long_op(base: &str, a: i64, b: i64, pc: usize) -> Result<i64, EmulatorError> 
         "sub-int" => a.wrapping_sub(b),
         "mul-int" => a.wrapping_mul(b),
         "div-int" => {
-            if b == 0 { return Err(EmulatorError::DivisionByZero(pc)); }
+            if b == 0 {
+                return Err(EmulatorError::DivisionByZero(pc));
+            }
             a.wrapping_div(b)
         }
         "rem-int" => {
-            if b == 0 { return Err(EmulatorError::DivisionByZero(pc)); }
+            if b == 0 {
+                return Err(EmulatorError::DivisionByZero(pc));
+            }
             a.wrapping_rem(b)
         }
         "and-int" => a & b,

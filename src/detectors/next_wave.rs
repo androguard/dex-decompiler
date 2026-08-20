@@ -120,7 +120,13 @@ pub fn scan_activity_result_grant(
             class_name,
             method_name,
             "activity_result_grant_smuggle",
-            &["getData", "getDataString", "getClipData", "getParcelableExtra", "Intent"],
+            &[
+                "getData",
+                "getDataString",
+                "getClipData",
+                "getParcelableExtra",
+                "Intent",
+            ],
             &[
                 "setResult",
                 "addFlags",
@@ -180,7 +186,12 @@ pub fn scan_intent_sanitizer_gap(
         class_name,
         method_name,
         "intent_redirect_no_sanitizer",
-        &["startActivity", "startActivityForResult", "startService", "bindService"],
+        &[
+            "startActivity",
+            "startActivityForResult",
+            "startService",
+            "bindService",
+        ],
     )
 }
 
@@ -261,7 +272,12 @@ pub fn scan_webview_postmessage(
         method_name,
         "webview_postmessage",
         USER_SOURCES,
-        &["evaluateJavascript", "postMessage", "loadData", "loadDataWithBaseURL"],
+        &[
+            "evaluateJavascript",
+            "postMessage",
+            "loadData",
+            "loadDataWithBaseURL",
+        ],
     );
     let has_bridge = owned
         .invoke_method_map

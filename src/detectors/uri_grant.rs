@@ -58,7 +58,10 @@ pub fn scan_uri_grant(
             .invoke_method_map
             .values()
             .any(|m| m.contains("setResult"));
-        let has_get_intent = owned.invoke_method_map.values().any(|m| m.contains("getIntent"))
+        let has_get_intent = owned
+            .invoke_method_map
+            .values()
+            .any(|m| m.contains("getIntent"))
             || owned
                 .api_return_sources
                 .iter()

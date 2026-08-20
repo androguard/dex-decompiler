@@ -4,8 +4,13 @@ use crate::decompile::value_flow::ValueFlowAnalysisOwned;
 use crate::detectors::types::{source_sink_scan, VulnFinding};
 
 const LOGGING_SINKS: &[&str] = &[
-    "Log.d", "Log.i", "Log.e", "Log.w", "Log.v",
-    "println", "print",
+    "Log.d",
+    "Log.i",
+    "Log.e",
+    "Log.w",
+    "Log.v",
+    "println",
+    "print",
     "FileWriter",
     "FileWriter.<init>",
     "FileWriter.write",

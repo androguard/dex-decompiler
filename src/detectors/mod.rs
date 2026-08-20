@@ -168,6 +168,40 @@ pub fn class_matches_prefixes(class_name: &str, prefixes: &[String]) -> bool {
         .any(|p| class_name == p.as_str() || class_name.starts_with(&format!("{p}.")))
 }
 
+/// True when `class_name` matches any of the exclude regular expressions.
+pub fn class_matches_exclude_regexps(class_name: &str, exclude_regexps: &[String]) -> bool {
+    if exclude_regexps.is_empty() {
+        return false;
+    }
+    exclude_regexps.iter().any(|pat| {
+        let pat = pat.trim();
+        if pat.is_empty() {
+            return false;
+        }
+        regex::Regex::new(pat)
+            .map(|re| re.is_match(class_name))
+            .unwrap_or(false)
+    })
+}
+
+/// Compile exclude patterns once; invalid patterns are skipped (logged by caller if needed).
+pub fn compile_exclude_regexps(patterns: &[String]) -> Vec<regex::Regex> {
+    patterns
+        .iter()
+        .filter_map(|pat| {
+            let pat = pat.trim();
+            if pat.is_empty() {
+                return None;
+            }
+            regex::Regex::new(pat).ok()
+        })
+        .collect()
+}
+
+fn class_excluded(class_name: &str, excludes: &[regex::Regex]) -> bool {
+    excludes.iter().any(|re| re.is_match(class_name))
+}
+
 /// One method with enough metadata to run detectors in parallel.
 #[derive(Clone)]
 struct MethodJob {
@@ -177,21 +211,42 @@ struct MethodJob {
 }
 
 fn collect_method_jobs(dex: &DexFile) -> Vec<MethodJob> {
-    collect_method_jobs_scoped(dex, None)
+    collect_method_jobs_scoped(dex, None, &[])
 }
 
-/// Number of non-library (and optionally prefix-scoped) methods with code.
+/// Number of non-library (and optionally prefix/exclude-scoped) methods with code.
 pub fn count_method_jobs_scoped(dex: &DexFile, prefixes: Option<&[String]>) -> usize {
-    collect_method_jobs_scoped(dex, prefixes).len()
+    count_method_jobs_scoped_ex(dex, prefixes, &[])
 }
 
-fn collect_method_jobs_scoped(dex: &DexFile, prefixes: Option<&[String]>) -> Vec<MethodJob> {
+/// Like [`count_method_jobs_scoped`] with package-exclude regexps.
+pub fn count_method_jobs_scoped_ex(
+    dex: &DexFile,
+    prefixes: Option<&[String]>,
+    exclude_regexps: &[String],
+) -> usize {
+    let excludes = compile_exclude_regexps(exclude_regexps);
+    collect_method_jobs_scoped(dex, prefixes, &excludes).len()
+}
+
+fn collect_method_jobs_scoped(
+    dex: &DexFile,
+    prefixes: Option<&[String]>,
+    excludes: &[regex::Regex],
+) -> Vec<MethodJob> {
     let mut jobs = Vec::new();
     for class_result in dex.class_defs() {
-        let Ok(class_def) = class_result else { continue };
-        let Ok(class_type) = dex.get_type(class_def.class_idx) else { continue };
+        let Ok(class_def) = class_result else {
+            continue;
+        };
+        let Ok(class_type) = dex.get_type(class_def.class_idx) else {
+            continue;
+        };
         let class_name = descriptor_to_java(&class_type);
         if is_library_class(&class_name) {
+            continue;
+        }
+        if class_excluded(&class_name, excludes) {
             continue;
         }
         if let Some(prefs) = prefixes {
@@ -199,7 +254,9 @@ fn collect_method_jobs_scoped(dex: &DexFile, prefixes: Option<&[String]>) -> Vec
                 continue;
             }
         }
-        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else {
+            continue;
+        };
         for encoded in class_data
             .direct_methods
             .iter()
@@ -231,10 +288,19 @@ pub fn run_all_detectors(
     let mut all = Vec::new();
     all.extend(scan_intent_spoofing(owned, class_name, method_name));
     all.extend(scan_intent_redirect(owned, class_name, method_name));
-    all.extend(scan_broadcast_intent_redirect(owned, class_name, method_name));
+    all.extend(scan_broadcast_intent_redirect(
+        owned,
+        class_name,
+        method_name,
+    ));
     all.extend(scan_command_receiver(owned, class_name, method_name));
     all.extend(scan_rce_dynamic_loading(owned, class_name, method_name));
-    all.extend(scan_insecure_logging(owned, class_name, method_name, logging_sources));
+    all.extend(scan_insecure_logging(
+        owned,
+        class_name,
+        method_name,
+        logging_sources,
+    ));
     all.extend(scan_sql_injection(owned, class_name, method_name));
     all.extend(scan_webview_unsafe(owned, class_name, method_name));
     all.extend(scan_custom_tabs(owned, class_name, method_name));
@@ -281,21 +347,21 @@ pub fn run_all_detectors(
 /// Parallel scan of every method with code in `dex` using the standard detectors.
 ///
 /// Each rayon worker creates its own [`Decompiler`] (`!Sync` caches).
-pub fn scan_dex_parallel(
-    dex: &DexFile,
-    logging_sources: Option<&[String]>,
-) -> Vec<VulnFinding> {
-    scan_dex_parallel_scoped(dex, logging_sources, None)
+/// Parallel scan over every method with code in `dex`.
+pub fn scan_dex_parallel(dex: &DexFile, logging_sources: Option<&[String]>) -> Vec<VulnFinding> {
+    scan_dex_parallel_scoped(dex, logging_sources, None, &[])
 }
 
 /// Like [`scan_dex_parallel`], but only methods whose class matches `class_prefixes`
-/// (when non-empty / `Some`).
+/// (when non-empty / `Some`) and does not match `exclude_regexps`.
 pub fn scan_dex_parallel_scoped(
     dex: &DexFile,
     logging_sources: Option<&[String]>,
     class_prefixes: Option<&[String]>,
+    exclude_regexps: &[String],
 ) -> Vec<VulnFinding> {
-    let jobs = collect_method_jobs_scoped(dex, class_prefixes);
+    let excludes = compile_exclude_regexps(exclude_regexps);
+    let jobs = collect_method_jobs_scoped(dex, class_prefixes, &excludes);
     let logging = logging_sources.map(|s| s.to_vec());
     jobs.par_iter()
         .flat_map(|job| {
@@ -315,15 +381,17 @@ pub fn scan_dex_parallel_scoped(
 
 /// Parallel PendingIntent scan over every method with code in `dex`.
 pub fn scan_pending_intents_dex_parallel(dex: &DexFile) -> Vec<PendingIntentFinding> {
-    scan_pending_intents_dex_parallel_scoped(dex, None)
+    scan_pending_intents_dex_parallel_scoped(dex, None, &[])
 }
 
 /// Scoped variant of [`scan_pending_intents_dex_parallel`].
 pub fn scan_pending_intents_dex_parallel_scoped(
     dex: &DexFile,
     class_prefixes: Option<&[String]>,
+    exclude_regexps: &[String],
 ) -> Vec<PendingIntentFinding> {
-    let jobs = collect_method_jobs_scoped(dex, class_prefixes);
+    let excludes = compile_exclude_regexps(exclude_regexps);
+    let jobs = collect_method_jobs_scoped(dex, class_prefixes, &excludes);
     jobs.par_iter()
         .flat_map(|job| {
             let decompiler = Decompiler::new(dex);
@@ -357,7 +425,9 @@ mod library_class_tests {
     #[test]
     fn insecurebankv2_is_app_not_library() {
         assert!(!is_library_class("com.android.insecurebankv2"));
-        assert!(!is_library_class("com.android.insecurebankv2.LoginActivity"));
+        assert!(!is_library_class(
+            "com.android.insecurebankv2.LoginActivity"
+        ));
         assert!(is_com_android_lab_app("com.android.insecurebankv2.DoLogin"));
     }
 
@@ -365,7 +435,8 @@ mod library_class_tests {
     fn lab_allowlist_is_package_boundary() {
         // Must not match a longer sibling under a different package name.
         assert!(is_library_class("com.android.insecurebankv2evil.Foo"));
-        assert!(!is_com_android_lab_app("com.android.insecurebankv2evil.Foo"));
+        assert!(!is_com_android_lab_app(
+            "com.android.insecurebankv2evil.Foo"
+        ));
     }
 }
-

@@ -5,6 +5,7 @@
 //! just to flow taint through `Child.foo` via a `Base` invoke is heavier than the
 //! extra coverage it would add.
 
+use dex_decompiler::taint::Port;
 use dex_decompiler::{default_config, TaintConfig};
 
 #[test]
@@ -42,6 +43,9 @@ fn sanitizer_and_propagation_lookup() {
     let cfg = default_config();
     assert!(cfg.find_sanitizer("MessageDigest.digest").is_some());
     assert!(!cfg.find_propagations("StringBuilder.append").is_empty());
+    assert!(!cfg
+        .find_propagations("java.lang.String.getBytes()[B")
+        .is_empty());
 }
 
 #[test]
@@ -55,7 +59,9 @@ fn tightened_default_source_sink_patterns() {
         cfg.find_source("android.widget.TextView.getText").is_none(),
         "bare/TextView getText must not be a UserInput source"
     );
-    assert!(cfg.find_source("android.content.ClipboardManager.getText").is_some());
+    assert!(cfg
+        .find_source("android.content.ClipboardManager.getText")
+        .is_some());
 
     assert!(cfg.find_sink("android.webkit.WebView.loadUrl").is_some());
     assert!(
@@ -63,17 +69,37 @@ fn tightened_default_source_sink_patterns() {
         "unqualified loadUrl must not be ExecuteJavascript"
     );
 
-    assert!(cfg.find_source("android.content.ContentResolver.query").is_some());
+    assert!(cfg
+        .find_source("android.content.ContentResolver.query")
+        .is_some());
     assert!(
         cfg.find_source("com.foo.DbHelper.query").is_none(),
         "bare query must not be a ProviderUserInput source"
     );
+    assert!(cfg
+        .find_sources(
+            "com.foo.Receiver.onReceive(Landroid/content/Context;Landroid/content/Intent;)V"
+        )
+        .iter()
+        .any(|s| {
+            s.kind == "ReceiverUserInput" && matches!(s.port, Port::Argument { index: 2 })
+        }));
+    assert!(
+        cfg.find_sources("com.foo.Helper.onReceiveEvent(Ljava/lang/String;)V")
+            .is_empty(),
+        "callback patterns must require an exact method boundary"
+    );
+    assert!(cfg
+        .find_source("android.os.PersistableBundle.getString")
+        .is_some());
 }
 
 #[test]
 fn default_sanitizers_are_breadcrumb_noops() {
     let cfg = default_config();
-    let san = cfg.find_sanitizer("MessageDigest.digest").expect("default sanitizer");
+    let san = cfg
+        .find_sanitizer("MessageDigest.digest")
+        .expect("default sanitizer");
     assert!(
         san.kinds.is_empty(),
         "default sanitizers must stay kinds=[] (do not hash DeviceId away)"
@@ -115,4 +141,3 @@ fn solve_twice_is_deterministic_on_sample_dex() {
     let c = solve_dexes(&[&dex], &cfg, &opts8).unwrap();
     assert_eq!(keys(&a), keys(&c));
 }
-

@@ -28,9 +28,10 @@ pub fn scan_pick_file_theft(
     let hint = owned.insn_at.values().any(|s| {
         let u = s.to_uppercase();
         PICK_HINTS.iter().any(|p| u.contains(&p.to_uppercase()))
-    }) || owned.invoke_method_map.values().any(|m| {
-        m.contains("setAction") || m.contains("MediaStore")
-    });
+    }) || owned
+        .invoke_method_map
+        .values()
+        .any(|m| m.contains("setAction") || m.contains("MediaStore"));
     if !hint {
         return Vec::new();
     }
@@ -43,10 +44,12 @@ pub fn scan_pick_file_theft(
             || u.contains("MEDIASTORE")
     });
     if !has_pick_string
-        && !owned
-            .invoke_method_map
-            .values()
-            .any(|m| method_matches_any(m, &["startActivityForResult", "copyToCache", "openInputStream"]))
+        && !owned.invoke_method_map.values().any(|m| {
+            method_matches_any(
+                m,
+                &["startActivityForResult", "copyToCache", "openInputStream"],
+            )
+        })
     {
         return Vec::new();
     }

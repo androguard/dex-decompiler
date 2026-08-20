@@ -112,6 +112,7 @@ mod tests {
         let owned = ValueFlowAnalysisOwned {
             cfg: make_cfg(vec![0, 2]),
             rw_map,
+            exceptional_edges: vec![],
             api_return_sources: vec![((0, 0), "java.util.zip.ZipEntry.getName".into())],
             invoke_method_map,
             insn_at,

@@ -23,7 +23,10 @@ impl VarId {
 pub enum Expr {
     Var(VarId), // vN or vN_k in SSA
     /// Java-style call expression: `target(args)`
-    Call { target: String, args: String },
+    Call {
+        target: String,
+        args: String,
+    },
     /// Placeholder for move-result; merged by InvokeChainPass with preceding Call.
     PendingResult,
     Raw(String),
@@ -32,9 +35,19 @@ pub enum Expr {
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stmt {
-    Assign { dst: VarId, rhs: Expr, comment: Option<String> },
-    Expr { expr: Expr, comment: Option<String> },
-    Return { value: Option<Expr>, comment: Option<String> },
+    Assign {
+        dst: VarId,
+        rhs: Expr,
+        comment: Option<String>,
+    },
+    Expr {
+        expr: Expr,
+        comment: Option<String>,
+    },
+    Return {
+        value: Option<Expr>,
+        comment: Option<String>,
+    },
     /// SSA φ-node (not emitted as Java; stripped after renaming).
     Phi {
         dst: VarId,
@@ -98,7 +111,9 @@ impl Stmt {
     fn to_java_line_impl(&self, names: Option<&HashMap<VarId, String>>) -> String {
         match self {
             Stmt::Assign { dst, rhs, comment } => {
-                let dst_str = names.and_then(|n| n.get(dst).cloned()).unwrap_or_else(|| Expr::Var(*dst).to_java());
+                let dst_str = names
+                    .and_then(|n| n.get(dst).cloned())
+                    .unwrap_or_else(|| Expr::Var(*dst).to_java());
                 let rhs_str = rhs.to_java_impl(names);
                 let base = format!("{} = {};", dst_str, rhs_str);
                 append_comment(base, comment.as_deref())
@@ -152,7 +167,17 @@ fn substitute_names_in_text(s: &str, names: &HashMap<VarId, String>) -> String {
                 0
             };
             let vid = VarId::new(reg, ver);
-            if let Some(name) = names.get(&vid) {
+            let resolved = names.get(&vid).or_else(|| {
+                if ver != 0 {
+                    return None;
+                }
+                names
+                    .iter()
+                    .filter(|(candidate, _)| candidate.reg == reg)
+                    .max_by_key(|(candidate, _)| candidate.ver)
+                    .map(|(_, name)| name)
+            });
+            if let Some(name) = resolved {
                 out.push_str(name);
             } else {
                 out.push_str(&s[start..i]);
@@ -169,4 +194,3 @@ fn substitute_names_in_text(s: &str, names: &HashMap<VarId, String>) -> String {
 fn append_comment(base: String, _comment: Option<&str>) -> String {
     base
 }
-

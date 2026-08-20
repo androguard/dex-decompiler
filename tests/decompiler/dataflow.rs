@@ -36,7 +36,10 @@ fn test_dataflow_def_use_gcd_expected() {
     ]
     .into_iter()
     .collect();
-    assert_eq!(expected_du.get(&("c".into(), 0)).unwrap(), &vec![2, 5, 6, 7, 8]);
+    assert_eq!(
+        expected_du.get(&("c".into(), 0)).unwrap(),
+        &vec![2, 5, 6, 7, 8]
+    );
     assert_eq!(expected_du.get(&("ret".into(), 3)).unwrap(), &vec![9]);
 }
 
@@ -70,10 +73,7 @@ fn test_dataflow_group_variables_gcd_expected() {
     let expected_groups: HashMap<String, Vec<DefUse>> = [
         ("a".into(), vec![(vec![-1], vec![0])]),
         ("b".into(), vec![(vec![-2], vec![1])]),
-        (
-            "c".into(),
-            vec![(vec![0, 6], vec![8, 2, 5, 6, 7])],
-        ),
+        ("c".into(), vec![(vec![0, 6], vec![8, 2, 5, 6, 7])]),
         ("d".into(), vec![(vec![1], vec![3, 4, 5, 6, 7])]),
         ("ret".into(), vec![(vec![3, 8], vec![9])]),
     ]

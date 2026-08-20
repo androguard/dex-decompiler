@@ -40,7 +40,10 @@ impl Graph {
     pub fn add_edge(&mut self, from: &str, to: &str) {
         self.add_node(from);
         self.add_node(to);
-        self.edges.entry(from.to_string()).or_default().push(to.to_string());
+        self.edges
+            .entry(from.to_string())
+            .or_default()
+            .push(to.to_string());
     }
 
     pub fn successors(&self, n: &str) -> &[String] {
@@ -134,7 +137,10 @@ impl Graph {
     /// RPO as map: node -> rpo number (1-based like Python).
     pub fn rpo_numbers(&self) -> HashMap<String, usize> {
         let rpo = self.compute_rpo();
-        rpo.into_iter().enumerate().map(|(i, n)| (n, i + 1)).collect()
+        rpo.into_iter()
+            .enumerate()
+            .map(|(i, n)| (n, i + 1))
+            .collect()
     }
 }
 
@@ -144,7 +150,11 @@ fn intersect(
     mut b1: String,
     mut b2: String,
 ) -> String {
-    let rpo_idx: HashMap<&str, usize> = rpo.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    let rpo_idx: HashMap<&str, usize> = rpo
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
     let max_steps = rpo.len() + 2;
     for _ in 0..max_steps {
         if b1 == b2 {
@@ -506,12 +516,7 @@ mod tests {
     fn verify_rpo(g: &Graph, expected: &[(&str, usize)]) {
         let rpo_num = g.rpo_numbers();
         for (node, num) in expected {
-            assert_eq!(
-                rpo_num.get(*node),
-                Some(num),
-                "rpo({})",
-                node
-            );
+            assert_eq!(rpo_num.get(*node), Some(num), "rpo({})", node);
         }
     }
 
@@ -636,7 +641,14 @@ mod tests {
             ("y2", &["x2"]),
         ];
         let g = graph_from_edges("r", edges);
-        let expected = [("r", 1), ("w", 4), ("x1", 6), ("x2", 5), ("y1", 2), ("y2", 3)];
+        let expected = [
+            ("r", 1),
+            ("w", 4),
+            ("x1", 6),
+            ("x2", 5),
+            ("y1", 2),
+            ("y2", 3),
+        ];
         verify_rpo(&g, &expected);
     }
 

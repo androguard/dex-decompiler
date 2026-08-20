@@ -51,19 +51,25 @@ pub fn scan_custom_tabs(
                 ],
             )
         });
-        let has_url_src = owned.invoke_method_map.values().any(|m| {
-            method_matches_any(m, URL_SOURCES)
-        }) || owned
-            .api_return_sources
-            .iter()
-            .any(|(_, s)| URL_SOURCES.iter().any(|p| s.contains(p)));
+        let has_url_src = owned
+            .invoke_method_map
+            .values()
+            .any(|m| method_matches_any(m, URL_SOURCES))
+            || owned
+                .api_return_sources
+                .iter()
+                .any(|(_, s)| URL_SOURCES.iter().any(|p| s.contains(p)));
         if has_ct && has_url_src {
             findings.extend(invoke_scan(
                 owned,
                 class_name,
                 method_name,
                 "custom_tabs_intent_url",
-                &["CustomTabsIntent.launchUrl", "launchUrl", "CustomTabsIntent"],
+                &[
+                    "CustomTabsIntent.launchUrl",
+                    "launchUrl",
+                    "CustomTabsIntent",
+                ],
             ));
             findings.truncate(1);
         }

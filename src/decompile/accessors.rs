@@ -75,7 +75,9 @@ pub fn apply_accessor_replacements(body: &str, reps: &[(String, String)]) -> Str
 pub fn collect_dex_accessor_map(dex: &DexFile) -> HashMap<String, Vec<(String, String)>> {
     let mut out = HashMap::new();
     for class_result in dex.class_defs() {
-        let Ok(class_def) = class_result else { continue };
+        let Ok(class_def) = class_result else {
+            continue;
+        };
         let Ok(class_type) = dex.get_type(class_def.class_idx) else {
             continue;
         };
@@ -96,30 +98,42 @@ pub fn collect_dex_accessor_map(dex: &DexFile) -> HashMap<String, Vec<(String, S
     out
 }
 
-fn infer_accessor_expr(
-    dex: &DexFile,
-    decoded: &[dex_bytecode::Instruction],
-) -> Option<String> {
+fn infer_accessor_expr(dex: &DexFile, decoded: &[dex_bytecode::Instruction]) -> Option<String> {
     // Typical: (optional check-cast) + iget/sget/iput/sput/invoke + return
     for ins in decoded {
         let m = ins.mnemonic;
         if matches!(
             m,
-            "iget" | "iget-object" | "iget-boolean" | "iget-byte" | "iget-char" | "iget-short"
+            "iget"
+                | "iget-object"
+                | "iget-boolean"
+                | "iget-byte"
+                | "iget-char"
+                | "iget-short"
                 | "iget-wide"
         ) {
             return field_expr_from_ops(dex, &ins.operands, false);
         }
         if matches!(
             m,
-            "sget" | "sget-object" | "sget-boolean" | "sget-byte" | "sget-char" | "sget-short"
+            "sget"
+                | "sget-object"
+                | "sget-boolean"
+                | "sget-byte"
+                | "sget-char"
+                | "sget-short"
                 | "sget-wide"
         ) {
             return field_expr_from_ops(dex, &ins.operands, true);
         }
         if matches!(
             m,
-            "iput" | "iput-object" | "iput-boolean" | "iput-byte" | "iput-char" | "iput-short"
+            "iput"
+                | "iput-object"
+                | "iput-boolean"
+                | "iput-byte"
+                | "iput-char"
+                | "iput-short"
                 | "iput-wide"
         ) {
             // Setter: still expose field name; call sites are messier — use field for get-style rewrite.
@@ -127,7 +141,12 @@ fn infer_accessor_expr(
         }
         if matches!(
             m,
-            "sput" | "sput-object" | "sput-boolean" | "sput-byte" | "sput-char" | "sput-short"
+            "sput"
+                | "sput-object"
+                | "sput-boolean"
+                | "sput-byte"
+                | "sput-char"
+                | "sput-short"
                 | "sput-wide"
         ) {
             return field_expr_from_ops(dex, &ins.operands, true);

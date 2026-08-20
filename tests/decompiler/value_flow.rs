@@ -19,8 +19,8 @@ fn get_first_encoded_method(dex_bytes: &[u8]) -> Option<dex_parser::EncodedMetho
 fn bytecode_const_move_return() -> Vec<u8> {
     vec![
         0x12, 0x00, // const/4 v0, 0
-        0x04, 0x10, // move v1, v0
-        0x0f, 0x10, // return v1
+        0x01, 0x01, // move v1, v0
+        0x0f, 0x01, // return v1
     ]
 }
 
@@ -28,9 +28,9 @@ fn bytecode_const_move_return() -> Vec<u8> {
 fn bytecode_const_move_move_return() -> Vec<u8> {
     vec![
         0x12, 0x00, // const/4 v0, 0
-        0x04, 0x10, // move v1, v0
-        0x04, 0x21, // move v2, v1
-        0x0f, 0x20, // return v2
+        0x01, 0x01, // move v1, v0
+        0x01, 0x12, // move v2, v1
+        0x0f, 0x02, // return v2
     ]
 }
 
@@ -45,7 +45,9 @@ fn value_flow_analysis_builds_and_propagates() {
         .value_flow_analysis(&encoded)
         .expect("value_flow_analysis");
 
-    let offsets = owned.cfg.blocks[owned.cfg.entry].instruction_offsets.clone();
+    let offsets = owned.cfg.blocks[owned.cfg.entry]
+        .instruction_offsets
+        .clone();
     assert!(
         offsets.len() >= 3,
         "expected at least 3 instructions, got {:?}",
@@ -58,80 +60,74 @@ fn value_flow_analysis_builds_and_propagates() {
     // Seed: value defined at const/4 v0,0.
     let result = analysis.value_flow_from_seed(off_const, 0);
 
-    // Writes must at least contain the seed (const v0). With full read/write from
-    // resolve_operands, propagation adds copy (move v1,v0) and reads at move/return.
+    // This is the production-computed RW map, not a test-supplied expected map.
     let writes_set: HashSet<_> = result.writes.iter().copied().collect();
-    assert!(
-        writes_set.contains(&(off_const, 0)),
-        "writes should contain seed (const v0), got {:?}",
-        result.writes
+    let reads_set: HashSet<_> = result.reads.iter().copied().collect();
+    assert_eq!(
+        writes_set,
+        HashSet::from([(offsets[0], 0), (offsets[1], 1)])
     );
+    assert_eq!(reads_set, HashSet::from([(offsets[1], 0), (offsets[2], 1)]));
 }
 
 /// Tainting tracks a value through **return**: seed at const, value flows to move then to return v1.
-/// (Propagation depends on rw_map from the decompiler; minimal DEX resolve may vary.)
 #[test]
 fn value_flow_tracks_value_through_return() {
     let dex_bytes = super::helpers::minimal_dex_with_method_code(&bytecode_const_move_return());
     let encoded = get_first_encoded_method(&dex_bytes).expect("one direct method");
     let dex = parse_dex(&dex_bytes).expect("parse");
     let decompiler = Decompiler::new(&dex);
-    let owned = decompiler.value_flow_analysis(&encoded).expect("value_flow_analysis");
+    let owned = decompiler
+        .value_flow_analysis(&encoded)
+        .expect("value_flow_analysis");
 
-    let offsets = owned.cfg.blocks[owned.cfg.entry].instruction_offsets.clone();
+    let offsets = owned.cfg.blocks[owned.cfg.entry]
+        .instruction_offsets
+        .clone();
     assert!(offsets.len() >= 3, "expected const, move, return");
     let off_const = offsets[0];
     let analysis = owned.analysis();
     let result = analysis.value_flow_from_seed(off_const, 0);
 
     let writes_set: HashSet<_> = result.writes.iter().copied().collect();
-
-    // Seed (const v0) must always be in writes.
-    assert!(
-        writes_set.contains(&(off_const, 0)),
-        "writes should contain seed (const v0), got {:?}",
-        result.writes
+    let reads_set: HashSet<_> = result.reads.iter().copied().collect();
+    assert_eq!(
+        writes_set,
+        HashSet::from([(offsets[0], 0), (offsets[1], 1)])
     );
-    // When propagation works (move parsed as read v0, write v1), we get ≥2 writes and ≥1 read.
-    if result.writes.len() >= 2 {
-        assert!(
-            !result.reads.is_empty(),
-            "when value flows through move, reads should be non-empty, got {:?}",
-            result.reads
-        );
-    }
+    assert_eq!(reads_set, HashSet::from([(offsets[1], 0), (offsets[2], 1)]));
 }
 
 /// Tainting tracks a value through **transitive copies** (move chain) and then return.
-/// (Propagation depends on rw_map; when it works we get ≥3 writes and non-empty reads.)
 #[test]
 fn value_flow_tracks_value_through_move_chain_and_return() {
-    let dex_bytes = super::helpers::minimal_dex_with_method_code(&bytecode_const_move_move_return());
+    let dex_bytes =
+        super::helpers::minimal_dex_with_method_code(&bytecode_const_move_move_return());
     let encoded = get_first_encoded_method(&dex_bytes).expect("one direct method");
     let dex = parse_dex(&dex_bytes).expect("parse");
     let decompiler = Decompiler::new(&dex);
-    let owned = decompiler.value_flow_analysis(&encoded).expect("value_flow_analysis");
+    let owned = decompiler
+        .value_flow_analysis(&encoded)
+        .expect("value_flow_analysis");
 
-    let offsets = owned.cfg.blocks[owned.cfg.entry].instruction_offsets.clone();
+    let offsets = owned.cfg.blocks[owned.cfg.entry]
+        .instruction_offsets
+        .clone();
     assert!(offsets.len() >= 4, "expected const, move, move, return");
     let off_const = offsets[0];
     let analysis = owned.analysis();
     let result = analysis.value_flow_from_seed(off_const, 0);
 
     let writes_set: HashSet<_> = result.writes.iter().copied().collect();
-    assert!(
-        writes_set.contains(&(off_const, 0)),
-        "writes should contain seed (const v0), got {:?}",
-        result.writes
+    let reads_set: HashSet<_> = result.reads.iter().copied().collect();
+    assert_eq!(
+        writes_set,
+        HashSet::from([(offsets[0], 0), (offsets[1], 1), (offsets[2], 2)])
     );
-    // When full chain is parsed (const→move→move→return), we get 3 writes and non-empty reads.
-    if result.writes.len() >= 3 {
-        assert!(
-            !result.reads.is_empty(),
-            "when value flows through move chain, reads should be non-empty, got {:?}",
-            result.reads
-        );
-    }
+    assert_eq!(
+        reads_set,
+        HashSet::from([(offsets[1], 0), (offsets[2], 1), (offsets[3], 2)])
+    );
 }
 
 #[test]
@@ -140,15 +136,16 @@ fn value_flow_def_use_and_use_def_api() {
     let encoded = get_first_encoded_method(&dex_bytes).expect("one direct method");
     let dex = parse_dex(&dex_bytes).expect("parse");
     let decompiler = Decompiler::new(&dex);
-    let owned = decompiler.value_flow_analysis(&encoded).expect("value_flow_analysis");
+    let owned = decompiler
+        .value_flow_analysis(&encoded)
+        .expect("value_flow_analysis");
 
-    let offsets = owned.cfg.blocks[owned.cfg.entry].instruction_offsets.clone();
+    let offsets = owned.cfg.blocks[owned.cfg.entry]
+        .instruction_offsets
+        .clone();
     let off_const = offsets[0];
     let analysis = owned.analysis();
 
-    // API must not panic. With correct read/write sets, def_use(off_const, 0) would be non-empty.
-    let _uses = analysis.def_use(off_const, 0);
-    if offsets.len() >= 3 {
-        let _defs = analysis.use_def(offsets[2], 1);
-    }
+    assert_eq!(analysis.def_use(off_const, 0), vec![(offsets[1], 0)]);
+    assert_eq!(analysis.use_def(offsets[2], 1), vec![(offsets[1], 1)]);
 }

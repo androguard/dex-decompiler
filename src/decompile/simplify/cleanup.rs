@@ -34,8 +34,12 @@ pub(crate) fn inline_static_field_refs(body: &str) -> String {
         if let Some(n) = reg_num {
             let v_form = format!("v{}", n);
             let local_form = format!("local{}", n);
-            if v_form != alias_var { vars.push(v_form); }
-            if local_form != alias_var { vars.push(local_form); }
+            if v_form != alias_var {
+                vars.push(v_form);
+            }
+            if local_form != alias_var {
+                vars.push(local_form);
+            }
         }
         vars
     };
@@ -49,12 +53,13 @@ pub(crate) fn inline_static_field_refs(body: &str) -> String {
             if t == assign_stmt {
                 let candidate_vars = match_vars_for(var, reg_num);
                 let non_print_use = lines.iter().enumerate().any(|(j, l)| {
-                    j != idx && candidate_vars.iter().any(|cv| {
-                        let prefix = format!("{}.", cv);
-                        l.contains(&prefix)
-                            && !l.contains(&format!("{}.println(", cv))
-                            && !l.contains(&format!("{}.print(", cv))
-                    })
+                    j != idx
+                        && candidate_vars.iter().any(|cv| {
+                            let prefix = format!("{}.", cv);
+                            l.contains(&prefix)
+                                && !l.contains(&format!("{}.println(", cv))
+                                && !l.contains(&format!("{}.print(", cv))
+                        })
                 });
                 if !non_print_use {
                     skip = true;
@@ -62,7 +67,9 @@ pub(crate) fn inline_static_field_refs(body: &str) -> String {
                 }
             }
         }
-        if skip { continue; }
+        if skip {
+            continue;
+        }
         let mut current_line = line.to_string();
         for (var, val, reg_num) in &aliases {
             let candidate_vars = match_vars_for(var, reg_num);
@@ -241,9 +248,8 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         let mut out = val.to_string();
         for other in &inlines {
             let live = at_idx > other.def_idx && at_idx < other.end_idx;
-            let on_kill = at_idx == other.end_idx
-                && at_idx > other.def_idx
-                && ident_occurs(val, &other.var);
+            let on_kill =
+                at_idx == other.end_idx && at_idx > other.def_idx && ident_occurs(val, &other.var);
             if (live || on_kill) && ident_occurs(&out, &other.var) {
                 out = replace_ident_as_expr(&out, &other.var, &other.val);
             }
@@ -265,14 +271,19 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         for cand in &inlines {
             // Include the killing reassignment line (end_idx) when it reads the old value.
             let in_range = idx > cand.def_idx && idx < cand.end_idx;
-            let on_kill_use = idx == cand.end_idx && idx > cand.def_idx && ident_occurs(line, &cand.var);
+            let on_kill_use =
+                idx == cand.end_idx && idx > cand.def_idx && ident_occurs(line, &cand.var);
             if (in_range || on_kill_use) && ident_occurs(&current, &cand.var) {
                 let replacement = materialize(&cand.val, idx);
                 // Never rewrite the assignment target (`i4 = 20` must not become `18 = 20`).
                 if assign_lhs_var(&current).as_deref() == Some(cand.var.as_str()) {
                     if let Some(eq) = current.find(" = ") {
                         let (lhs, rhs) = current.split_at(eq + 3);
-                        current = format!("{}{}", lhs, replace_ident_as_expr(rhs, &cand.var, &replacement));
+                        current = format!(
+                            "{}{}",
+                            lhs,
+                            replace_ident_as_expr(rhs, &cand.var, &replacement)
+                        );
                     }
                 } else {
                     current = replace_ident_as_expr(&current, &cand.var, &replacement);
@@ -308,9 +319,12 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
             continue;
         }
         // Register reuse (`s0 = "x"; …; s0 = receiver; s0.method()`) — cleanup inlines per live range.
-        if lines.iter().enumerate().skip(idx + 1).any(|(_, l)| {
-            assign_lhs_var(l).as_deref() == Some(var.as_str())
-        }) {
+        if lines
+            .iter()
+            .enumerate()
+            .skip(idx + 1)
+            .any(|(_, l)| assign_lhs_var(l).as_deref() == Some(var.as_str()))
+        {
             continue;
         }
         *assign_counts.entry(var.clone()).or_insert(0) += 1;
@@ -432,9 +446,21 @@ pub(crate) fn merge_constructor_calls(body: &str) -> String {
                 if init_var == var {
                     let indent = leading_indent(lines[i]);
                     let typed = if lhs.contains(' ') {
-                        format!("{}{} = new {}({});", indent, lhs, class, args.unwrap_or_default())
+                        format!(
+                            "{}{} = new {}({});",
+                            indent,
+                            lhs,
+                            class,
+                            args.unwrap_or_default()
+                        )
                     } else {
-                        format!("{}{} = new {}({});", indent, var, class, args.unwrap_or_default())
+                        format!(
+                            "{}{} = new {}({});",
+                            indent,
+                            var,
+                            class,
+                            args.unwrap_or_default()
+                        )
                     };
                     replacements.insert(i, typed);
                     skip.insert(j);
@@ -477,4 +503,3 @@ pub(crate) fn merge_constructor_calls(body: &str) -> String {
     }
     out
 }
-

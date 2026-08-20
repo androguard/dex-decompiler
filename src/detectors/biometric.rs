@@ -27,7 +27,10 @@ pub fn scan_biometric_misuse(
         .invoke_method_map
         .values()
         .any(|m| method_matches_any(m, BIO))
-        || owned.insn_at.values().any(|s| s.contains("BiometricPrompt"));
+        || owned
+            .insn_at
+            .values()
+            .any(|s| s.contains("BiometricPrompt"));
     if !has_bio {
         return Vec::new();
     }
