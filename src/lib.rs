@@ -51,9 +51,9 @@ pub use taint::{
 pub use xref::{
     find_field_xrefs, find_method_call_traces, find_method_call_traces_by_class_method,
     find_method_call_traces_with_index, find_method_callees, find_method_callees_by_class_method,
-    find_method_callers, find_method_callers_by_class_method, CallTraceFrame, CallTracePath,
-    FieldXref, FieldXrefsInfo, MethodCallTracesInfo, MethodCallee, MethodCalleesInfo, MethodCaller,
-    MethodCallersInfo, ReverseCallIndex,
+    find_method_callers, find_method_callers_by_class_method, find_method_callers_by_name,
+    CallTraceFrame, CallTracePath, FieldXref, FieldXrefsInfo, MethodCallTracesInfo, MethodCallee,
+    MethodCalleesInfo, MethodCaller, MethodCallersInfo, ReverseCallIndex,
 };
 
 /// Parse a DEX file from raw bytes. Returns decompiler Result (maps parser errors to Parse).

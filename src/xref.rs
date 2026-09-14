@@ -131,18 +131,25 @@ fn method_descriptor_from_dex(dex: &DexFile, method_idx: u32) -> Result<(String,
     Ok((class_name, info.name.to_string(), descriptor))
 }
 
-/// Find all invoke sites that reference `callee_method_idx` in `method_ids`.
-pub fn find_method_callers(dex: &DexFile, callee_method_idx: u32) -> Result<MethodCallersInfo> {
-    if callee_method_idx >= dex.header.method_ids_size {
-        return Err(DexDecompilerError::Parse(format!(
-            "method index {} out of range (size {})",
-            callee_method_idx, dex.header.method_ids_size
-        )));
+fn normalize_java_class_name(name: &str) -> String {
+    let mut n = name.trim().to_string();
+    if n.starts_with('L') && n.ends_with(';') {
+        n = n[1..n.len() - 1].replace('/', ".");
+    } else {
+        n = n.replace('/', ".");
     }
+    n
+}
 
-    let (callee_class_name, callee_method_name, callee_descriptor) =
-        method_descriptor_from_dex(dex, callee_method_idx)?;
-
+/// Scan class code for invokes whose `method_ids` index is in `callee_idxs`.
+fn find_method_callers_for_set(
+    dex: &DexFile,
+    callee_idxs: &std::collections::HashSet<u32>,
+    primary_idx: u32,
+    callee_class_name: String,
+    callee_method_name: String,
+    callee_descriptor: String,
+) -> Result<MethodCallersInfo> {
     let mut callers = Vec::new();
     let mut truncated = false;
 
@@ -187,7 +194,7 @@ pub fn find_method_callers(dex: &DexFile, callee_method_idx: u32) -> Result<Meth
                 else {
                     continue;
                 };
-                if midx != callee_method_idx {
+                if !callee_idxs.contains(&midx) {
                     continue;
                 }
                 if callers.len() >= METHOD_CALLERS_CAP {
@@ -204,20 +211,97 @@ pub fn find_method_callers(dex: &DexFile, callee_method_idx: u32) -> Result<Meth
                     offset: ins.offset,
                     file_offset: insns_base.saturating_add(ins.offset),
                     invoke_kind: invoke_kind_name(ins.opcode).to_string(),
-                    callee_method_idx,
+                    callee_method_idx: midx,
                 });
             }
         }
     }
 
     Ok(MethodCallersInfo {
-        callee_method_idx,
+        callee_method_idx: primary_idx,
         callee_class_name,
         callee_method_name,
         callee_descriptor,
         callers,
         truncated,
     })
+}
+
+/// Find all invoke sites that reference `callee_method_idx` in `method_ids`.
+pub fn find_method_callers(dex: &DexFile, callee_method_idx: u32) -> Result<MethodCallersInfo> {
+    if callee_method_idx >= dex.header.method_ids_size {
+        return Err(DexDecompilerError::Parse(format!(
+            "method index {} out of range (size {})",
+            callee_method_idx, dex.header.method_ids_size
+        )));
+    }
+
+    let (callee_class_name, callee_method_name, callee_descriptor) =
+        method_descriptor_from_dex(dex, callee_method_idx)?;
+    let mut set = std::collections::HashSet::new();
+    set.insert(callee_method_idx);
+    find_method_callers_for_set(
+        dex,
+        &set,
+        callee_method_idx,
+        callee_class_name,
+        callee_method_name,
+        callee_descriptor,
+    )
+}
+
+/// Find invoke sites calling any `method_ids` entry matching class + method name
+/// (all overloads). Useful for JNI / multidex where the defining class may be absent
+/// from the DEX that contains the call site.
+pub fn find_method_callers_by_name(
+    dex: &DexFile,
+    class_name: &str,
+    method_name: &str,
+) -> Result<MethodCallersInfo> {
+    let want_class = normalize_java_class_name(class_name);
+    let want_method = method_name.trim();
+    let mut matched = std::collections::HashSet::new();
+    let mut primary_idx = 0u32;
+    let mut callee_class_name = want_class.clone();
+    let mut callee_descriptor = String::new();
+
+    for i in 0..dex.header.method_ids_size {
+        let Ok((cn, mn, desc)) = method_descriptor_from_dex(dex, i) else {
+            continue;
+        };
+        if mn != want_method {
+            continue;
+        }
+        if normalize_java_class_name(&cn) != want_class {
+            continue;
+        }
+        if matched.is_empty() {
+            primary_idx = i;
+            callee_class_name = cn;
+            callee_descriptor = desc;
+        }
+        matched.insert(i);
+    }
+
+    if matched.is_empty() {
+        return Ok(MethodCallersInfo {
+            callee_method_idx: 0,
+            callee_class_name: want_class,
+            callee_method_name: want_method.to_string(),
+            callee_descriptor: String::new(),
+            callers: Vec::new(),
+            truncated: false,
+        });
+    }
+
+    find_method_callers_for_set(
+        dex,
+        &matched,
+        primary_idx,
+        callee_class_name,
+        want_method.to_string(),
+        callee_descriptor,
+    )
 }
 
 /// Resolve a UI class/method pair (light-parse indices) to a `method_ids` index, then find callers.
