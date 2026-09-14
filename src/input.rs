@@ -3,6 +3,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use apkparser::{dex_entries, iter_logical_dexes, ZipIndex};
 use zip::ZipArchive;
 
 use crate::error::{DexDecompilerError, Result};
@@ -65,6 +66,29 @@ pub fn extract_dex_entries_from_apk(apk_bytes: &[u8]) -> Result<Vec<(String, Vec
     Ok(out)
 }
 
+/// Lazy APK DEX extract via apk-parser `ZipIndex` (inflate only `classes*.dex`, smallest-first).
+pub fn extract_dex_entries_lazy(apk_bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    let index = ZipIndex::parse(apk_bytes)
+        .map_err(|e| DexDecompilerError::Parse(format!("open APK ZipIndex: {e}")))?;
+    let entries = dex_entries(&index);
+    if entries.is_empty() {
+        return Err(DexDecompilerError::Parse(
+            "APK/ZIP contains no classes*.dex".into(),
+        ));
+    }
+    let mut out = Vec::new();
+    for e in entries {
+        let fname = e.filename.clone();
+        let data = index
+            .read_entry(e)
+            .map_err(|err| DexDecompilerError::Parse(format!("inflate {fname}: {err}")))?;
+        for (name, bytes) in iter_logical_dexes(&fname, data) {
+            out.push((name, bytes));
+        }
+    }
+    Ok(out)
+}
+
 /// Extract `AndroidManifest.xml` bytes from an APK/ZIP (binary AXML or text).
 pub fn extract_android_manifest_from_apk(apk_bytes: &[u8]) -> Result<Vec<u8>> {
     let cursor = Cursor::new(apk_bytes);
@@ -115,7 +139,7 @@ pub fn load_dexes_from_bytes(bytes: &[u8], hint_path: &Path) -> Result<Vec<DexFi
                 )
             })
     {
-        let entries = extract_dex_entries_from_apk(bytes)?;
+        let entries = extract_dex_entries_lazy(bytes).or_else(|_| extract_dex_entries_from_apk(bytes))?;
         let mut dexes = Vec::with_capacity(entries.len());
         for (name, data) in entries {
             let dex = parse_dex(&data)

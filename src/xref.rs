@@ -229,25 +229,8 @@ fn find_method_callers_for_set(
 
 /// Find all invoke sites that reference `callee_method_idx` in `method_ids`.
 pub fn find_method_callers(dex: &DexFile, callee_method_idx: u32) -> Result<MethodCallersInfo> {
-    if callee_method_idx >= dex.header.method_ids_size {
-        return Err(DexDecompilerError::Parse(format!(
-            "method index {} out of range (size {})",
-            callee_method_idx, dex.header.method_ids_size
-        )));
-    }
-
-    let (callee_class_name, callee_method_name, callee_descriptor) =
-        method_descriptor_from_dex(dex, callee_method_idx)?;
-    let mut set = std::collections::HashSet::new();
-    set.insert(callee_method_idx);
-    find_method_callers_for_set(
-        dex,
-        &set,
-        callee_method_idx,
-        callee_class_name,
-        callee_method_name,
-        callee_descriptor,
-    )
+    // ASC fast path — same result shape as the decode-all scan, with insn offsets.
+    find_method_callers_fast(dex, callee_method_idx)
 }
 
 /// Find invoke sites calling any `method_ids` entry matching class + method name
@@ -292,6 +275,11 @@ pub fn find_method_callers_by_name(
             callers: Vec::new(),
             truncated: false,
         });
+    }
+
+    // Single overload → ASC fast path; multi-overload keeps the set scan.
+    if matched.len() == 1 {
+        return find_method_callers_fast(dex, primary_idx);
     }
 
     find_method_callers_for_set(
@@ -967,6 +955,224 @@ pub fn find_field_xrefs(dex: &DexFile, field_idx: u32) -> Result<FieldXrefsInfo>
         xrefs,
         truncated,
     })
+}
+
+/// Generic reference site from the fast path (string / type / field / method).
+#[derive(Debug, Clone, Serialize)]
+pub struct FastRefSite {
+    pub class_name: String,
+    pub method_name: String,
+    pub method_idx: u32,
+    pub file_offset: u32,
+    /// Method-relative instruction offset (bytes), for Code-view navigation.
+    pub offset: u32,
+    pub pool_idx: u32,
+    pub class_idx: usize,
+    pub method_idx_in_class: usize,
+}
+
+/// Prefer [`find_method_callers_fast`] for a single query; keep [`ReverseCallIndex`] if you
+/// expect more than ~20 call-trace queries on the same DEX.
+pub fn find_method_callers_fast(dex: &DexFile, callee_method_idx: u32) -> Result<MethodCallersInfo> {
+    if callee_method_idx >= dex.header.method_ids_size {
+        return Err(DexDecompilerError::Parse(format!(
+            "method index {} out of range (size {})",
+            callee_method_idx, dex.header.method_ids_size
+        )));
+    }
+    let (callee_class_name, callee_method_name, callee_descriptor) =
+        method_descriptor_from_dex(dex, callee_method_idx)?;
+    let raw = dex_parser::RawDex::from_dex(dex);
+    let mut fr = dex_parser::FastRef::from_raw(raw);
+    let sites = fr
+        .find_method_idx(callee_method_idx)
+        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    callers_from_fast_sites(
+        dex,
+        sites,
+        callee_method_idx,
+        callee_class_name,
+        callee_method_name,
+        callee_descriptor,
+    )
+}
+
+fn callers_from_fast_sites(
+    dex: &DexFile,
+    sites: Vec<dex_parser::RefSite>,
+    primary_idx: u32,
+    callee_class_name: String,
+    callee_method_name: String,
+    callee_descriptor: String,
+) -> Result<MethodCallersInfo> {
+    let wanted: std::collections::HashSet<u32> = sites.iter().map(|s| s.method_idx).collect();
+    let ui = method_ui_map(dex, &wanted)?;
+    let mut callers = Vec::new();
+    let mut truncated = false;
+    for s in sites {
+        if callers.len() >= METHOD_CALLERS_CAP {
+            truncated = true;
+            break;
+        }
+        let (class_idx, method_idx_in_class, class_name) = ui
+            .get(&s.method_idx)
+            .cloned()
+            .unwrap_or((0, 0, String::new()));
+        let info = dex.get_method_info(s.method_idx).ok();
+        let method_name = info
+            .as_ref()
+            .map(|i| i.name.to_string())
+            .unwrap_or_default();
+        let method_descriptor = info
+            .as_ref()
+            .map(|i| format_method_descriptor(&i.return_type, &i.params))
+            .unwrap_or_default();
+        let class_name = if class_name.is_empty() {
+            info.map(|i| java::descriptor_to_java(&i.class))
+                .unwrap_or_default()
+        } else {
+            class_name
+        };
+        callers.push(MethodCaller {
+            class_name,
+            method_name,
+            method_descriptor,
+            class_idx,
+            method_idx_in_class,
+            caller_method_idx: s.method_idx,
+            offset: s.insn_off,
+            file_offset: s.file_off,
+            invoke_kind: "invoke".into(),
+            callee_method_idx: s.pool_idx,
+        });
+    }
+    Ok(MethodCallersInfo {
+        callee_method_idx: primary_idx,
+        callee_class_name,
+        callee_method_name,
+        callee_descriptor,
+        callers,
+        truncated,
+    })
+}
+
+fn method_ui_map(
+    dex: &DexFile,
+    wanted: &std::collections::HashSet<u32>,
+) -> Result<std::collections::HashMap<u32, (usize, usize, String)>> {
+    let mut out = std::collections::HashMap::new();
+    if wanted.is_empty() {
+        return Ok(out);
+    }
+    for (class_idx, class_result) in dex.class_defs().enumerate() {
+        let Ok(class_def) = class_result else { continue };
+        let Ok(class_type) = dex.get_type(class_def.class_idx) else { continue };
+        let class_name = java::descriptor_to_java(&class_type);
+        let Ok(Some(class_data)) = dex.get_class_data(&class_def) else { continue };
+        for (mi, encoded) in class_data
+            .direct_methods
+            .iter()
+            .chain(class_data.virtual_methods.iter())
+            .enumerate()
+        {
+            if wanted.contains(&encoded.method_idx) {
+                out.insert(encoded.method_idx, (class_idx, mi, class_name.clone()));
+            }
+        }
+        if out.len() >= wanted.len() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+pub fn find_string_xrefs(dex: &DexFile, needle: &str) -> Result<Vec<FastRefSite>> {
+    let raw = dex_parser::RawDex::from_dex(dex);
+    let mut fr = dex_parser::FastRef::from_raw(raw);
+    let sites = fr
+        .find_strings(needle)
+        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    fast_sites_to_ui(dex, sites)
+}
+
+pub fn find_type_xrefs(dex: &DexFile, needle: &str) -> Result<Vec<FastRefSite>> {
+    let raw = dex_parser::RawDex::from_dex(dex);
+    let mut fr = dex_parser::FastRef::from_raw(raw);
+    let sites = fr
+        .find_types(needle)
+        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    fast_sites_to_ui(dex, sites)
+}
+
+pub fn find_field_xrefs_fast(
+    dex: &DexFile,
+    class: Option<&str>,
+    name: Option<&str>,
+    exact_class: bool,
+) -> Result<Vec<FastRefSite>> {
+    let raw = dex_parser::RawDex::from_dex(dex);
+    let mut fr = dex_parser::FastRef::from_raw(raw);
+    let q = dex_parser::MemberQuery {
+        class: class.map(|c| (c.to_string(), exact_class)),
+        name: name.map(|s| s.to_string()),
+    };
+    let sites = fr
+        .find_fields(&q)
+        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    fast_sites_to_ui(dex, sites)
+}
+
+/// ASC fast path: locate invoke / method-ref sites by optional class + method name.
+pub fn find_method_xrefs_fast(
+    dex: &DexFile,
+    class: Option<&str>,
+    name: Option<&str>,
+    exact_class: bool,
+) -> Result<Vec<FastRefSite>> {
+    let raw = dex_parser::RawDex::from_dex(dex);
+    let mut fr = dex_parser::FastRef::from_raw(raw);
+    let q = dex_parser::MemberQuery {
+        class: class.map(|c| (c.to_string(), exact_class)),
+        name: name.map(|s| s.to_string()),
+    };
+    let sites = fr
+        .find_methods(&q)
+        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    fast_sites_to_ui(dex, sites)
+}
+
+fn fast_sites_to_ui(dex: &DexFile, sites: Vec<dex_parser::RefSite>) -> Result<Vec<FastRefSite>> {
+    let wanted: std::collections::HashSet<u32> = sites.iter().map(|s| s.method_idx).collect();
+    let ui = method_ui_map(dex, &wanted)?;
+    let mut out = Vec::new();
+    for s in sites {
+        let (class_idx, method_idx_in_class, class_name) = ui
+            .get(&s.method_idx)
+            .cloned()
+            .unwrap_or((0, 0, String::new()));
+        let info = dex.get_method_info(s.method_idx).ok();
+        let method_name = info
+            .as_ref()
+            .map(|i| i.name.to_string())
+            .unwrap_or_default();
+        let class_name = if class_name.is_empty() {
+            info.map(|i| java::descriptor_to_java(&i.class))
+                .unwrap_or_default()
+        } else {
+            class_name
+        };
+        out.push(FastRefSite {
+            class_name,
+            method_name,
+            method_idx: s.method_idx,
+            file_offset: s.file_off,
+            offset: s.insn_off,
+            pool_idx: s.pool_idx,
+            class_idx,
+            method_idx_in_class,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

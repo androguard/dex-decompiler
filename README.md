@@ -76,6 +76,48 @@ A **DEX to Java decompiler** in pure Rust. It parses DEX files, disassembles Dal
 - **Vulnerability detectors**: PendingIntent scan (`--scan-pending-intent`), full scan (`--scan-vulns`: intent spoofing, RCE, insecure logging, SQL injection, WebView, hardcoded-secrets, IPC), **native Semgrep** (`--scan-semgrep`: general Android rules + [OWASP MASTG](https://github.com/OWASP/mastg/tree/master/rules) via SSA/value-flow + Java/XML patterns).
 - **Global taint solver (Mariana Trench–style)**: JSON models (sources / sinks / propagations / sanitizers), rules by kind, call-graph + interprocedural fixpoint, traces, JSON issue report (`--taint-solve`). Includes a port of MT’s **74 end-to-end cases** under `tests/data/mariana_trench/` (`cargo test --test mariana_trench_e2e`).
 - **Progress**: With `--output-dir`, progress bar shows current class being decompiled.
+- **ASC fast path**: On-demand `findrefs` / `getclass` without full APK inflate or a global xref index (see [Acknowledgments](#acknowledgments--asc-fast-path)).
+
+## Acknowledgments / ASC fast path
+
+The on-demand search and single-class slice paths (`--findrefs`, `--getclass`, and the matching library/WASM APIs) adapt algorithms from **Droid ASC**, presented at **Black Hat Europe 2026 Arsenal**:
+
+> WeiMin Cheng (MG1937), Zhihan Lin (0chencc).  
+> *Droid ASC: R8 Compiler Optimization as a DeCompiler Primitive.*  
+> Black Hat Europe 2026 Arsenal.  
+> Tool / source: <https://github.com/MG1937/ASC>
+
+**Design thesis (ASC):** a compiled DEX is already an index, so building another global cross-reference database is wasted work. Query the artifact on demand.
+
+Algorithms used here (Rust ports across `apk-parser`, `dex-parser`, and this crate; see `docs/ASC_FASTPATH_PLAN.md`):
+
+| Algorithm | Role |
+|-----------|------|
+| **Central-directory DEX probe** | Locate root `classes*.dex` entries by scanning the ZIP CD for `classes` (`memmem`) with a namelist fallback, instead of eagerly listing/inflating the whole archive. |
+| **Smallest-first lazy inflate + early exit** | Inflate candidate DEX entries ordered by ascending compressed size; stop as soon as `dex_defines_class` hits (`--getclass`). |
+| **DEX 041 logical containers** | Split multi-DEX containers (`dex\n041`) and normalize headers the way ASC names `classes.dex!classesN.dex`. |
+| **String locator (contiguity + MUTF-8)** | Resolve string queries via sorted/contiguous `string_data` layout (with full fallback) after encoding the needle as MUTF-8. |
+| **Type / method / field locators** | Map queries to pool indices using type→string maps and class/name member indexes (`MemberQuery`, exact or fuzzy class). |
+| **Raw `code_item` reference scan** | Find `(opcode, pool_idx)` sites by scanning code bytes (opcode masks / `memchr` for single-op), not by full instruction decode. |
+| **O(1) instruction→method locator** | 16-byte bucket table + payload-aware boundary walk with a per-method resume cursor (`InsnLocator`), including R8 shared-code `Owner::Many`. |
+| **Minimal in-memory DEX reconstruction** | Harvest one class and its transitive pool deps, rewrite operands via `DexBuilder::pool_maps()`, emit a spec-valid slice (`DexSlicer`) for decompilation. |
+
+**CLI examples:**
+
+```bash
+# Cross-DEX reference search (string / type / method / field)
+cargo run --release --bin dex-decompile -- -i app.apk \
+  --findrefs string --findrefs-value token
+cargo run --release --bin dex-decompile -- -i app.apk \
+  --findrefs method --findrefs-value onCreate \
+  --findrefs-class com.example.Main --fast-xref
+
+# Locate one class, slice a minimal DEX, decompile only it
+cargo run --release --bin dex-decompile -- -i app.apk \
+  --getclass com.example.Main -o Main.java
+```
+
+We deliberately **do not** port ASC’s unimplemented partial-Deflate / Huffman bitstream probe, CPython regex/bigint scanners, or a second non-canonical DEX writer—canonical pools and checksums come from `dex-parser::DexBuilder`.
 
 ## Simplifications
 
@@ -106,9 +148,10 @@ Method bodies and IR are simplified so output looks like idiomatic Java.
 ## Dependencies
 
 - [dex-bytecode](https://github.com/androguard/dex-bytecode) – Dalvik disassembly and CFG (basic blocks, switch expansion).
-- [dex-parser](https://github.com/androguard/dex-parser/tree/main/dexparser-rs) – DEX file parsing.
+- [dex-parser](https://github.com/androguard/dex-parser/tree/main/dexparser-rs) – DEX file parsing, fastref locators/scanner, `DexSlicer`.
+- [apk-parser](https://github.com/androguard/apk-parser) – Lazy ZIP/`ZipIndex`, `dex_entries` (ASC CD probe).
 
-Both are pulled from GitHub in `Cargo.toml`; no local paths required.
+`dex-parser` / `dex-bytecode` are pulled from GitHub in `Cargo.toml` (with optional local `[patch]`); `apkparser` is a path/git sibling used for the ASC fast path.
 
 ## Run
 
@@ -210,8 +253,14 @@ cargo run --release --bin dex-decompile -- -i AndroidManifest.xml --scan-semgrep
 | `--rename-method` | | Rename method (`ClassName#methodName=NEW`). Repeatable. |
 | `--rename-field` | | Rename field (`ClassName#fieldName=NEW`). Repeatable. |
 | `--rename-variable` | | Rename variable in a method (`ClassName#methodName:oldVar=newVar`). Repeatable. |
+| `--getclass` | | Locate `CLASS` in the APK/DEX, slice a minimal DEX, decompile only that class (ASC-style early exit; does not load every DEX). |
+| `--findrefs` | | Fast cross-refs: `string` \| `type` \| `method` \| `field` (requires `--findrefs-value`). |
+| `--findrefs-value` | | Needle for `--findrefs`. |
+| `--findrefs-class` | | Optional class (Dalvik or Java name) for method/field findrefs. |
+| `--findrefs-fuzzy-class` | | Treat `--findrefs-class` as a substring. |
+| `--fast-xref` | | Prefer the ASC-style fast caller path for method findrefs. |
 
-When `--output-dir` is set, progress is shown per class. When `--taint-method` is set with either (`--taint-offset` and `--taint-reg`) or `--taint-api`, the tool prints value-flow (reads/writes) and exits without decompiling. When `--scan-pending-intent` is set, the tool scans every method for PendingIntent creation and prints a risk report. When `--taint-solve` is set, the global taint solver runs and optionally writes JSON via `--taint-output`. When `--scan-vulns` is set, the tool runs all detectors and prints one line per finding (category, class#method, sink offset, sink method). When `--scan-semgrep` is set, native Semgrep-style Android rules (general Android + OWASP MASTG by default) run over every method via SSA/value-flow, plus XML rules on plaintext manifests. When both `-o` and `-d` are omitted and neither taint nor scan is used, decompiled Java is printed to stdout.
+When `--output-dir` is set, progress is shown per class. When `--getclass` or `--findrefs` is set, those paths run and exit without a full multi-class decompile. When `--taint-method` is set with either (`--taint-offset` and `--taint-reg`) or `--taint-api`, the tool prints value-flow (reads/writes) and exits without decompiling. When `--scan-pending-intent` is set, the tool scans every method for PendingIntent creation and prints a risk report. When `--taint-solve` is set, the global taint solver runs and optionally writes JSON via `--taint-output`. When `--scan-vulns` is set, the tool runs all detectors and prints one line per finding (category, class#method, sink offset, sink method). When `--scan-semgrep` is set, native Semgrep-style Android rules (general Android + OWASP MASTG by default) run over every method via SSA/value-flow, plus XML rules on plaintext manifests. When both `-o` and `-d` are omitted and neither taint nor scan is used, decompiled Java is printed to stdout.
 
 ### Global taint solver (Mariana Trench–style)
 

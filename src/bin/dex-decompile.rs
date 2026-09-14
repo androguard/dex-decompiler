@@ -431,8 +431,150 @@ fn parse_emulate_params(
     (params, initial_heap)
 }
 
+fn dalvik_descriptor(class: &str) -> String {
+    let n = class.trim();
+    if n.starts_with('L') && n.ends_with(';') {
+        return n.to_string();
+    }
+    format!("L{};", n.replace('.', "/"))
+}
+
+fn run_getclass(args: &Args, class: &str) -> Result<()> {
+    if args.input.len() != 1 {
+        anyhow::bail!("--getclass expects exactly one input path");
+    }
+    let path = &args.input[0];
+    let bytes = fs::read(path).with_context(|| format!("read {path}"))?;
+    let mode =
+        parse_decompilation_mode(&args.decompilation_mode).map_err(|e| anyhow::anyhow!(e))?;
+    let options = DecompilerOptions {
+        only_package: args.only_package.clone(),
+        exclude: args.exclude.clone(),
+        show_bytecode: args.show_bytecode,
+        rename_map: None,
+        mode,
+        use_debug_names: !args.no_debug_info,
+        resource_map: None,
+    };
+    let java = dex_decompiler::getclass_java(&bytes, class, options)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(ref out) = args.output {
+        fs::write(out, &java).with_context(|| format!("write {out}"))?;
+    } else {
+        print!("{java}");
+    }
+    Ok(())
+}
+
+fn run_findrefs(args: &Args, kind: &str) -> Result<()> {
+    let value = args
+        .findrefs_value
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--findrefs requires --findrefs-value"))?;
+    let owned = load_dexes_from_paths(
+        &args
+            .input
+            .iter()
+            .map(std::path::Path::new)
+            .collect::<Vec<_>>(),
+    )?;
+    for (i, dex) in owned.iter().enumerate() {
+        match kind {
+            "string" => {
+                let sites = dex_decompiler::xref::find_string_xrefs(dex, value)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("DEX[{i}] string {value:?}: {} site(s)", sites.len());
+                for s in sites.iter().take(200) {
+                    println!(
+                        "  {}#{}  @0x{:x}  pool={}",
+                        s.class_name, s.method_name, s.file_offset, s.pool_idx
+                    );
+                }
+            }
+            "type" => {
+                let sites = dex_decompiler::xref::find_type_xrefs(dex, value)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("DEX[{i}] type {value:?}: {} site(s)", sites.len());
+                for s in sites.iter().take(200) {
+                    println!(
+                        "  {}#{}  @0x{:x}  pool={}",
+                        s.class_name, s.method_name, s.file_offset, s.pool_idx
+                    );
+                }
+            }
+            "method" => {
+                let q = dex_parser::MemberQuery {
+                    class: args.findrefs_class.as_ref().map(|c| {
+                        (dalvik_descriptor(c), !args.findrefs_fuzzy_class)
+                    }),
+                    name: Some(value.to_string()),
+                };
+                let raw = dex_parser::RawDex::from_dex(dex);
+                let mut fr = dex_parser::FastRef::from_raw(raw);
+                let sites = fr.find_methods(&q).map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("DEX[{i}] method: {} site(s)", sites.len());
+                for s in sites.iter().take(200) {
+                    println!(
+                        "  method_idx={} pool={} @0x{:x}",
+                        s.method_idx, s.pool_idx, s.file_off
+                    );
+                }
+                if args.fast_xref {
+                    let mut seen = std::collections::HashSet::new();
+                    for s in &sites {
+                        if !seen.insert(s.pool_idx) {
+                            continue;
+                        }
+                        let info = if args.fast_xref {
+                            dex_decompiler::xref::find_method_callers_fast(dex, s.pool_idx)
+                        } else {
+                            dex_decompiler::xref::find_method_callers(dex, s.pool_idx)
+                        }
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        println!(
+                            "  callers of pool {}: {} (fast-xref)",
+                            s.pool_idx,
+                            info.callers.len()
+                        );
+                    }
+                }
+            }
+            "field" => {
+                let class = args
+                    .findrefs_class
+                    .as_deref()
+                    .map(dalvik_descriptor);
+                let sites = dex_decompiler::xref::find_field_xrefs_fast(
+                    dex,
+                    class.as_deref(),
+                    Some(value),
+                    !args.findrefs_fuzzy_class,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("DEX[{i}] field: {} site(s)", sites.len());
+                for s in sites.iter().take(200) {
+                    println!(
+                        "  {}#{}  @0x{:x}",
+                        s.class_name, s.method_name, s.file_offset
+                    );
+                }
+            }
+            other => anyhow::bail!("unknown --findrefs kind {other} (string|type|method|field)"),
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(ref kind) = args.findrefs {
+        return run_findrefs(&args, kind);
+    }
+
+    if let Some(ref class) = args.getclass {
+        return run_getclass(&args, class);
+    }
 
     // Emulate: run method with given params and print console output + return value.
     if let Some(ref emulate_spec) = args.emulate {
@@ -1176,4 +1318,28 @@ struct Args {
     /// Rename variable in a method (ClassName#methodName:oldVar=newVar). May be repeated. E.g. --rename-variable "com.old.Main#onCreate:p0=context"
     #[arg(long = "rename-variable", value_name = "CLASS#METHOD:OLD=NEW")]
     rename_variable: Vec<String>,
+
+    /// Locate CLASS in the input APK/DEX, slice a minimal DEX, decompile only it.
+    #[arg(long = "getclass", value_name = "CLASS")]
+    getclass: Option<String>,
+
+    /// Fast findrefs kind: string | type | method | field
+    #[arg(long = "findrefs", value_name = "KIND")]
+    findrefs: Option<String>,
+
+    /// Needle for --findrefs (substring for string/type, name for method/field).
+    #[arg(long = "findrefs-value", value_name = "VALUE")]
+    findrefs_value: Option<String>,
+
+    /// Restrict method/field --findrefs to this class (Dalvik or Java name).
+    #[arg(long = "findrefs-class", value_name = "CLASS")]
+    findrefs_class: Option<String>,
+
+    /// Treat --findrefs-class as a substring (fuzzy).
+    #[arg(long = "findrefs-fuzzy-class")]
+    findrefs_fuzzy_class: bool,
+
+    /// Use the fast path for existing xref-style method caller queries.
+    #[arg(long = "fast-xref")]
+    fast_xref: bool,
 }
