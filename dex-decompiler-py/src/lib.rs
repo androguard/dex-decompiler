@@ -1,13 +1,15 @@
 //! Python bindings for dex-decompiler (DEX to Java decompiler).
 
-use ::dex_decompiler::{
-    default_config, parse_dex, scan_dex_parallel, solve_dexes, Decompiler, DecompilerOptions,
-    DexFile, EncodedMethod, RenameMap, SolveOptions,
-};
 use ::dex_decompiler::java;
+use ::dex_decompiler::{
+    default_config, find_field_xrefs_fast, find_method_xrefs_fast, getclass_java,
+    load_dexes_from_bytes, parse_dex, scan_dex_parallel, slice_class_from_input, solve_dexes,
+    to_dalvik_descriptor, Decompiler, DecompilerOptions, DexFile, EncodedMethod, FastRefSite,
+    MethodCaller, RenameMap, SolveOptions,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+use pyo3::types::{PyDict, PyList, PyModule};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -321,9 +323,10 @@ impl DexFileWrapper {
         } else {
             default_config()
         };
-        let opts = SolveOptions {
-            max_iterations: max_iterations.unwrap_or(8),
-            exclude_prefixes: SolveOptions::default_android().exclude_prefixes,
+        let opts = {
+            let mut o = SolveOptions::default_android();
+            o.max_iterations = max_iterations.unwrap_or(8);
+            o
         };
         let result =
             solve_dexes(&[&dex], &config, &opts).map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -376,6 +379,225 @@ impl DexFileWrapper {
             Ok(dict.into_py(py))
         })
     }
+
+    /// ASC fast path: sites that reference a string containing `needle`.
+    fn find_string_xrefs(&self, needle: &str) -> PyResult<Vec<PyObject>> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let sites = ::dex_decompiler::find_string_xrefs(&dex, needle)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Python::with_gil(|py| sites.into_iter().map(|s| fast_ref_site_to_py(py, &s)).collect())
+    }
+
+    /// ASC fast path: sites that reference a type descriptor containing `needle`.
+    fn find_type_xrefs(&self, needle: &str) -> PyResult<Vec<PyObject>> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let sites = ::dex_decompiler::find_type_xrefs(&dex, needle)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Python::with_gil(|py| sites.into_iter().map(|s| fast_ref_site_to_py(py, &s)).collect())
+    }
+
+    /// ASC fast path: field reference sites.
+    ///
+    /// `class_name` may be Java (`com.foo.Bar`) or Dalvik (`Lcom/foo/Bar;`).
+    #[pyo3(signature = (class_name=None, field_name=None, exact_class=true))]
+    fn find_field_xrefs(
+        &self,
+        class_name: Option<&str>,
+        field_name: Option<&str>,
+        exact_class: bool,
+    ) -> PyResult<Vec<PyObject>> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let class = class_name.map(to_dalvik_descriptor);
+        let sites = find_field_xrefs_fast(
+            &dex,
+            class.as_deref(),
+            field_name,
+            exact_class,
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Python::with_gil(|py| sites.into_iter().map(|s| fast_ref_site_to_py(py, &s)).collect())
+    }
+
+    /// ASC fast path: method reference / invoke sites.
+    #[pyo3(signature = (class_name=None, method_name=None, exact_class=true))]
+    fn find_method_xrefs(
+        &self,
+        class_name: Option<&str>,
+        method_name: Option<&str>,
+        exact_class: bool,
+    ) -> PyResult<Vec<PyObject>> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let class = class_name.map(to_dalvik_descriptor);
+        let sites = find_method_xrefs_fast(
+            &dex,
+            class.as_deref(),
+            method_name,
+            exact_class,
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Python::with_gil(|py| sites.into_iter().map(|s| fast_ref_site_to_py(py, &s)).collect())
+    }
+
+    /// Callers of `method_ids` index (slow full decode path).
+    fn find_method_callers(&self, method_idx: u32) -> PyResult<PyObject> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let info = ::dex_decompiler::find_method_callers(&dex, method_idx)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Python::with_gil(|py| callers_info_to_py(py, &info))
+    }
+
+    /// Callers of `method_ids` index (ASC fast path).
+    fn find_method_callers_fast(&self, method_idx: u32) -> PyResult<PyObject> {
+        let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let info = ::dex_decompiler::find_method_callers_fast(&dex, method_idx)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Python::with_gil(|py| callers_info_to_py(py, &info))
+    }
+
+    /// Slice a minimal DEX containing only `class_name` (from this DEX's bytes).
+    fn slice_class(&self, class_name: &str) -> PyResult<Vec<u8>> {
+        ::dex_decompiler::slice_class_from_input(&self.data, class_name)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Decompile only `class_name` via slice (ASC getclass on a single DEX).
+    fn getclass(&self, class_name: &str) -> PyResult<String> {
+        ::dex_decompiler::getclass_java(&self.data, class_name, DecompilerOptions::default())
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+}
+
+fn fast_ref_site_to_py(py: Python<'_>, s: &FastRefSite) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("class_name", &s.class_name)?;
+    dict.set_item("method_name", &s.method_name)?;
+    dict.set_item("method_idx", s.method_idx)?;
+    dict.set_item("file_offset", s.file_offset)?;
+    dict.set_item("pool_idx", s.pool_idx)?;
+    dict.set_item("class_idx", s.class_idx)?;
+    dict.set_item("method_idx_in_class", s.method_idx_in_class)?;
+    Ok(dict.into_py(py))
+}
+
+fn caller_to_py(py: Python<'_>, c: &MethodCaller) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("class_name", &c.class_name)?;
+    dict.set_item("method_name", &c.method_name)?;
+    dict.set_item("method_descriptor", &c.method_descriptor)?;
+    dict.set_item("class_idx", c.class_idx)?;
+    dict.set_item("method_idx_in_class", c.method_idx_in_class)?;
+    dict.set_item("caller_method_idx", c.caller_method_idx)?;
+    dict.set_item("offset", c.offset)?;
+    dict.set_item("file_offset", c.file_offset)?;
+    dict.set_item("invoke_kind", &c.invoke_kind)?;
+    dict.set_item("callee_method_idx", c.callee_method_idx)?;
+    Ok(dict.into_py(py))
+}
+
+fn callers_info_to_py(
+    py: Python<'_>,
+    info: &::dex_decompiler::MethodCallersInfo,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("callee_method_idx", info.callee_method_idx)?;
+    dict.set_item("callee_class_name", &info.callee_class_name)?;
+    dict.set_item("callee_method_name", &info.callee_method_name)?;
+    dict.set_item("callee_descriptor", &info.callee_descriptor)?;
+    dict.set_item("truncated", info.truncated)?;
+    let callers = PyList::empty(py);
+    for c in &info.callers {
+        callers.append(caller_to_py(py, c)?)?;
+    }
+    dict.set_item("callers", callers)?;
+    Ok(dict.into_py(py))
+}
+
+/// Locate + slice + decompile a single class from DEX or APK bytes (ASC getclass).
+#[pyfunction]
+fn getclass(data: &[u8], class_name: &str) -> PyResult<String> {
+    getclass_java(data, class_name, DecompilerOptions::default())
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// Slice a minimal DEX containing only `class_name` from DEX or APK bytes.
+#[pyfunction]
+fn slice_class(data: &[u8], class_name: &str) -> PyResult<Vec<u8>> {
+    slice_class_from_input(data, class_name).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// Normalize a class name to a Dalvik descriptor (`Lcom/foo/Bar;`).
+#[pyfunction]
+fn to_dalvik(class_name: &str) -> String {
+    to_dalvik_descriptor(class_name)
+}
+
+/// ASC findrefs over DEX or APK bytes.
+///
+/// `kind` is one of: `"string"`, `"type"`, `"method"`, `"field"`.
+/// For method/field, `class_name` optionally restricts the owning class
+/// (Java or Dalvik form); set `fuzzy_class=True` for substring class match.
+#[pyfunction]
+#[pyo3(signature = (data, kind, value, class_name=None, fuzzy_class=false))]
+fn findrefs(
+    data: &[u8],
+    kind: &str,
+    value: &str,
+    class_name: Option<&str>,
+    fuzzy_class: bool,
+) -> PyResult<Vec<PyObject>> {
+    let path = Path::new(if data.len() >= 4 && &data[0..4] == b"dex\n" {
+        "input.dex"
+    } else {
+        "input.apk"
+    });
+    let dexes =
+        load_dexes_from_bytes(data, path).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let exact_class = !fuzzy_class;
+    let class_desc = class_name.map(to_dalvik_descriptor);
+    Python::with_gil(|py| {
+        let mut all = Vec::new();
+        for (dex_i, dex) in dexes.iter().enumerate() {
+            let sites: Vec<FastRefSite> = match kind {
+                "string" => ::dex_decompiler::find_string_xrefs(dex, value)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                "type" => ::dex_decompiler::find_type_xrefs(dex, value)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                "method" => find_method_xrefs_fast(
+                    dex,
+                    class_desc.as_deref(),
+                    Some(value),
+                    exact_class,
+                )
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                "field" => find_field_xrefs_fast(
+                    dex,
+                    class_desc.as_deref(),
+                    Some(value),
+                    exact_class,
+                )
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown kind {other:?} (string|type|method|field)"
+                    )));
+                }
+            };
+            for s in sites {
+                let dict = PyDict::new(py);
+                dict.set_item("dex", dex_i)?;
+                dict.set_item("kind", kind)?;
+                dict.set_item("class_name", &s.class_name)?;
+                dict.set_item("method_name", &s.method_name)?;
+                dict.set_item("method_idx", s.method_idx)?;
+                dict.set_item("file_offset", s.file_offset)?;
+                dict.set_item("pool_idx", s.pool_idx)?;
+                dict.set_item("class_idx", s.class_idx)?;
+                dict.set_item("method_idx_in_class", s.method_idx_in_class)?;
+                all.push(dict.into_py(py));
+            }
+        }
+        Ok(all)
+    })
 }
 
 /// Python module entry point.
@@ -383,5 +605,9 @@ impl DexFileWrapper {
 fn dex_decompiler(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DexFileWrapper>()?;
     m.add_function(wrap_pyfunction!(parse_dex_py, m)?)?;
+    m.add_function(wrap_pyfunction!(getclass, m)?)?;
+    m.add_function(wrap_pyfunction!(slice_class, m)?)?;
+    m.add_function(wrap_pyfunction!(findrefs, m)?)?;
+    m.add_function(wrap_pyfunction!(to_dalvik, m)?)?;
     Ok(())
 }

@@ -18,3 +18,5 @@ dex-parser = { path = "../../dex-parser/dexparser-rs" }
 
 [patch."https://github.com/androguard/dex-bytecode.git"]
 dex-bytecode = { path = "../../dex-bytecode/dex-bytecode" }
+
+# Ensure local apk-parser (ASC ZipIndex) is used via the parent crate path dep.

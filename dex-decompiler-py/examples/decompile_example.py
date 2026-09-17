@@ -25,6 +25,19 @@ def main() -> None:
     parser.add_argument("--list-strings", action="store_true", help="List first N strings and exit")
     parser.add_argument("--method", help="Decompile single method: CLASS#METHOD (e.g. com.example.Main#onCreate)")
     parser.add_argument("--cfg", help="Show bytecode + CFG for method: CLASS#METHOD")
+    parser.add_argument("--getclass", help="ASC getclass: decompile only this class (DEX or APK)")
+    parser.add_argument(
+        "--findrefs",
+        choices=["string", "type", "method", "field"],
+        help="ASC findrefs kind",
+    )
+    parser.add_argument("--findrefs-value", help="Needle for --findrefs")
+    parser.add_argument("--findrefs-class", help="Optional class for method/field findrefs")
+    parser.add_argument(
+        "--findrefs-fuzzy-class",
+        action="store_true",
+        help="Treat --findrefs-class as substring",
+    )
     args = parser.parse_args()
 
     path = Path(args.input)
@@ -33,6 +46,38 @@ def main() -> None:
         sys.exit(1)
 
     data = path.read_bytes()
+
+    if args.getclass:
+        try:
+            print(dex_decompiler.getclass(data, args.getclass))
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.findrefs:
+        if not args.findrefs_value:
+            print("--findrefs requires --findrefs-value", file=sys.stderr)
+            sys.exit(1)
+        try:
+            sites = dex_decompiler.findrefs(
+                data,
+                args.findrefs,
+                args.findrefs_value,
+                class_name=args.findrefs_class,
+                fuzzy_class=args.findrefs_fuzzy_class,
+            )
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"{len(sites)} site(s)")
+        for s in sites[:200]:
+            print(
+                f"  dex={s.get('dex')} {s.get('class_name')}#{s.get('method_name')} "
+                f"@0x{s.get('file_offset', 0):x} pool={s.get('pool_idx')}"
+            )
+        return
+
     try:
         dex = dex_decompiler.parse_dex(data)
     except ValueError as e:

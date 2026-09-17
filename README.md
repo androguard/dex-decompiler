@@ -495,6 +495,12 @@ java_renamed = dex.decompile_with_renames(
     field_renames={"com.example.Main#count": "mCount"},
     variable_renames={"com.example.Main#onCreate": {"p0": "context", "result": "out"}},
 )
+
+# ASC fast path (DEX or APK bytes)
+apk = open("app.apk", "rb").read()
+print(dex_decompiler.getclass(apk, "com.example.Main"))
+for site in dex_decompiler.findrefs(apk, "string", "token"):
+    print(site["class_name"], site["method_name"], hex(site["file_offset"]))
 ```
 
 See [dex-decompiler-py/README.md](dex-decompiler-py/README.md) for full API and installation options.
