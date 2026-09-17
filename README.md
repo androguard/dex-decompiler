@@ -119,6 +119,36 @@ cargo run --release --bin dex-decompile -- -i app.apk \
 
 We deliberately **do not** port ASC’s unimplemented partial-Deflate / Huffman bitstream probe, CPython regex/bigint scanners, or a second non-canonical DEX writer—canonical pools and checksums come from `dex-parser::DexBuilder`.
 
+### Benchmark vs Droid ASC
+
+Compare three tools on the same `getclass` / `findrefs` workloads:
+
+1. **rust-cli** — our `dex-decompile` release binary  
+2. **rust-py** — our `dex_decompiler` Python bindings  
+3. **droidasc** — upstream [MG1937/ASC](https://github.com/MG1937/ASC)
+
+```bash
+# Build our binary, then bench (installs ASC + Python bindings if needed)
+cargo build --release --bin dex-decompile
+python3 scripts/bench_asc_compare.py --install-asc --install-py
+
+# Custom APK / queries / JSON dump
+python3 scripts/bench_asc_compare.py --install-asc --install-py \
+  --apk /path/to/app.apk \
+  --class com.example.Main \
+  --string token \
+  --runs 5 --json-out /tmp/asc_bench.json
+
+# Already have droidasc + bindings
+python3 scripts/bench_asc_compare.py --asc-bin droidasc \
+  --py-python dex-decompiler-py/.venv/bin/python
+
+# Rust CLI vs Python bindings only (no upstream ASC)
+python3 scripts/bench_asc_compare.py --skip-asc --install-py
+```
+
+Default fixture: `testdata/bugbazaar/bugbazaar.apk` (~18 MB) with Firebase queries. Wall time and (when `/usr/bin/time` is available) max RSS are reported; the table includes `cli/ASC` and `py/ASC` speedup ratios.
+
 ## Simplifications
 
 Method bodies and IR are simplified so output looks like idiomatic Java.
