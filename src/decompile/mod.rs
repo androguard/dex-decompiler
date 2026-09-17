@@ -42,8 +42,7 @@ use pass::{
 };
 use region::{
     as_single_if, build_regions, build_regions_filtered, for_loop_pattern,
-    loop_body_do_while_exit_in_else, loop_body_do_while_pattern, loop_exit_break_target,
-    loop_prefix_multi_exit_ifs, region_contains_loop, region_is_empty, region_is_empty_with_cfg,
+    loop_body_do_while_pattern, region_contains_loop, region_is_empty, region_is_empty_with_cfg,
     Region,
 };
 use ssa::{apply_canonical_names, construct_ssa, phi_canonical_map, phi_registers, strip_phis};
@@ -4189,7 +4188,6 @@ impl<'a> Decompiler<'a> {
             let seq = self.block_instruction_seq_for_condition_naming(cfg, instructions, block_id);
             let mut local_names: HashMap<u32, String> = HashMap::new();
             let mut local_types: HashMap<u32, String> = HashMap::new();
-            let mut name_map: HashMap<ir::VarId, String> = HashMap::new();
             if !seq.is_empty() {
                 let stmts = self
                     .instructions_to_ir(&seq, base_off, code_insns, Some(instructions))
@@ -4203,7 +4201,7 @@ impl<'a> Decompiler<'a> {
                 runner.add(InlineFilledArrayPass);
                 let stmts = runner.run(stmts);
                 let types = infer_types(self.dex, encoded, code, &stmts);
-                name_map =
+                let mut name_map =
                     build_var_names_with_regs(&stmts, &types, registers_size, ins_size, is_static);
                 self.apply_debug_names_to_name_map(&mut name_map, &types, code, encoded);
                 self.apply_signature_param_names(&mut name_map, encoded, code);

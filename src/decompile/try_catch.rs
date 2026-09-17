@@ -137,20 +137,13 @@ pub fn parse_tries_and_handlers(
 
 /// Try and handler ranges in byte offsets (relative to start of insns, i.e. base_offset=0).
 /// try_start_byte, try_end_byte: [try_start_byte, try_end_byte) is the try range.
-/// handler_ranges: for each (type_idx, start_byte, end_byte), [start_byte, end_byte) is that handler's code.
+/// Compute try byte range and per-handler ranges.
 ///
-/// Handler ends at the next handler / catch-all start. The last handler ends at
-/// `post_handler_end` (continuation after all handlers), not necessarily `code_end`.
-pub fn try_and_handler_byte_ranges(
-    try_item: &TryItem,
-    handler: &EncodedCatchHandler,
-    insns_size_16bit: u32,
-) -> (u32, u32, Vec<(u32, u32, u32)>) {
-    try_and_handler_byte_ranges_with_end(try_item, handler, insns_size_16bit, None)
-}
-
-/// Like [`try_and_handler_byte_ranges`], but `post_handler_end` caps the last handler
-/// (e.g. next try start or method continuation).
+/// `handler_ranges`: for each `(type_idx, start_byte, end_byte)`, `[start_byte, end_byte)` is
+/// that handler's code. Handler ends at the next handler / catch-all start. The last handler
+/// ends at `post_handler_end` (continuation after all handlers), not necessarily `code_end`.
+///
+/// Pass `post_handler_end = None` to cap at the method code end.
 pub fn try_and_handler_byte_ranges_with_end(
     try_item: &TryItem,
     handler: &EncodedCatchHandler,
@@ -456,8 +449,8 @@ pub fn try_handler_pairs(
 #[cfg(test)]
 mod tests {
     use super::{
-        looks_like_finally, try_and_handler_byte_ranges, EncodedCatchHandler, EncodedTypeAddr,
-        TryItem,
+        looks_like_finally, try_and_handler_byte_ranges_with_end, EncodedCatchHandler,
+        EncodedTypeAddr, TryItem,
     };
 
     #[test]
@@ -504,7 +497,7 @@ mod tests {
             catch_all_addr: None,
         };
         let (try_start, try_end, handler_ranges) =
-            try_and_handler_byte_ranges(&try_item, &handler, 64);
+            try_and_handler_byte_ranges_with_end(&try_item, &handler, 64, None);
         assert_eq!(try_start, 0, "try starts at byte 0");
         assert_eq!(try_end, 32, "try ends at byte 32 (16 * 2)");
         assert_eq!(handler_ranges.len(), 1);
@@ -657,7 +650,7 @@ mod tests {
             catch_all_addr: Some(30),
         };
         let (try_start, try_end, handler_ranges) =
-            try_and_handler_byte_ranges(&try_item, &handler, 20);
+            try_and_handler_byte_ranges_with_end(&try_item, &handler, 20, None);
         assert_eq!(try_start, 0);
         assert_eq!(try_end, 20);
         assert_eq!(handler_ranges.len(), 2);

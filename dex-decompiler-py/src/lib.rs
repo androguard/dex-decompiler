@@ -15,7 +15,7 @@ use std::path::Path;
 
 /// Build RenameMap from optional Python dicts. Keys/values must be str.
 fn renames_from_py(
-    py: Python<'_>,
+    _py: Python<'_>,
     package: Option<&Bound<'_, PyAny>>,
     class: Option<&Bound<'_, PyAny>>,
     method: Option<&Bound<'_, PyAny>>,
@@ -242,7 +242,7 @@ impl DexFileWrapper {
                     dict.set_item("offset", r.offset).unwrap();
                     dict.set_item("mnemonic", r.mnemonic).unwrap();
                     dict.set_item("operands", r.operands).unwrap();
-                    dict.into_py(py)
+                    dict.into_any().unbind()
                 })
                 .collect();
             let nodes_py: Vec<PyObject> = nodes
@@ -253,7 +253,7 @@ impl DexFileWrapper {
                     dict.set_item("start_offset", n.start_offset).unwrap();
                     dict.set_item("end_offset", n.end_offset).unwrap();
                     dict.set_item("label", n.label).unwrap();
-                    dict.into_py(py)
+                    dict.into_any().unbind()
                 })
                 .collect();
             let edges_py: Vec<PyObject> = edges
@@ -262,7 +262,7 @@ impl DexFileWrapper {
                     let dict = pyo3::types::PyDict::new(py);
                     dict.set_item("from_id", e.from_id).unwrap();
                     dict.set_item("to_id", e.to_id).unwrap();
-                    dict.into_py(py)
+                    dict.into_any().unbind()
                 })
                 .collect();
             Ok((rows_py, nodes_py, edges_py))
@@ -304,7 +304,7 @@ impl DexFileWrapper {
                         trace_list.append(s)?;
                     }
                     dict.set_item("trace", trace_list)?;
-                    Ok(dict.into_py(py))
+                    Ok(dict.into_any().unbind())
                 })
                 .collect()
         })
@@ -376,7 +376,7 @@ impl DexFileWrapper {
                 regs.set_item(i, v.display_short_hex())?;
             }
             dict.set_item("registers", regs)?;
-            Ok(dict.into_py(py))
+            Ok(dict.into_any().unbind())
         })
     }
 
@@ -476,7 +476,7 @@ fn fast_ref_site_to_py(py: Python<'_>, s: &FastRefSite) -> PyResult<PyObject> {
     dict.set_item("pool_idx", s.pool_idx)?;
     dict.set_item("class_idx", s.class_idx)?;
     dict.set_item("method_idx_in_class", s.method_idx_in_class)?;
-    Ok(dict.into_py(py))
+    Ok(dict.into_any().unbind())
 }
 
 fn caller_to_py(py: Python<'_>, c: &MethodCaller) -> PyResult<PyObject> {
@@ -491,7 +491,7 @@ fn caller_to_py(py: Python<'_>, c: &MethodCaller) -> PyResult<PyObject> {
     dict.set_item("file_offset", c.file_offset)?;
     dict.set_item("invoke_kind", &c.invoke_kind)?;
     dict.set_item("callee_method_idx", c.callee_method_idx)?;
-    Ok(dict.into_py(py))
+    Ok(dict.into_any().unbind())
 }
 
 fn callers_info_to_py(
@@ -509,7 +509,7 @@ fn callers_info_to_py(
         callers.append(caller_to_py(py, c)?)?;
     }
     dict.set_item("callers", callers)?;
-    Ok(dict.into_py(py))
+    Ok(dict.into_any().unbind())
 }
 
 /// Locate + slice + decompile a single class from DEX or APK bytes (ASC getclass).
@@ -593,7 +593,7 @@ fn findrefs(
                 dict.set_item("pool_idx", s.pool_idx)?;
                 dict.set_item("class_idx", s.class_idx)?;
                 dict.set_item("method_idx_in_class", s.method_idx_in_class)?;
-                all.push(dict.into_py(py));
+                all.push(dict.into_any().unbind());
             }
         }
         Ok(all)

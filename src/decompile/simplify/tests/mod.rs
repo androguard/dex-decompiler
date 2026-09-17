@@ -2,23 +2,14 @@
 
 use super::cleanup::*;
 use super::conditions::*;
-use super::expr::*;
-use super::format::*;
 use super::loops::*;
-use super::try_catch::*;
 use super::util::*;
 use super::{
     java_string_hash_code, merge_duplicate_finally, normalize_java_indent, restore_string_switch,
-    simplify_method_body, simplify_synchronized_blocks,
+    simplify_method_body,
 };
 
-mod parsing {
-    use super::*;
-}
-
 mod pipeline {
-    use super::*;
-
     use super::*;
 
     #[test]
@@ -543,8 +534,6 @@ mod pipeline {
 }
 
 mod string_switch {
-    use super::*;
-
     use super::*;
 
     #[test]

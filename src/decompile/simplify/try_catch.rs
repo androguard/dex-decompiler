@@ -1,7 +1,5 @@
 //! Try/catch/finally, do-while, and enum switch-map restoration.
 
-use std::collections::{HashMap, HashSet};
-
 use super::util::*;
 
 /// Strip `Objects.requireNonNull` / Kotlin `Intrinsics.checkNotNull*` wrappers.

@@ -1,7 +1,6 @@
 //! Shared parsing, identifier, and structural helpers.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
 
 /// Strip trailing "  // ..." comment from a line to get the statement part.
 pub(crate) fn strip_trailing_comment(line: &str) -> String {

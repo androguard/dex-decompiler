@@ -210,10 +210,6 @@ struct MethodJob {
     encoded: EncodedMethod,
 }
 
-fn collect_method_jobs(dex: &DexFile) -> Vec<MethodJob> {
-    collect_method_jobs_scoped(dex, None, &[])
-}
-
 /// Number of non-library (and optionally prefix/exclude-scoped) methods with code.
 pub fn count_method_jobs_scoped(dex: &DexFile, prefixes: Option<&[String]>) -> usize {
     count_method_jobs_scoped_ex(dex, prefixes, &[])

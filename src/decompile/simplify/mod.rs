@@ -15,7 +15,14 @@ mod util;
 #[path = "tests/mod.rs"]
 mod tests;
 
-pub use format::{normalize_java_indent, simplify_synchronized_blocks};
+pub use format::simplify_synchronized_blocks;
 pub use pipeline::simplify_method_body;
-pub use string_switch::{java_string_hash_code, restore_string_switch};
+pub use string_switch::restore_string_switch;
+
+// Re-exports used by unit tests (and external callers).
+#[cfg(test)]
+pub use format::normalize_java_indent;
+#[cfg(test)]
+pub use string_switch::java_string_hash_code;
+#[cfg(test)]
 pub use try_catch::merge_duplicate_finally;
