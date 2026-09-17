@@ -8,7 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 dex-bytecode = { git = "https://github.com/androguard/dex-bytecode.git" }
 dex-parser = { git = "https://github.com/androguard/dex-parser", branch = "main" }
-apkparser = { path = "../apk-parser/apkparser-rs" }
+apkparser = { git = "https://github.com/androguard/apk-parser", branch = "main" }
 thiserror = "2.0.18"
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
@@ -29,10 +29,3 @@ path = "src/lib.rs"
 [[bin]]
 name = "dex-decompile"
 path = "src/bin/dex-decompile.rs"
-
-# Local siblings: Arc-backed DexFile for parallel decompile/taint/detectors.
-[patch."https://github.com/androguard/dex-parser"]
-dex-parser = { path = "../dex-parser/dexparser-rs" }
-
-[patch."https://github.com/androguard/dex-bytecode.git"]
-dex-bytecode = { path = "../dex-bytecode/dex-bytecode" }
