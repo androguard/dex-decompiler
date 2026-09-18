@@ -17,7 +17,12 @@ use super::util::*;
 /// Also collapses "if (cond) { return a; } else { return b; }" into "return cond ? a : b;" (JADX-style).
 /// When `is_constructor` is true, "receiver.<init>();" (no args) is simplified to "super();".
 pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
-    let body = fold_array_length_assigns(body);
+    let body = restore_synchronized_from_monitors(body);
+    let body = fold_running_arithmetic(&body);
+    let body = fold_postinc_division(&body);
+    let body = fold_const_break_into_while(&body);
+    let body = rewrite_nonreturning_while(&body);
+    let body = fold_array_length_assigns(&body);
     let body = fold_array_alloc_length_sum(&body);
     let body = fold_length_sum_return(&body);
     let lines: Vec<String> = body.lines().map(String::from).collect();
@@ -161,7 +166,6 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
             let mut const_assigns: Vec<(String, String)> = Vec::new();
 
             while j < lines.len() {
-                let jline = lines[j].trim();
                 if let Some((_init_var, init_arg)) = parse_init_call(&lines[j]) {
                     if let Some(arg) = init_arg {
                         parts.push(arg);
@@ -169,33 +173,41 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
                     j += 1;
                     continue;
                 }
-                if jline.contains(" = ")
-                    && !jline.contains(".append(")
-                    && !jline.contains(".toString(")
-                    && !jline.contains("new ")
-                    && !jline.contains(".println(")
-                {
-                    if let Some(eq) = jline.find(" = ") {
-                        let var = jline[..eq].trim();
-                        let val = jline[eq + 3..].trim_end_matches(';').trim();
-                        if !var.is_empty() && !val.is_empty() && !val.contains('(') {
-                            const_assigns.push((var.to_string(), val.to_string()));
-                            j += 1;
-                            continue;
-                        }
+                if let Some((var, val)) = parse_simple_assign_line(&lines[j]) {
+                    if !val.contains('(') && !val.contains("new ") && is_sb_chain_side_value(&val)
+                    {
+                        const_assigns.push((var, val));
+                        j += 1;
+                        continue;
                     }
                 }
                 break;
             }
 
+            let mut env = const_assigns;
             while j < lines.len() {
                 if let Some((_v, arg)) = parse_append(&lines[j]) {
-                    parts.push(arg);
+                    let inlined = env
+                        .iter()
+                        .rev()
+                        .find(|(var, _)| var == &arg)
+                        .map(|(_, val)| val.clone())
+                        .unwrap_or(arg);
+                    parts.push(inlined);
                     j += 1;
                     continue;
                 }
+                // `String s = "…";` / `int i = this.value;` between appends.
+                if let Some((var, val)) = parse_simple_assign_line(&lines[j]) {
+                    if is_sb_chain_side_value(&val) {
+                        env.push((var, val));
+                        j += 1;
+                        continue;
+                    }
+                }
                 break;
             }
+            const_assigns = env;
 
             if j < lines.len() && !parts.is_empty() {
                 if let Some((dest, _to_str_var)) = parse_to_string(&lines[j]) {
@@ -273,6 +285,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = restore_counting_for_loop(&out);
     // Remove bare "var; /* move-exception */" lines and inline single-use temps (consts / simple copies).
     out = inline_global_literal_temps(&out);
+    out = repair_self_sized_new_array(&out);
     out = repair_register_reuse_scalars(&out);
     out = repair_loop_length_index_shadow(&out);
     out = restore_array_store_postincrement(&out);
@@ -382,5 +395,16 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = restore_d8_merge_copy_loops(&out);
     out = cleanup_decompiler_artifacts(&out);
     out = repair_ssa_temp_increments(&out);
+    out = fold_running_arithmetic(&out);
+    out = rewrite_nonreturning_while(&out);
     out
+}
+
+/// Values that can sit between `append` calls without ending a StringBuilder chain.
+fn is_sb_chain_side_value(val: &str) -> bool {
+    let val = val.trim();
+    if val.is_empty() || val.contains('(') || val.contains("new ") {
+        return false;
+    }
+    is_cheap_literal_rhs(val) || is_simple_field_path(val) || is_java_ident(val)
 }

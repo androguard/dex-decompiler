@@ -421,13 +421,15 @@ impl MethodCfg {
             }
         }
 
-        Self {
+        let mut cfg = Self {
             blocks,
             block_by_start,
             loop_headers,
             entry,
             folded_const_offsets: HashSet::new(),
-        }
+        };
+        cfg.unmark_handler_copy_joins(instructions);
+        cfg
     }
 
     pub fn block_count(&self) -> usize {
@@ -588,6 +590,67 @@ impl MethodCfg {
             }
         }
         edges
+    }
+
+    /// A single `move` reached by normal fallthrough and by a catch `goto` is the
+    /// delayed store of `j++` (`foo4`), not a loop. The catch edge is the only back edge.
+    pub fn unmark_handler_copy_joins(&mut self, instructions: &[Instruction]) {
+        let handler_blocks: HashSet<BlockId> = instructions
+            .iter()
+            .filter(|ins| ins.mnemonic() == "move-exception")
+            .filter_map(|ins| self.block_id_at_offset(ins.offset))
+            .collect();
+        if handler_blocks.is_empty() {
+            return;
+        }
+        let mut drop_headers = Vec::new();
+        for &header in &self.loop_headers {
+            if !block_is_plain_move(self, header, instructions) {
+                continue;
+            }
+            let sources = back_edge_sources(self, header);
+            if sources.is_empty() {
+                continue;
+            }
+            if sources.iter().all(|src| {
+                *src == header || reachable_from_handlers(self, &handler_blocks, *src, header)
+            }) {
+                drop_headers.push(header);
+            }
+        }
+        for header in drop_headers {
+            self.loop_headers.remove(&header);
+        }
+    }
+
+    fn successors_of(&self, bid: BlockId) -> Vec<BlockId> {
+        let mut out = Vec::new();
+        match &self.blocks[bid].end {
+            BlockEnd::Goto(t) => out.push(*t),
+            BlockEnd::FallThrough => {
+                if let Some(ft) = self.fall_through_block(bid) {
+                    out.push(ft);
+                }
+            }
+            BlockEnd::Conditional {
+                branch_target,
+                fall_through,
+                ..
+            } => {
+                out.push(*branch_target);
+                out.push(*fall_through);
+            }
+            BlockEnd::Switch {
+                cases,
+                default_block,
+                ..
+            } => {
+                out.extend(cases.iter().map(|(_, b)| *b));
+                out.push(*default_block);
+            }
+            BlockEnd::Exit => {}
+        }
+        out
     }
 
     pub fn fall_through_block(&self, block_id: BlockId) -> Option<BlockId> {
@@ -789,6 +852,56 @@ impl MethodCfg {
     }
 }
 
+fn block_is_plain_move(cfg: &MethodCfg, bid: BlockId, instructions: &[Instruction]) -> bool {
+    let offs = &cfg.blocks[bid].instruction_offsets;
+    if offs.len() != 1 {
+        return false;
+    }
+    instructions.iter().any(|ins| {
+        ins.offset == offs[0]
+            && matches!(ins.mnemonic(), "move" | "move/from16" | "move/16")
+    })
+}
+
+fn back_edge_sources(cfg: &MethodCfg, header: BlockId) -> Vec<BlockId> {
+    let header_start = cfg.blocks[header].start_offset;
+    (0..cfg.blocks.len())
+        .filter(|&bid| {
+            bid != header
+                && cfg.blocks[bid].start_offset > header_start
+                && cfg.successors_of(bid).contains(&header)
+        })
+        .collect()
+}
+
+/// True if `target` is reachable from a handler block without entering `avoid`.
+fn reachable_from_handlers(
+    cfg: &MethodCfg,
+    handlers: &HashSet<BlockId>,
+    target: BlockId,
+    avoid: BlockId,
+) -> bool {
+    if handlers.contains(&target) {
+        return true;
+    }
+    let mut seen = HashSet::new();
+    let mut stack: Vec<BlockId> = handlers.iter().copied().collect();
+    while let Some(bid) = stack.pop() {
+        if bid == avoid || !seen.insert(bid) {
+            continue;
+        }
+        for succ in cfg.successors_of(bid) {
+            if succ == target {
+                return true;
+            }
+            if succ != avoid {
+                stack.push(succ);
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BlockEnd, MethodCfg};
@@ -807,6 +920,41 @@ mod tests {
         assert!(cfg.block_count() >= 1);
         assert!(matches!(cfg.blocks[cfg.entry].end, BlockEnd::Exit));
         assert!(cfg.loop_headers.is_empty());
+    }
+
+    /// Catch `goto` into the delayed `j = j + 1` store is a join, not a second loop (`foo4`).
+    #[test]
+    fn handler_goto_into_move_is_not_a_loop() {
+        let bytecode: &[u8] = &[
+            0x00, 0x00, 0x35, 0x32, 0x0c, 0x00, 0xd8, 0x00, 0x03, 0x01, 0xb3, 0x23, 0x01, 0x32,
+            0x01, 0x03, 0x28, 0xf9, 0x0d, 0x03, 0x13, 0x02, 0x0a, 0x00, 0x28, 0xfb, 0x0f, 0x03,
+        ];
+        let instructions = decode_all(bytecode, 0).unwrap();
+        let cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_for);
+        let move_blocks: Vec<_> = cfg
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                b.instruction_offsets.len() == 1
+                    && instructions.iter().any(|ins| {
+                        ins.offset == b.instruction_offsets[0] && ins.mnemonic() == "move"
+                    })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!move_blocks.is_empty(), "expected the j++ store block");
+        for bid in move_blocks {
+            assert!(
+                !cfg.loop_headers.contains(&bid),
+                "move block {bid} marked as loop header: {:?}",
+                cfg.loop_headers
+            );
+        }
+        assert!(
+            !cfg.loop_headers.is_empty(),
+            "the real while (i < j) header should remain"
+        );
     }
 
     /// if-eqz v0, +4; goto +2; return-void; return-void

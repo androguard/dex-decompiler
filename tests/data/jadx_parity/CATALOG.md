@@ -28,6 +28,8 @@ to `tests/decompiler/jadx_parity.rs` (and related unit tests).
 | `trycatch` multi-resource TWR | `try (A a; B b)` | `jadx_try_with_resources_multi` |
 | (style) redundant casts | `(T) new T` / `(T)(T)` | `jadx_strip_redundant_cast` |
 | (style) StringConcatFactory | `a + b` | `jadx_string_concat_indy` (unit) |
+| `inline/TestInline` | one-use return temp | `jadx_inline_return_temp` (unit) |
+| `inline` / CodeShrink | `v = a; v = b` dead store | `jadx_shrink_immediate_overwrite` (unit) |
 | Kotlin `@Metadata` | d1/d2 + NameResolver | `kotlin::tests` (BitEncoding, base64, wire walk, NameResolver, comment_prefix) |
 | finally heuristic | cleanup vs handle | `looks_like_finally_*` in `try_catch.rs` |
 | duplicate-path finally | peel common suffix → `finally` | `merge_duplicate_finally_peels_close` |

@@ -197,6 +197,80 @@ mod pipeline {
     }
 
     #[test]
+    fn stringbuilder_chain_keeps_each_loaded_piece() {
+        let body = "\
+        PrintStream v0 = System.out;\n\
+        StringBuilder sb1 = new StringBuilder();\n\
+        String s1 = \"VALUE = \";\n\
+        sb1 = sb1.append(s1);\n\
+        int i2 = this.value;\n\
+        sb1 = sb1.append(i2);\n\
+        s1 = \" VALUE 2 = \";\n\
+        sb1 = sb1.append(s1);\n\
+        i2 = this.value2;\n\
+        sb1 = sb1.append(i2);\n\
+        String s2 = sb1.toString();\n\
+        v0.println(s2);\n\
+        s1 = \"boom\";\n\
+        v0.println(s1);\n";
+        let out = simplify_method_body(body, false);
+        assert!(
+            out.contains(
+                "System.out.println(\"VALUE = \" + this.value + \" VALUE 2 = \" + this.value2);"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("println(\"boom\")") || out.contains("println(s1)"),
+            "{out}"
+        );
+        assert!(!out.contains("0.0.append"), "{out}");
+        assert!(!out.contains("append(\"boom\")"), "{out}");
+    }
+
+    #[test]
+    fn later_literal_does_not_rewrite_earlier_uses() {
+        let body = "\
+        String s1 = \"VALUE = \";\n\
+        sb.append(s1);\n\
+        s1 = \"boom\";\n\
+        v0.println(s1);\n";
+        let out = simplify_method_body(body, false);
+        assert!(
+            out.contains("append(\"VALUE = \")") || out.contains("append(s1)"),
+            "{out}"
+        );
+        assert!(!out.contains("append(\"boom\")"), "{out}");
+    }
+
+    #[test]
+    fn self_sized_new_array_uses_preceding_int() {
+        let body = "\
+        y = 5;\n\
+        try {\n\
+        int[] arr0 = new int[arr0];\n\
+        } catch (ArrayIndexOutOfBoundsException e) {\n\
+        }\n";
+        let out = simplify_method_body(body, false);
+        assert!(out.contains("new int[5]"), "{out}");
+        assert!(!out.contains("new int[0.0]"), "{out}");
+        assert!(!out.contains("new int[arr0]"), "{out}");
+    }
+
+    #[test]
+    fn object_receiver_is_not_rewritten_to_zero() {
+        let body = "\
+        result = local0.test1(20);\n\
+        result = result * 200;\n";
+        let out = simplify_method_body(body, false);
+        assert!(!out.contains("= 0.test1") && !out.contains("(0.test1"), "{out}");
+        assert!(
+            out.contains("local0.test1(20)") || out.contains("this.test1(20)"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn simplify_remove_move_exception() {
         let body = "\
                 local0; /* move-exception */\n\
@@ -471,6 +545,60 @@ mod pipeline {
         );
     }
 
+    /// jadx `CodeShrinkVisitor` / `inline/TestInline`: a store killed by the next
+    /// assignment is dropped, and the declaration type moves onto the surviving store.
+    #[test]
+    fn jadx_shrink_immediate_overwrite() {
+        let body = "\
+        int result = 0;\n\
+        result = y;\n\
+        use(result);\n\
+        result = TestDefault.test2;\n\
+        result = this.test1(20) * 200;\n";
+        let out = simplify_method_body(body, false);
+        assert!(out.contains("int result = y;"), "{out}");
+        assert!(!out.contains("result = 0"), "{out}");
+        assert!(!out.contains("result = TestDefault.test2"), "{out}");
+        assert!(out.contains("this.test1(20) * 200"), "{out}");
+    }
+
+    /// jadx `inline/TestInline`: one-use temp returned immediately is inlined.
+    #[test]
+    fn jadx_inline_return_temp() {
+        let body = "\
+        int n = a + b;\n\
+        return n;\n";
+        let out = simplify_method_body(body, false);
+        assert!(out.contains("return a + b;"), "{out}");
+        assert!(!out.contains("int n"), "{out}");
+    }
+
+    #[test]
+    fn overwrite_keeps_call_with_side_effect() {
+        let body = "\
+        int result = foo();\n\
+        result = y;\n";
+        let out = simplify_method_body(body, false);
+        assert!(out.contains("foo()"), "{out}");
+    }
+
+    #[test]
+    fn bare_literal_index_and_dead_store_fold() {
+        let body = "\
+        y = 5;\n\
+        int[] arr0 = new int[5];\n\
+        y = 6;\n\
+        arr0[y] = 1;\n\
+        y = this.pouet();\n\
+        this.value2 = y;\n";
+        let out = cleanup_decompiler_artifacts(body);
+        assert!(!out.contains("y = 5"), "{out}");
+        assert!(!out.contains("y = 6"), "{out}");
+        assert!(out.contains("arr0[6] = 1"), "{out}");
+        assert!(out.contains("this.value2 = this.pouet()"), "{out}");
+        assert!(!out.contains("y = this.pouet()"), "{out}");
+    }
+
     #[test]
     fn simplify_inline_return_string_constant() {
         let body = "                        String result = \"bad_name\";\n                        return result;";
@@ -530,6 +658,64 @@ mod pipeline {
             "body statements should be 8 spaces, got {:?}: {:?}",
             spaces, simplified
         );
+    }
+
+    #[test]
+    fn keep_unused_yvwx2_style_double() {
+        let body = "        double yvwx2 = -123456789123456784.0;\n        float yvwx = -123456790519087104.0f;\n        System.out.println(1);\n";
+        let out = simplify_method_body(body, false);
+        assert!(out.contains("yvwx2"), "lost yvwx2: {out}");
+        assert!(out.contains("double yvwx2"), "typed decl:\n{out}");
+    }
+
+    #[test]
+    fn folds_running_double_arithmetic() {
+        let body = "\
+        double useless = (double) g;\n\
+        useless = useless * c;\n\
+        useless = useless + b;\n\
+        useless = useless - (double) y;\n\
+        useless = useless + d;\n";
+        let out = simplify_method_body(body, false);
+        assert!(
+            out.contains("double useless = g * c + b - y + d;"),
+            "{out}"
+        );
+        assert_eq!(out.lines().filter(|l| l.contains("useless")).count(), 1);
+    }
+
+    #[test]
+    fn folds_postinc_division() {
+        let body = "\
+        while (i < j) {\n\
+            int i2 = j + 1;\n\
+            j = j / i;\n\
+            i = j;\n\
+            j = i2;\n\
+        }\n";
+        let out = simplify_method_body(body, false);
+        assert!(out.contains("i = j++ / i;"), "{out}");
+        assert!(!out.contains("i2"), "{out}");
+    }
+
+    #[test]
+    fn rewrites_while_that_cannot_exit() {
+        // Explicit spaces: a `\` string continuation drops the next line's indent.
+        let body = "        while (i < j) {\n            i = j++ / i;\n            if (i == 0) {\n                return j;\n            }\n        }\n";
+        let out = simplify_method_body(body, false);
+        assert!(out.contains("while (true)"), "{out}");
+        assert!(out.contains("if (i < j)"), "{out}");
+        assert!(out.contains("if (i == 0)"), "{out}");
+        assert!(out.contains("return j;"), "{out}");
+        assert!(!out.contains("if (true)"), "{out}");
+    }
+
+    #[test]
+    fn keeps_int_compare_for_index_name() {
+        let body = "        if (i == 0) {\n            return j;\n        }\n";
+        let out = simplify_method_body(body, false);
+        assert!(out.contains("i == 0"), "became null:\n{out}");
+        assert!(!out.contains("== null"), "{out}");
     }
 }
 

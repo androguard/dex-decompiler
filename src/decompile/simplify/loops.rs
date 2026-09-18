@@ -1554,3 +1554,208 @@ fn restore_d8_merge_drain_once(body: &str) -> String {
     }
     body.to_string()
 }
+
+/// A `while (cond)` that is the whole method and ends in `if (…) return` cannot
+/// actually exit on `!cond` (the method would not return). javac lowered
+/// `while (true)` that way for `foo2`.
+pub(crate) fn rewrite_nonreturning_while(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some(w) = lines.iter().position(|l| l.trim().starts_with("while (")) else {
+        return body.to_string();
+    };
+    if lines[..w].iter().any(|l| !l.trim().is_empty()) {
+        return body.to_string();
+    }
+    let Some(cond) = parse_while_condition(lines[w]) else {
+        return body.to_string();
+    };
+    if cond == "true" {
+        return body.to_string();
+    }
+    let Some(close) = find_closing_brace_line(&lines, w) else {
+        return body.to_string();
+    };
+    if lines[close + 1..]
+        .iter()
+        .any(|l| !l.trim().is_empty())
+    {
+        return body.to_string();
+    }
+    let while_indent = leading_indent(lines[w]);
+    let child_indent = format!("{while_indent}    ");
+    let Some(rel) = lines[w + 1..close].iter().rposition(|l| {
+        l.trim().starts_with("if (") && leading_indent(l) == child_indent
+    }) else {
+        return body.to_string();
+    };
+    let if_idx = w + 1 + rel;
+    let Some(if_close) = find_closing_brace_line(&lines, if_idx) else {
+        return body.to_string();
+    };
+    if lines[if_close + 1..close]
+        .iter()
+        .any(|l| !l.trim().is_empty())
+    {
+        return body.to_string();
+    }
+    let if_cond = parse_if_condition(lines[if_idx]).unwrap_or_default();
+    if !if_cond.contains("== 0") {
+        return body.to_string();
+    }
+    let returns = lines[if_idx..=if_close]
+        .iter()
+        .any(|l| l.trim().starts_with("return "));
+    if !returns {
+        return body.to_string();
+    }
+    let inner: Vec<&str> = lines[w + 1..if_idx]
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if inner.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&format!("{while_indent}while (true) {{\n"));
+    out.push_str(&format!("{child_indent}if ({cond}) {{\n"));
+    for line in &inner {
+        let extra = if leading_indent(line).len() >= child_indent.len() {
+            &line[child_indent.len()..]
+        } else {
+            line.trim()
+        };
+        out.push_str(&format!("{child_indent}    {extra}\n"));
+    }
+    out.push_str(&format!("{child_indent}}}\n"));
+    for line in &lines[if_idx..=if_close] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!("{while_indent}}}"));
+    if body.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// `while (i < j) { int t = 10; if (i == t) { break; } BODY }`
+/// → `while (i < j && i != 10) { BODY }`.
+/// The const is the compiler's copy of a second loop-exit test (`foobis`).
+pub(crate) fn fold_const_break_into_while(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut skip = HashSet::new();
+    let mut repl: HashMap<usize, String> = HashMap::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let Some(cond) = parse_while_condition(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        let Some(close) = find_closing_brace_line(&lines, i) else {
+            i += 1;
+            continue;
+        };
+        let Some(assign_idx) = (i + 1..close).find(|&k| !lines[k].trim().is_empty()) else {
+            i += 1;
+            continue;
+        };
+        let Some((var, lit)) = parse_simple_assign_line(lines[assign_idx]) else {
+            i += 1;
+            continue;
+        };
+        if !is_numeric_literal(&lit) {
+            i += 1;
+            continue;
+        }
+        let Some(if_idx) = (assign_idx + 1..close).find(|&k| !lines[k].trim().is_empty()) else {
+            i += 1;
+            continue;
+        };
+        if leading_indent(lines[if_idx]) != leading_indent(lines[assign_idx]) {
+            i += 1;
+            continue;
+        }
+        let Some(if_cond) = parse_if_condition(lines[if_idx]) else {
+            i += 1;
+            continue;
+        };
+        let Some(if_close) = find_closing_brace_line(&lines, if_idx) else {
+            i += 1;
+            continue;
+        };
+        if if_close > close {
+            i += 1;
+            continue;
+        }
+        let only_break = lines[if_idx + 1..if_close]
+            .iter()
+            .all(|l| l.trim().is_empty() || l.trim() == "break;");
+        if !only_break {
+            i += 1;
+            continue;
+        }
+        let Some((cmp_var, op)) = cmp_against_temp(&if_cond, &var) else {
+            i += 1;
+            continue;
+        };
+        if lines[if_close + 1..close]
+            .iter()
+            .any(|l| ident_occurs(l, &var))
+        {
+            i += 1;
+            continue;
+        }
+        let extra = match op {
+            "==" => format!("{cmp_var} != {lit}"),
+            "!=" => format!("{cmp_var} == {lit}"),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let indent = leading_indent(lines[i]);
+        repl.insert(i, format!("{indent}while ({cond} && {extra}) {{"));
+        for k in assign_idx..=if_close {
+            skip.insert(k);
+        }
+        i = close + 1;
+    }
+    if repl.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if skip.contains(&idx) {
+            continue;
+        }
+        if let Some(rep) = repl.get(&idx) {
+            out.push_str(rep);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !body.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn cmp_against_temp(cond: &str, temp: &str) -> Option<(String, &'static str)> {
+    for op in ["==", "!="] {
+        let needle = format!(" {op} ");
+        let Some((a, b)) = cond.split_once(&needle) else {
+            continue;
+        };
+        let a = a.trim();
+        let b = b.trim();
+        if b == temp && is_java_ident(a) {
+            return Some((a.to_string(), op));
+        }
+        if a == temp && is_java_ident(b) {
+            return Some((b.to_string(), op));
+        }
+    }
+    None
+}

@@ -112,6 +112,7 @@ pub fn infer_types(
         .map(|p| java::descriptor_to_java(p))
         .collect();
     let return_type_java = java::descriptor_to_java(&info.return_type);
+    let field_types = FieldTypeIndex::build(dex);
 
     // Seed param registers (version 0) at the high end of the Dalvik frame.
     let param_base = registers_size.saturating_sub(ins_size);
@@ -203,7 +204,7 @@ pub fn infer_types(
                             None
                         })
                     }
-                    IrExpr::Raw(s) => infer_type_from_raw(s, &types),
+                    IrExpr::Raw(s) => infer_typed_raw(dex, &field_types, s, &types),
                     IrExpr::PendingResult => None,
                 };
                 if let Some(t) = ty {
@@ -229,18 +230,69 @@ fn looks_like_wide_bits_literal(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii_digit()) && s.len() > 10
 }
 
+fn raw_looks_like_wide_or_float_literal(s: &str) -> bool {
+    let s = s.trim();
+    if s.ends_with('f') || s.ends_with('F') {
+        return true;
+    }
+    if s.contains('.') && s.chars().all(|c| c.is_ascii_digit() || ".-+eEfF".contains(c)) {
+        return true;
+    }
+    looks_like_wide_bits_literal(s) || (s.starts_with("0x") || s.starts_with("0X")) && s.ends_with('L')
+}
+
 /// Fill missing SSA types from a whole-method register→type map, then re-propagate
 /// Assign RHS types (so `aget` can pick up array element types across blocks).
 pub fn enrich_types_with_register_map(
+    dex: &DexFile,
     type_map: &mut HashMap<VarId, String>,
     reg_types: &HashMap<u32, String>,
     stmts: &[IrStmt],
 ) {
+    enrich_types_with_register_map_and_debug(dex, type_map, reg_types, None, stmts);
+}
+
+pub fn enrich_types_with_register_map_and_debug(
+    dex: &DexFile,
+    type_map: &mut HashMap<VarId, String>,
+    reg_types: &HashMap<u32, String>,
+    debug_types: Option<&HashMap<u32, String>>,
+    stmts: &[IrStmt],
+) {
+    let field_types = FieldTypeIndex::build(dex);
     for stmt in stmts {
         if let IrStmt::Assign { dst, rhs, .. } = stmt {
+            if let Some(dbg) = debug_types.and_then(|m| m.get(&dst.reg)) {
+                match rhs {
+                    IrExpr::Raw(r)
+                        if raw_looks_like_wide_or_float_literal(r)
+                            || r.parse::<i64>().is_ok()
+                            || r.starts_with("0x")
+                            || r.starts_with("0X") =>
+                    {
+                        // Prefer the literal's own type when it conflicts with a later
+                        // debug type on a reused register (`double -5.0` vs `float gettype`).
+                        if let Some(lit_ty) = infer_type_from_raw(r, type_map) {
+                            if types_compatible_for_naming(Some(lit_ty.as_str()), Some(dbg)) {
+                                type_map.insert(*dst, dbg.clone());
+                            } else {
+                                type_map.insert(*dst, lit_ty);
+                            }
+                        } else if !type_map.contains_key(dst) {
+                            type_map.insert(*dst, dbg.clone());
+                        }
+                        continue;
+                    }
+                    _ if !type_map.contains_key(dst) => {
+                        type_map.insert(*dst, dbg.clone());
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             if !type_map.contains_key(dst) {
                 if let IrExpr::Raw(r) = rhs {
-                    if let Some(ty) = infer_type_from_raw(r, type_map) {
+                    if let Some(ty) = infer_typed_raw(dex, &field_types, r, type_map) {
                         type_map.insert(*dst, ty);
                     }
                 }
@@ -251,6 +303,23 @@ pub fn enrich_types_with_register_map(
                 continue;
             }
             if let Some(ty) = reg_types.get(&v.reg) {
+                // Do not paint a wide numeric const with a later reused register's
+                // float/reference type (e.g. `float g = -6.0`).
+                if let IrStmt::Assign {
+                    dst,
+                    rhs: IrExpr::Raw(raw),
+                    ..
+                } = stmt
+                {
+                    if *dst == v && raw_looks_like_wide_or_float_literal(raw) {
+                        if let Some(lit_ty) = infer_type_from_raw(raw, type_map) {
+                            if !types_compatible_for_naming(Some(lit_ty.as_str()), Some(ty)) {
+                                type_map.insert(v, lit_ty);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 type_map.insert(v, ty.clone());
             }
         }
@@ -265,7 +334,7 @@ pub fn enrich_types_with_register_map(
                 }
                 let ty = match rhs {
                     IrExpr::Var(v) => type_map.get(v).cloned(),
-                    IrExpr::Raw(s) => infer_type_from_raw(s, type_map),
+                    IrExpr::Raw(s) => infer_typed_raw(dex, &field_types, s, type_map),
                     IrExpr::Call { .. } | IrExpr::PendingResult => None,
                 };
                 if let Some(t) = ty {
@@ -297,6 +366,140 @@ fn vars_in_stmt(stmt: &IrStmt) -> Vec<VarId> {
         }
         IrStmt::Raw(text) => var_ids_in_text(text),
     }
+}
+
+/// owner Java name → field name → Java type.
+struct FieldTypeIndex {
+    by_owner: HashMap<String, HashMap<String, String>>,
+}
+
+impl FieldTypeIndex {
+    fn build(dex: &DexFile) -> Self {
+        let mut by_owner: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let n = dex.header.field_ids_size;
+        for idx in 0..n {
+            let Ok(fi) = dex.get_field_info(idx) else {
+                continue;
+            };
+            let owner = java::descriptor_to_java(&fi.class);
+            let ty = java::descriptor_to_java(&fi.typ);
+            by_owner.entry(owner).or_default().insert(fi.name, ty);
+        }
+        Self { by_owner }
+    }
+
+    fn lookup(&self, dex: &DexFile, owner: &str, field: &str) -> Option<String> {
+        let mut current = owner.to_string();
+        for _ in 0..24 {
+            if let Some(ty) = self
+                .by_owner
+                .get(&current)
+                .and_then(|fields| fields.get(field))
+            {
+                return Some(ty.clone());
+            }
+            current = superclass_java(dex, &current)?;
+        }
+        None
+    }
+}
+
+fn superclass_java(dex: &DexFile, class_java: &str) -> Option<String> {
+    if class_java.is_empty() || is_primitive_java_type(class_java) {
+        return None;
+    }
+    let want = format!("L{};", class_java.replace('.', "/"));
+    for def in dex.class_defs().flatten() {
+        let Ok(desc) = dex.get_type(def.class_idx) else {
+            continue;
+        };
+        if desc != want {
+            continue;
+        }
+        if def.superclass_idx == dex_parser::NO_INDEX {
+            return None;
+        }
+        let Ok(super_desc) = dex.get_type(def.superclass_idx) else {
+            return None;
+        };
+        let super_java = java::descriptor_to_java(&super_desc);
+        if super_java.is_empty() || super_java == class_java {
+            return None;
+        }
+        return Some(super_java);
+    }
+    None
+}
+
+fn is_reg_token(s: &str) -> bool {
+    let Some(vid) = parse_var_id(s) else {
+        return false;
+    };
+    let expect = if vid.ver == 0 {
+        format!("v{}", vid.reg)
+    } else {
+        format!("v{}_{}", vid.reg, vid.ver)
+    };
+    s == expect
+}
+
+/// `vN.field` / `pkg.Class.field` → the field's declared type, not the receiver register.
+fn infer_field_load_type(
+    dex: &DexFile,
+    fields: &FieldTypeIndex,
+    s: &str,
+    types: &HashMap<VarId, String>,
+) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty()
+        || s.contains('(')
+        || s.contains(' ')
+        || s.contains('[')
+        || s.contains('"')
+        || s.ends_with(".length")
+        || s.ends_with(".class")
+    {
+        return None;
+    }
+    let (recv, field) = s.rsplit_once('.')?;
+    if field.is_empty()
+        || !field
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    {
+        return None;
+    }
+    let owner = if is_reg_token(recv) {
+        let vid = parse_var_id(recv)?;
+        types
+            .get(&vid)
+            .cloned()
+            .or_else(|| types.get(&VarId::new(vid.reg, 0)).cloned())?
+    } else {
+        // Reject numeric receivers so `1.0` / `4.2f` are not field loads.
+        if !recv.chars().any(|c| c.is_ascii_alphabetic() || c == '_') {
+            return None;
+        }
+        recv.to_string()
+    };
+    if is_primitive_java_type(&owner) || is_reg_token(&owner) {
+        return None;
+    }
+    fields.lookup(dex, &owner, field)
+}
+
+fn infer_typed_raw(
+    dex: &DexFile,
+    fields: &FieldTypeIndex,
+    s: &str,
+    types: &HashMap<VarId, String>,
+) -> Option<String> {
+    if let Some(ty) = infer_field_load_type(dex, fields, s, types) {
+        if !is_reg_token(&ty) {
+            return Some(ty);
+        }
+    }
+    infer_type_from_raw(s, types).filter(|ty| !is_reg_token(ty))
 }
 
 /// Infer type from Raw RHS: string literal, new-array "new Type[size]", new-instance, literal, or first variable reference's type.
@@ -361,7 +564,14 @@ fn infer_type_from_raw(s: &str, types: &HashMap<VarId, String>) -> Option<String
     if s.starts_with('(') {
         if let Some(close) = s.find(") ") {
             let ty = s[1..close].trim();
-            if !ty.is_empty() && ty.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            if !ty.is_empty()
+                && (is_primitive_java_type(ty)
+                    || ty
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false))
+            {
                 return Some(ty.to_string());
             }
         }
@@ -387,15 +597,21 @@ fn infer_type_from_raw(s: &str, types: &HashMap<VarId, String>) -> Option<String
         }
     }
     // Static field / enum constant: com.foo.Bar.BAZ → com.foo.Bar
+    // Must not treat float/double literals (`1.0`, `4.2f`) as Class.field.
     if s.contains('.') && !s.contains('(') && !s.contains(' ') && !s.contains('[') {
         if let Some((type_part, field)) = s.rsplit_once('.') {
-            if !type_part.is_empty()
-                && !field.is_empty()
-                && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            let field_ok = !field.is_empty()
+                && field
+                    .chars()
+                    .all(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && field.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$');
+            let type_ok = !type_part.is_empty()
+                && !is_reg_token(type_part)
                 && type_part
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$')
-            {
+                && type_part.chars().any(|c| c.is_ascii_alphabetic() || c == '_');
+            if field_ok && type_ok {
                 return Some(type_part.to_string());
             }
         }
@@ -453,8 +669,14 @@ fn infer_type_from_raw(s: &str, types: &HashMap<VarId, String>) -> Option<String
                 0
             };
             let vid = VarId::new(reg, ver);
+            // `vN.field` is a field load; its type is the field's, not the receiver's.
+            if i < b.len() && b[i] == b'.' {
+                continue;
+            }
             if let Some(t) = types.get(&vid) {
-                return Some(t.clone());
+                if !is_reg_token(t) {
+                    return Some(t.clone());
+                }
             }
             continue;
         }
@@ -1046,6 +1268,22 @@ fn count_args(args: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_field_is_not_typed_as_register() {
+        use crate::decompile::ir::VarId;
+        let mut types = std::collections::HashMap::new();
+        types.insert(
+            VarId::new(24, 0),
+            "tests.androguard.TestActivity".into(),
+        );
+        assert_eq!(infer_type_from_raw("v24.value", &types), None);
+        let mut arith = std::collections::HashMap::new();
+        arith.insert(VarId::new(22, 0), "int".into());
+        assert_eq!(infer_type_from_raw("v22 * 2", &arith).as_deref(), Some("int"));
+        assert_eq!(infer_type_from_raw("1.0", &types).as_deref(), Some("double"));
+        assert_eq!(infer_type_from_raw("4.2f", &types).as_deref(), Some("float"));
+    }
 
     #[test]
     fn count_args_empty() {

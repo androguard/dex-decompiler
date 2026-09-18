@@ -26,4 +26,5 @@ mod source_fidelity;
 mod taint_solver;
 mod try_catch_assertions;
 mod try_catch_fixtures;
+mod type_fidelity;
 mod value_flow;

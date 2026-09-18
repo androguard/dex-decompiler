@@ -4,7 +4,7 @@
 //! walks the tree to produce Java if/else and while.
 
 use crate::decompile::cfg::{BlockEnd, BlockId, MethodCfg};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Single-entry single-exit style region for structured emission.
 #[derive(Debug, Clone)]
@@ -26,6 +26,9 @@ pub enum Region {
         condition: String,
         cases: Vec<(i32, Box<Region>)>,
         default: Box<Region>,
+        /// Case value that shares `default`'s target block, so `default:` is
+        /// emitted with that case instead of as an empty trailing label.
+        default_case: Option<i32>,
     },
 }
 
@@ -244,6 +247,7 @@ pub fn format_region_debug(region: &Region, cfg: &MethodCfg) -> String {
                 condition,
                 cases,
                 default,
+                ..
             } => {
                 let _ = writeln!(
                     out,
@@ -483,6 +487,7 @@ pub fn peel_sequential_loop_tails(region: Region, cfg: &MethodCfg) -> Region {
             condition,
             cases,
             default,
+            default_case,
         } => Region::Switch {
             condition,
             cases: cases
@@ -490,6 +495,7 @@ pub fn peel_sequential_loop_tails(region: Region, cfg: &MethodCfg) -> Region {
                 .map(|(v, r)| (v, Box::new(peel_sequential_loop_tails(*r, cfg))))
                 .collect(),
             default: Box::new(peel_sequential_loop_tails(*default, cfg)),
+            default_case,
         },
         other => other,
     }
@@ -699,7 +705,7 @@ fn trailing_continue_if(children: &[Region]) -> Option<(&str, &Region, usize)> {
     None
 }
 
-fn region_contains_block(region: &Region, id: BlockId) -> bool {
+pub fn region_contains_block(region: &Region, id: BlockId) -> bool {
     match region {
         Region::Block(b) => *b == id,
         Region::Seq(c) => c.iter().any(|r| region_contains_block(r, id)),
@@ -909,6 +915,154 @@ fn build_if_branches_until(
     }
 }
 
+fn block_preds(cfg: &MethodCfg, target: BlockId) -> Vec<BlockId> {
+    let mut preds = Vec::new();
+    for bid in 0..cfg.blocks.len() {
+        let hit = match &cfg.blocks[bid].end {
+            BlockEnd::Goto(t) => *t == target,
+            BlockEnd::FallThrough => cfg.fall_through_block(bid) == Some(target),
+            BlockEnd::Conditional {
+                branch_target,
+                fall_through,
+                ..
+            } => *branch_target == target || *fall_through == target,
+            BlockEnd::Switch {
+                cases,
+                default_block,
+                ..
+            } => *default_block == target || cases.iter().any(|(_, b)| *b == target),
+            BlockEnd::Exit => false,
+        };
+        if hit {
+            preds.push(bid);
+        }
+    }
+    preds
+}
+
+/// Where a switch arm goes once its own straight-line body ends.
+/// A second predecessor on that block means other arms meet there (`break`).
+fn arm_exit_target(cfg: &MethodCfg, start: BlockId) -> Option<BlockId> {
+    let mut bid = start;
+    for _ in 0..32 {
+        match &cfg.blocks[bid].end {
+            BlockEnd::Exit | BlockEnd::Conditional { .. } | BlockEnd::Switch { .. } => {
+                return None;
+            }
+            BlockEnd::Goto(t) => return Some(*t),
+            BlockEnd::FallThrough => {
+                let ft = cfg.fall_through_block(bid)?;
+                if block_preds(cfg, ft).iter().any(|p| *p != bid) {
+                    return Some(ft);
+                }
+                bid = ft;
+            }
+        }
+    }
+    None
+}
+
+/// Block every arm of a switch reaches without falling into another arm.
+/// That continuation belongs after the switch, not inside `default`.
+fn switch_join_block(
+    cfg: &MethodCfg,
+    cases: &[(i32, BlockId)],
+    default_block: BlockId,
+) -> Option<BlockId> {
+    let mut arms: HashSet<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+    arms.insert(default_block);
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut join = None;
+    for &arm in &arms {
+        let exit = arm_exit_target(cfg, arm)?;
+        if arms.contains(&exit) {
+            return None;
+        }
+        match join {
+            None => join = Some(exit),
+            Some(j) if j != exit => return None,
+            _ => {}
+        }
+    }
+    join
+}
+
+fn block_successors(cfg: &MethodCfg, bid: BlockId) -> Vec<BlockId> {
+    match &cfg.blocks[bid].end {
+        BlockEnd::Exit => Vec::new(),
+        BlockEnd::FallThrough => cfg.fall_through_block(bid).into_iter().collect(),
+        BlockEnd::Goto(t) => vec![*t],
+        BlockEnd::Conditional {
+            branch_target,
+            fall_through,
+            ..
+        } => vec![*branch_target, *fall_through],
+        BlockEnd::Switch {
+            cases,
+            default_block,
+            ..
+        } => {
+            let mut v: Vec<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+            v.push(*default_block);
+            v
+        }
+    }
+}
+
+/// Blocks reached by leaving `start`, not including `start` itself.
+fn reachable_after(cfg: &MethodCfg, start: BlockId) -> HashSet<BlockId> {
+    let mut seen = HashSet::new();
+    let mut stack = block_successors(cfg, start);
+    while let Some(b) = stack.pop() {
+        if !seen.insert(b) || seen.len() > 64 {
+            continue;
+        }
+        stack.extend(block_successors(cfg, b));
+    }
+    seen
+}
+
+/// Earliest block every arm can reach. Used when arms break to different
+/// blocks (`main`: some cases jump to `println("4")`, others to the code
+/// after the switch). That common block is the switch exit.
+fn switch_common_exit(
+    cfg: &MethodCfg,
+    cases: &[(i32, BlockId)],
+    default_block: BlockId,
+) -> Option<BlockId> {
+    let mut arms: HashSet<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+    arms.insert(default_block);
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut inter: Option<HashSet<BlockId>> = None;
+    for &arm in &arms {
+        let reach = reachable_after(cfg, arm);
+        inter = Some(match inter {
+            None => reach,
+            Some(prev) => prev.intersection(&reach).copied().collect(),
+        });
+    }
+    inter?
+        .into_iter()
+        .filter(|b| !arms.contains(b))
+        .min_by_key(|b| cfg.blocks[*b].start_offset)
+}
+
+/// A case that is only `goto body` — other arms must not steal `body`.
+fn outlined_case_body(cfg: &MethodCfg, arm: BlockId, exit: Option<BlockId>) -> Option<BlockId> {
+    let block = &cfg.blocks[arm];
+    if !block_is_effectively_empty(block) {
+        return None;
+    }
+    match block.end {
+        BlockEnd::Goto(t) if Some(t) != exit && t != arm => Some(t),
+        _ => None,
+    }
+}
+
 fn build_regions_rec(
     cfg: &MethodCfg,
     block_id: BlockId,
@@ -1024,6 +1178,11 @@ fn build_regions_rec(
                 } else if block_is_effectively_empty(&cfg.blocks[join_id]) {
                     emitted.insert(join_id);
                     Region::Seq(vec![])
+                } else if matches!(&cfg.blocks[join_id].end, BlockEnd::Switch { .. }) {
+                    // The shared tail is a switch. A bare block emits the payload as
+                    // `switch (x) { case 0: default: break; }` and drops the arms.
+                    build_regions_rec(cfg, join_id, loop_header, emitted, allowed)
+                        .unwrap_or_else(|| Region::Seq(vec![]))
                 } else {
                     emitted.insert(join_id);
                     Region::Block(join_id)
@@ -1064,30 +1223,104 @@ fn build_regions_rec(
             cases,
             default_block,
         } => {
-            let stop_at: HashSet<BlockId> = cases
+            let join = switch_join_block(cfg, cases, *default_block)
+                .or_else(|| switch_common_exit(cfg, cases, *default_block));
+            let mut stop_at: HashSet<BlockId> = cases
                 .iter()
                 .map(|(_, bid)| *bid)
                 .chain(std::iter::once(*default_block))
                 .collect();
+            let mut outlined: HashMap<BlockId, BlockId> = HashMap::new();
+            if let Some(j) = join {
+                stop_at.insert(j);
+                let mut arms: Vec<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+                arms.push(*default_block);
+                for arm in arms {
+                    if let Some(body) = outlined_case_body(cfg, arm, Some(j)) {
+                        outlined.insert(arm, body);
+                        stop_at.insert(body);
+                    }
+                }
+            }
+            // Several cases can share one target (`case 1: case 2: body`).
+            // Only the last label owns the body; earlier ones are bare labels.
+            let mut owner_at: HashMap<BlockId, usize> = HashMap::new();
+            for (i, (_, bid)) in cases.iter().enumerate() {
+                owner_at.insert(*bid, i);
+            }
+            let default_case = cases
+                .iter()
+                .rev()
+                .find(|(_, bid)| *bid == *default_block)
+                .map(|(val, _)| *val);
             let case_regions: Vec<(i32, Box<Region>)> = cases
                 .iter()
-                .filter_map(|(val, bid)| {
-                    let r =
-                        build_regions_rec_until(cfg, *bid, &stop_at, loop_header, emitted, allowed)
-                            .unwrap_or_else(|| Region::Seq(vec![]));
-                    Some((*val, Box::new(r)))
+                .enumerate()
+                .map(|(i, (val, bid))| {
+                    if join.is_some() && owner_at.get(bid).copied() != Some(i) {
+                        return (*val, Box::new(Region::Seq(vec![])));
+                    }
+                    // stop_at lists every arm so a case does not fall into the next one.
+                    // The arm we are building must not be in that set, or its body is dropped.
+                    let mut arm_stop = stop_at.clone();
+                    if join.is_some() {
+                        arm_stop.remove(bid);
+                        if let Some(body) = outlined.get(bid) {
+                            arm_stop.remove(body);
+                        }
+                    }
+                    let r = build_regions_rec_until(
+                        cfg,
+                        *bid,
+                        &arm_stop,
+                        loop_header,
+                        emitted,
+                        allowed,
+                    )
+                    .unwrap_or_else(|| Region::Seq(vec![]));
+                    (*val, Box::new(r))
                 })
                 .collect();
-            let default_r = build_regions_rec(cfg, *default_block, loop_header, emitted, allowed)
-                .unwrap_or_else(|| Region::Seq(vec![]));
-            Some(Region::Seq(vec![
+            let default_r = if default_case.is_some() {
+                Region::Seq(vec![])
+            } else if join.is_some() {
+                let mut arm_stop = stop_at.clone();
+                arm_stop.remove(default_block);
+                if let Some(body) = outlined.get(default_block) {
+                    arm_stop.remove(body);
+                }
+                build_regions_rec_until(
+                    cfg,
+                    *default_block,
+                    &arm_stop,
+                    loop_header,
+                    emitted,
+                    allowed,
+                )
+                .unwrap_or_else(|| Region::Seq(vec![]))
+            } else {
+                build_regions_rec(cfg, *default_block, loop_header, emitted, allowed)
+                    .unwrap_or_else(|| Region::Seq(vec![]))
+            };
+            let mut seq = vec![
                 block_region,
                 Region::Switch {
                     condition: condition.clone(),
                     cases: case_regions,
                     default: Box::new(default_r),
+                    default_case,
                 },
-            ]))
+            ];
+            if let Some(j) = join {
+                if !emitted.contains(&j) {
+                    if let Some(after) =
+                        build_regions_rec(cfg, j, loop_header, emitted, allowed)
+                    {
+                        seq.push(after);
+                    }
+                }
+            }
+            Some(Region::Seq(seq))
         }
     }
 }

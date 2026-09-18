@@ -198,3 +198,57 @@ pub fn simplify_synchronized_blocks(body: &str) -> String {
     }
     out
 }
+
+/// `/* monitor-enter(this) */` … `monitor-exit` … `throw` → `synchronized (this) { … }`.
+///
+/// javac lowers `synchronized` methods this way. The catch-all is only `monitor-exit; throw`.
+pub(crate) fn restore_synchronized_from_monitors(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some(enter_idx) = lines.iter().position(|l| l.contains("/* monitor-enter(")) else {
+        return body.to_string();
+    };
+    if lines[..enter_idx].iter().any(|l| !l.trim().is_empty()) {
+        return body.to_string();
+    }
+    let enter = lines[enter_idx].trim();
+    let Some(lock) = enter
+        .split("/* monitor-enter(")
+        .nth(1)
+        .and_then(|r| r.split(')').next())
+        .map(str::trim)
+    else {
+        return body.to_string();
+    };
+    if lock.is_empty() {
+        return body.to_string();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    for line in lines.iter().skip(enter_idx + 1) {
+        let t = line.trim();
+        if t.contains("/* monitor-exit(") || t.contains("/* monitor-enter(") {
+            continue;
+        }
+        if t.contains("/* move-exception */") || (t.starts_with("throw ") && t.ends_with(';')) {
+            continue;
+        }
+        if t.is_empty() {
+            continue;
+        }
+        kept.push(*line);
+    }
+    if kept.is_empty() {
+        return body.to_string();
+    }
+    let indent = leading_indent(lines[enter_idx]);
+    let mut out = String::new();
+    out.push_str(&format!("{indent}synchronized ({lock}) {{\n"));
+    for line in kept {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!("{indent}}}"));
+    if body.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}

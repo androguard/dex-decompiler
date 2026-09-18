@@ -172,12 +172,29 @@ impl DexFileWrapper {
     }
 
     /// Decompile the DEX into a directory with package structure (e.g. out/com/example/MyClass.java).
-    fn decompile_to_dir(&self, base_path: &str) -> PyResult<()> {
+    /// Optional only_package / exclude filter which classes are written.
+    #[pyo3(signature = (base_path, only_package=None, exclude=None))]
+    fn decompile_to_dir(
+        &self,
+        base_path: &str,
+        only_package: Option<&str>,
+        exclude: Option<Vec<String>>,
+    ) -> PyResult<usize> {
         let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let decompiler = Decompiler::new(&dex);
+        let options = DecompilerOptions {
+            only_package: only_package.map(String::from),
+            exclude: exclude.unwrap_or_default(),
+            ..Default::default()
+        };
+        let decompiler = Decompiler::with_options(&dex, options);
+        let n = decompiler
+            .collect_included_classes()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+            .len();
         decompiler
             .decompile_to_dir(Path::new(base_path))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(n)
     }
 
     /// Return list of string values in the DEX string pool (by index order).

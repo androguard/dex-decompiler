@@ -27,6 +27,10 @@ pub(crate) fn repair_undeclared_temps_in_call_args(
         if assigned.contains(&ident) {
             continue;
         }
+        // `local0.method` / `sb.append` is an object receiver, not a dropped int const.
+        if ident_used_as_receiver(current, &ident) {
+            continue;
+        }
         if let Some(lit) = literal_by_temp.get(&ident) {
             *current = replace_ident_as_expr(current, &ident, lit);
         } else if is_local_temp_name(&ident) {
@@ -75,6 +79,79 @@ pub(crate) fn repair_forward_array_scalar_uses(
             }
         }
     }
+}
+
+/// `int[] arr0 = new int[arr0]` after `y = 5` — the size register was overwritten by the array.
+/// Use the nearest preceding integer literal (`new int[5]`), never a double `0.0`.
+pub(crate) fn repair_self_sized_new_array(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let mut current = line.to_string();
+        if let Some((arr, element, size)) = parse_new_array_decl(line) {
+            if size == arr {
+                if let Some(lit) = preceding_int_literal(&lines, idx) {
+                    current = current.replacen(
+                        &format!("new {element}[{size}]"),
+                        &format!("new {element}[{lit}]"),
+                        1,
+                    );
+                }
+            }
+        }
+        out.push_str(&current);
+        if idx < lines.len().saturating_sub(1) || body.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !body.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn parse_new_array_decl(line: &str) -> Option<(String, String, String)> {
+    let binding = strip_trailing_comment(line);
+    let stmt = binding.trim().trim_end_matches(';');
+    let (lhs, rhs) = stmt.split_once(" = ")?;
+    let rhs = rhs.trim();
+    let rest = rhs.strip_prefix("new ")?;
+    let lb = rest.find('[')?;
+    let rb = rest.rfind(']')?;
+    if rb <= lb {
+        return None;
+    }
+    let element = rest[..lb].trim();
+    let size = rest[lb + 1..rb].trim();
+    if element.is_empty() || !is_java_ident(size) {
+        return None;
+    }
+    let arr = lhs.split_whitespace().last()?.trim();
+    if !is_java_ident(arr) {
+        return None;
+    }
+    Some((arr.to_string(), element.to_string(), size.to_string()))
+}
+
+fn preceding_int_literal(lines: &[&str], idx: usize) -> Option<String> {
+    for line in lines[..idx].iter().rev() {
+        let t = strip_trailing_comment(line).trim().to_string();
+        if t.is_empty() || t == "{" || t.starts_with("try") || t.starts_with('}') {
+            continue;
+        }
+        let (_, val) = parse_simple_assign_line(line)?;
+        let val = val.trim();
+        if val.bytes().all(|b| b.is_ascii_digit()) && val != "0" {
+            return Some(val.to_string());
+        }
+        return None;
+    }
+    None
+}
+
+fn ident_used_as_receiver(line: &str, ident: &str) -> bool {
+    let needle = format!("{ident}.");
+    line.contains(&needle)
 }
 
 /// Extract the register number from SSA variable names like "v2", "local2", "localN".

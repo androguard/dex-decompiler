@@ -95,7 +95,7 @@ pub(crate) fn inline_static_field_refs(body: &str) -> String {
 /// Live ranges stop at the next assignment to the same name, so reused temps like
 /// `s0 = "…"; …; s0 = this.foo;` are handled correctly.
 pub(crate) fn cleanup_decompiler_artifacts(body: &str) -> String {
-    let mut current = body.to_string();
+    let mut current = fold_immediate_overwrites(body);
     // Cast/call chains need multiple rounds: view→cast→getText→toString.
     for _ in 0..8 {
         let next = cleanup_decompiler_artifacts_once(&current);
@@ -105,6 +105,82 @@ pub(crate) fn cleanup_decompiler_artifacts(body: &str) -> String {
         current = next;
     }
     current
+}
+
+/// `int result = 0; result = y;` → `int result = y;`.
+/// The first store is dead when the next statement overwrites the same variable
+/// without reading it (jadx `CodeShrinkVisitor`).
+pub(crate) fn fold_immediate_overwrites(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut skip: HashSet<usize> = HashSet::new();
+    let mut replace: HashMap<usize, String> = HashMap::new();
+    let mut i = 0usize;
+    while i + 1 < lines.len() {
+        let Some((var, rhs1)) = parse_simple_assign_line(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        let Some((var2, rhs2)) = parse_simple_assign_line(lines[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        if var != var2
+            || leading_indent(lines[i]) != leading_indent(lines[i + 1])
+            || ident_occurs(&rhs2, &var)
+            || rhs1.contains('(')
+        {
+            i += 1;
+            continue;
+        }
+        let first = strip_trailing_comment(lines[i]);
+        let stmt = first.trim();
+        let type_prefix = stmt.find(" = ").and_then(|eq| {
+            let lhs = stmt[..eq].trim();
+            let (ty, name) = lhs.rsplit_once(' ')?;
+            if name == var && !ty.is_empty() && !ty.contains('=') {
+                Some(ty.to_string())
+            } else {
+                None
+            }
+        });
+        let second = strip_trailing_comment(lines[i + 1]);
+        let second_stmt = second.trim();
+        let already_typed = second_stmt
+            .find(" = ")
+            .map(|eq| second_stmt[..eq].trim().contains(' '))
+            .unwrap_or(false);
+        let indent = leading_indent(lines[i + 1]);
+        let comment = lines[i + 1].get(second.len()..).unwrap_or("");
+        let folded = if let Some(ty) = type_prefix.filter(|_| !already_typed) {
+            format!("{indent}{ty} {var} = {rhs2};{comment}")
+        } else {
+            lines[i + 1].to_string()
+        };
+        skip.insert(i);
+        replace.insert(i + 1, folded);
+        i += 2;
+    }
+    if skip.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if skip.contains(&idx) {
+            continue;
+        }
+        if let Some(repl) = replace.get(&idx) {
+            out.push_str(repl);
+        } else {
+            out.push_str(line);
+        }
+        if idx + 1 < lines.len() || body.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !body.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
@@ -216,7 +292,28 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
             }
         }
     }
-    let inline_set: HashSet<usize> = latest_inline_by_var.values().copied().collect();
+    // `y = 6; arr[y] = 1` and `y = this.pouet(); this.value2 = y` are register
+    // reuse, not stores the source kept. Only bare reassignments (not `int y =`).
+    let mut bare_inline: HashSet<usize> = HashSet::new();
+    for (i, c) in cands.iter().enumerate() {
+        if is_temp_like_name(&c.var) || !is_bare_reassign(lines[c.def_idx], &c.var) {
+            continue;
+        }
+        let index_lit = c.use_count == 1
+            && is_cheap_literal_rhs(&c.val)
+            && array_index_is_only_use(&lines, &c.var, c.def_idx, c.end_idx);
+        let call_rhs = c.use_count == 1
+            && is_simple_call_expr(&c.val)
+            && only_use_is_whole_rhs(&lines, &c.var, c.def_idx, c.end_idx);
+        if index_lit || call_rhs {
+            bare_inline.insert(i);
+        }
+    }
+    let inline_set: HashSet<usize> = latest_inline_by_var
+        .values()
+        .copied()
+        .chain(bare_inline.iter().copied())
+        .collect();
     let skip_indices: HashSet<usize> = cands
         .iter()
         .enumerate()
@@ -225,14 +322,20 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
             let used_after_def = lines[c.def_idx + 1..]
                 .iter()
                 .any(|l| ident_used_as_rvalue(l, &c.var));
-            (inline_set.contains(i) && temp)
+            (inline_set.contains(i) && (temp || bare_inline.contains(i)))
                 || (temp
                     && c.use_count == 0
                     && !used_after_def
                     && !is_simple_call_expr(&c.val)
                     && !is_cast_expr(&c.val)
                     && !is_loop_body_slot_update(&c.var, c.def_idx, &lines)
-                    && !is_index_increment(lines[c.def_idx], &c.var))
+                    && !is_index_increment(lines[c.def_idx], &c.var)
+                    // Keep unused `double f = -5.0` / `float fff = -5.0f` for source fidelity.
+                    && !is_typed_fp_or_long_const_decl(lines[c.def_idx]))
+                || (!temp
+                    && c.use_count == 0
+                    && is_bare_reassign(lines[c.def_idx], &c.var)
+                    && is_cheap_literal_rhs(&c.val))
         })
         .map(|(i, _)| cands[i].def_idx)
         .collect();
@@ -298,6 +401,57 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
     out
 }
 
+/// `y = 6` rather than `int y = 6`.
+fn is_bare_reassign(line: &str, var: &str) -> bool {
+    let t = strip_trailing_comment(line);
+    let t = t.trim();
+    t.starts_with(&format!("{var} = "))
+}
+
+/// The only reads of `var` in the live range are `expr[var]`.
+fn array_index_is_only_use(lines: &[&str], var: &str, def_idx: usize, end_idx: usize) -> bool {
+    let needle = format!("[{var}]");
+    let mut n = 0usize;
+    for line in &lines[def_idx + 1..end_idx] {
+        if !ident_occurs(line, var) {
+            continue;
+        }
+        n += 1;
+        if !line.contains(&needle) {
+            return false;
+        }
+        let rest = line.replace(&needle, "[]");
+        if ident_occurs(&rest, var) {
+            return false;
+        }
+    }
+    n == 1
+}
+
+/// The only read is the entire RHS (`this.value2 = y`).
+fn only_use_is_whole_rhs(lines: &[&str], var: &str, def_idx: usize, end_idx: usize) -> bool {
+    let mut found = false;
+    for line in &lines[def_idx + 1..end_idx] {
+        if !ident_occurs(line, var) {
+            continue;
+        }
+        if found {
+            return false;
+        }
+        let t = strip_trailing_comment(line);
+        let t = t.trim();
+        let Some(eq) = t.find(" = ") else {
+            return false;
+        };
+        let rhs = t[eq + 3..].trim_end_matches(';').trim();
+        if rhs != var {
+            return false;
+        }
+        found = true;
+    }
+    found
+}
+
 /// Inline temps assigned exactly once to a cheap literal across the whole method body.
 /// Inline temps assigned exactly once to a cheap literal across the whole method body.
 pub(crate) fn inline_global_literal_temps(body: &str) -> String {
@@ -313,6 +467,10 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
         }
         // Loop indices (`j = 0` in bubble sort) must stay — inlining breaks bound checks.
         if matches!(var.as_str(), "i" | "j" | "k") {
+            continue;
+        }
+        // Keep unused `double yvwx2 = …` / float literals for source fidelity.
+        if is_typed_fp_or_long_const_decl(line) {
             continue;
         }
         if lines.iter().any(|l| is_index_increment(l, &var)) {
@@ -333,6 +491,13 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
     let mut inline_vars: Vec<String> = assigns
         .keys()
         .filter(|v| assign_counts.get(*v).copied() == Some(1))
+        // Only inline when the temp is actually used — unused literal temps must stay
+        // (`double yvwx2 = …` with a trailing digit looks temp-like).
+        .filter(|v| {
+            lines.iter().enumerate().any(|(i, l)| {
+                assigns.get(*v).map(|(def, _)| *def) != Some(i) && ident_used_as_rvalue(l, v)
+            })
+        })
         .cloned()
         .collect();
     inline_vars.sort();
@@ -357,6 +522,10 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
             vars
         } {
             if let Some((_, lit)) = assigns.get(&var) {
+                let def_idx = assigns.get(&var).map(|(i, _)| *i).unwrap_or(0);
+                if idx <= def_idx {
+                    continue;
+                }
                 if ident_occurs(&current, &var) {
                     if assign_lhs_var(&current).as_deref() == Some(var.as_str()) {
                         continue;
@@ -384,7 +553,12 @@ pub(crate) fn fix_undeclared_temp_assigns(body: &str) -> String {
         let t = binding.trim();
         let mut current = line.to_string();
         if let Some((var, rhs)) = parse_simple_assign_line(line) {
-            if is_temp_like_name(&var) && !declared.contains(&var) && !is_simple_call_expr(&rhs) {
+            // `i`/`j`/`k` are usually parameters or already-declared indexes — don't shadow them.
+            if is_temp_like_name(&var)
+                && !matches!(var.as_str(), "i" | "j" | "k")
+                && !declared.contains(&var)
+                && !is_simple_call_expr(&rhs)
+            {
                 if let Some(eq) = t.find(" = ") {
                     let lhs = t[..eq].trim();
                     if !lhs.contains(' ') {
@@ -502,4 +676,25 @@ pub(crate) fn merge_constructor_calls(body: &str) -> String {
         }
     }
     out
+}
+
+/// `double f = -5.0;` / `float fff = -5.0f;` / `long ff = -5L;` — keep even when unused.
+fn is_typed_fp_or_long_const_decl(line: &str) -> bool {
+    let binding = strip_trailing_comment(line);
+    let t = binding.trim();
+    let rest = if let Some(r) = t.strip_prefix("double ") {
+        r
+    } else if let Some(r) = t.strip_prefix("float ") {
+        r
+    } else if let Some(r) = t.strip_prefix("long ") {
+        r
+    } else {
+        return false;
+    };
+    let Some(eq) = rest.find(" = ") else {
+        return false;
+    };
+    let rhs = rest[eq + 3..].trim_end_matches(';').trim();
+    // Prefer cheap literals; also accept any non-call RHS (large doubles, casts, etc.).
+    is_cheap_literal_rhs(rhs) || (!rhs.contains('(') && !rhs.starts_with("new "))
 }

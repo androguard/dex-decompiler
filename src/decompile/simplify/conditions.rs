@@ -1102,6 +1102,9 @@ pub(crate) fn looks_like_boolean_local(name: &str) -> bool {
 }
 
 pub(crate) fn looks_like_primitive_local(name: &str) -> bool {
+    if matches!(name, "i" | "j" | "k") {
+        return true;
+    }
     let b = name.as_bytes();
     b.len() >= 2
         && matches!(b[0], b'i' | b'j' | b'f' | b'd' | b'c' | b'b')

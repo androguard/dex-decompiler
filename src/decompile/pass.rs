@@ -254,7 +254,10 @@ impl Pass for DeadAssignPass {
                 if matches!(s, IrStmt::Phi { .. }) {
                     return false;
                 }
-                if let IrStmt::Assign { dst, .. } = s {
+                if let IrStmt::Assign { dst, rhs, .. } = s {
+                    if matches!(rhs, IrExpr::Raw(r) if is_numeric_const_rhs(r)) {
+                        return true;
+                    }
                     used.contains(dst)
                 } else {
                     true
@@ -292,14 +295,24 @@ fn is_numeric_const_rhs(rhs: &str) -> bool {
     if s.is_empty() {
         return false;
     }
+    // Float / double literals kept for source fidelity (debug locals often unused).
+    if s.ends_with('f') || s.ends_with('F') {
+        let core = &s[..s.len() - 1];
+        return core.parse::<f32>().is_ok();
+    }
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        return s.parse::<f64>().is_ok();
+    }
+    if let Some(rest) = s.strip_suffix('L').or_else(|| s.strip_suffix('l')) {
+        if rest.starts_with("0x") || rest.starts_with("0X") {
+            return rest[2..].chars().all(|c| c.is_ascii_hexdigit());
+        }
+        return rest.parse::<i64>().is_ok();
+    }
     if s.starts_with("0x") || s.starts_with("0X") {
         return s[2..].chars().all(|c| c.is_ascii_hexdigit());
     }
-    let mut chars = s.chars();
-    if chars.next() == Some('-') {
-        return chars.all(|c| c.is_ascii_digit());
-    }
-    s.chars().all(|c| c.is_ascii_digit())
+    s.parse::<i64>().is_ok()
 }
 
 /// Collect all register numbers that are read (used) in the IR.
@@ -441,6 +454,11 @@ fn copy_assign_must_keep(
     resolved: &HashMap<VarId, VarId>,
 ) -> bool {
     let reg = dst.reg;
+    // One-instruction block `dst = src` is a store used outside the block
+    // (delayed `j++` in foo4, a phi). Dead-assign drops it if the register is dead.
+    if stmts.len() == 1 && idx == 0 {
+        return true;
+    }
     if reg_used_in_range(rewritten, idx + 1, rewritten.len(), reg) {
         return true;
     }

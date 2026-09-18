@@ -18,6 +18,9 @@ mod tests;
 pub use format::simplify_synchronized_blocks;
 pub use pipeline::simplify_method_body;
 pub use string_switch::restore_string_switch;
+pub(crate) use expr::wrap_postinc_div_try;
+
+pub(crate) use util::is_temp_like_name;
 
 // Re-exports used by unit tests (and external callers).
 #[cfg(test)]

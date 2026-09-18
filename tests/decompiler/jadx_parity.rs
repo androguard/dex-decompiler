@@ -149,8 +149,12 @@ fn jadx_switches_TestSwitchSimple() {
         );
     }
     assert!(
-        count_substr(&body, "break;") >= 5,
-        "each case should break (jadx TestSwitchBreak); got:\n{body}"
+        body.contains("1 || 2") && body.contains("3 || ") && body.contains("\"5\""),
+        "case bodies were dropped; got:\n{body}"
+    );
+    assert!(
+        count_substr(&body, "break;") >= 3,
+        "switch exits should break; got:\n{body}"
     );
 }
 

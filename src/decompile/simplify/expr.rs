@@ -896,3 +896,332 @@ fn inline_filled_array_into_calls_once(body: &str) -> String {
     }
     body.to_string()
 }
+
+fn rebuild_skip_repl(
+    lines: &[&str],
+    skip: &HashSet<usize>,
+    repl: &HashMap<usize, String>,
+    trailing_nl: bool,
+) -> String {
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if skip.contains(&idx) {
+            continue;
+        }
+        if let Some(rep) = repl.get(&idx) {
+            out.push_str(rep);
+        } else {
+            out.push_str(line);
+        }
+        if idx < lines.len().saturating_sub(1) || trailing_nl {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Fold `x = a; x = x * b; x = x + c;` into `x = a * b + c`.
+/// Numeric casts of a bare name or literal are dropped (`(double) g` → `g`).
+pub(crate) fn fold_running_arithmetic(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut skip = HashSet::new();
+    let mut repl: HashMap<usize, String> = HashMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some((var, rhs)) = parse_simple_assign_line(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        let mut expr = strip_casts_in_expr(&strip_numeric_cast(&rhs));
+        let mut j = i + 1;
+        let mut folded = false;
+        while j < lines.len() {
+            if lines[j].trim().is_empty() {
+                break;
+            }
+            let Some((v2, next)) = parse_simple_assign_line(lines[j]) else {
+                break;
+            };
+            if v2 != var {
+                break;
+            }
+            let Some((op, operand)) = split_self_binop(&next, &var) else {
+                break;
+            };
+            expr = append_binop(&expr, op, &strip_casts_in_expr(&operand));
+            folded = true;
+            j += 1;
+        }
+        if folded {
+            if let Some(line) = replace_assign_rhs(lines[i], &expr) {
+                repl.insert(i, line);
+                for k in (i + 1)..j {
+                    skip.insert(k);
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    if repl.is_empty() {
+        return body.to_string();
+    }
+    rebuild_skip_repl(&lines, &skip, &repl, body.ends_with('\n'))
+}
+
+/// `int t = j + 1; j = j / i; i = j; j = t;` → `i = j++ / i;`.
+pub(crate) fn fold_postinc_division(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut skip = HashSet::new();
+    let mut repl: HashMap<usize, String> = HashMap::new();
+    let mut i = 0;
+    while i + 3 < lines.len() {
+        let Some((tmp, base)) = parse_plus_one_assign(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        let Some((dest, divisor)) = parse_self_div(lines[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        if dest != base {
+            i += 1;
+            continue;
+        }
+        let Some(quot) = parse_copy_of(lines[i + 2], &dest) else {
+            i += 1;
+            continue;
+        };
+        let Some(dest2) = parse_copy_from(lines[i + 3], &tmp) else {
+            i += 1;
+            continue;
+        };
+        if dest2 != dest {
+            i += 1;
+            continue;
+        }
+        let indent = leading_indent(lines[i + 2]);
+        repl.insert(i + 2, format!("{indent}{quot} = {base}++ / {divisor};"));
+        skip.insert(i);
+        skip.insert(i + 1);
+        skip.insert(i + 3);
+        i += 4;
+    }
+    if repl.is_empty() {
+        return body.to_string();
+    }
+    rebuild_skip_repl(&lines, &skip, &repl, body.ends_with('\n'))
+}
+
+/// Wrap a single `i = j++ / i;` in `try/catch`.
+pub(crate) fn wrap_postinc_div_try(
+    body: &str,
+    exc_type: &str,
+    catch_rhs: &str,
+    catch_continues: bool,
+) -> String {
+    if body.contains("} catch (") {
+        return body.to_string();
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let hits: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| {
+            let t = l.trim();
+            t.contains("++ / ") && t.contains(" = ") && t.ends_with(';')
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if hits.len() != 1 {
+        return body.to_string();
+    }
+    let idx = hits[0];
+    let indent = leading_indent(lines[idx]);
+    let stmt = lines[idx].trim();
+    let lhs = stmt.split(" = ").next().unwrap_or("i").trim();
+    let next = lines[idx + 1..]
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim())
+        .unwrap_or("");
+    let inner = format!("    {indent}");
+    let mut wrapped = format!(
+        "{indent}try {{\n{inner}{stmt}\n{indent}}} catch ({exc_type} e) {{\n{inner}{lhs} = {catch_rhs};\n"
+    );
+    // `continue` when the handler jumps back to a compound loop test (`foobis`:
+    // `while (i < j && i != 10)`). A single-test loop (`pouet2`) and a handler
+    // that only joins the delayed `j++` store (`foo4`) must not add one.
+    // `foo2` still gets `continue` because the statement is not last, or the
+    // loop is `while (true)`.
+    let explicit_continue = catch_continues && enclosing_while_has_and(&lines, idx);
+    if explicit_continue || !next.starts_with('}') || body.contains("while (true)") {
+        wrapped.push_str(&format!("{inner}continue;\n"));
+    }
+    wrapped.push_str(&format!("{indent}}}"));
+    let mut repl = HashMap::new();
+    repl.insert(idx, wrapped);
+    rebuild_skip_repl(&lines, &HashSet::new(), &repl, body.ends_with('\n'))
+}
+
+fn enclosing_while_has_and(lines: &[&str], idx: usize) -> bool {
+    let mut i = 0usize;
+    while i < lines.len() {
+        if parse_while_condition(lines[i]).is_some() {
+            if let Some(close) = find_closing_brace_line(lines, i) {
+                if i < idx && idx < close {
+                    return parse_while_condition(lines[i]).is_some_and(|c| c.contains("&&"));
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn strip_numeric_cast(expr: &str) -> String {
+    let e = expr.trim();
+    for ty in ["double", "float", "long", "int", "short", "byte", "char"] {
+        let prefix = format!("({ty})");
+        if let Some(rest) = e.strip_prefix(&prefix) {
+            let rest = rest.trim();
+            if is_java_ident(rest) || is_numeric_literal(rest) {
+                return rest.to_string();
+            }
+        }
+    }
+    e.to_string()
+}
+
+/// Drop `(double) name` / `(int) 0` anywhere in an expression (`(double) y + d` → `y + d`).
+fn strip_casts_in_expr(expr: &str) -> String {
+    let mut out = String::new();
+    let mut rest = expr;
+    while let Some(pos) = rest.find('(') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        if let Some((kept, consumed)) = take_numeric_cast(after) {
+            out.push_str(&kept);
+            rest = &after[consumed..];
+        } else {
+            out.push('(');
+            rest = &after[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn take_numeric_cast(s: &str) -> Option<(String, usize)> {
+    for ty in ["double", "float", "long", "int", "short", "byte", "char"] {
+        let prefix = format!("({ty})");
+        if let Some(after) = s.strip_prefix(&prefix) {
+            let trimmed = after.trim_start();
+            let ws = after.len() - trimmed.len();
+            let ident_len = trimmed
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                .count();
+            if ident_len == 0 {
+                continue;
+            }
+            let ident = &trimmed[..ident_len];
+            if is_java_ident(ident) || is_numeric_literal(ident) {
+                return Some((ident.to_string(), prefix.len() + ws + ident_len));
+            }
+        }
+    }
+    None
+}
+
+fn split_self_binop<'a>(rhs: &'a str, var: &str) -> Option<(&'a str, String)> {
+    let rhs = rhs.trim();
+    let prefix = format!("{var} ");
+    let rest = rhs.strip_prefix(&prefix)?.trim();
+    let op = if rest.starts_with("* ") {
+        "*"
+    } else if rest.starts_with("/ ") {
+        "/"
+    } else if rest.starts_with("% ") {
+        "%"
+    } else if rest.starts_with("+ ") {
+        "+"
+    } else if rest.starts_with("- ") {
+        "-"
+    } else {
+        return None;
+    };
+    Some((op, rest[1..].trim().to_string()))
+}
+
+fn expr_has_top_add_sub(expr: &str) -> bool {
+    let mut depth = 0i32;
+    for c in expr.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '+' | '-' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn append_binop(expr: &str, op: &str, operand: &str) -> String {
+    if matches!(op, "*" | "/" | "%") && expr_has_top_add_sub(expr) {
+        format!("({expr}) {op} {operand}")
+    } else {
+        format!("{expr} {op} {operand}")
+    }
+}
+
+fn replace_assign_rhs(line: &str, new_rhs: &str) -> Option<String> {
+    let binding = strip_trailing_comment(line);
+    let t = binding.trim();
+    let eq = t.find(" = ")?;
+    let lhs = t[..eq].trim();
+    let indent = leading_indent(line);
+    Some(format!("{indent}{lhs} = {new_rhs};"))
+}
+
+fn parse_plus_one_assign(line: &str) -> Option<(String, String)> {
+    let (var, rhs) = parse_simple_assign_line(line)?;
+    let base = rhs.trim().strip_suffix(" + 1")?.trim();
+    if is_java_ident(base) {
+        Some((var, base.to_string()))
+    } else {
+        None
+    }
+}
+
+fn parse_self_div(line: &str) -> Option<(String, String)> {
+    let (var, rhs) = parse_simple_assign_line(line)?;
+    let prefix = format!("{var} / ");
+    let div = rhs.trim().strip_prefix(&prefix)?.trim();
+    if is_java_ident(div) {
+        Some((var, div.to_string()))
+    } else {
+        None
+    }
+}
+
+fn parse_copy_of(line: &str, from: &str) -> Option<String> {
+    let (var, rhs) = parse_simple_assign_line(line)?;
+    if rhs.trim() == from && var != from {
+        Some(var)
+    } else {
+        None
+    }
+}
+
+fn parse_copy_from(line: &str, from: &str) -> Option<String> {
+    let (var, rhs) = parse_simple_assign_line(line)?;
+    if rhs.trim() == from {
+        Some(var)
+    } else {
+        None
+    }
+}

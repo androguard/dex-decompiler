@@ -371,7 +371,12 @@ pub(crate) fn parse_to_string(line: &str) -> Option<(String, String)> {
         }
     }
     let eq = stmt.find(" = ")?;
-    let dest = stmt[..eq].trim().to_string();
+    let lhs = stmt[..eq].trim();
+    let dest = lhs
+        .split_whitespace()
+        .last()
+        .unwrap_or(lhs)
+        .to_string();
     let rhs = stmt[eq + 3..].trim_end_matches(';').trim();
     if let Some(var) = rhs.strip_suffix(".toString()") {
         return Some((dest, var.trim().to_string()));
