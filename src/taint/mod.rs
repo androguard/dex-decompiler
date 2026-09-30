@@ -5,6 +5,7 @@
 //! - **Rules**: source-kind → sink-kind issue matching
 //! - **Call graph** + interprocedural fixpoint over method summaries
 //! - **Traces** (source → root → sink) and JSON issue reports
+//! - Lifecycle seeds + callback shims (Executor/Handler/listeners)
 //!
 //! Built on the existing intraprocedural [`crate::decompile::value_flow`] engine.
 
@@ -13,6 +14,7 @@ mod config;
 mod defaults;
 mod index;
 mod issue;
+mod lifecycle;
 mod models;
 mod mt_compat;
 mod report;
@@ -23,6 +25,10 @@ pub use config::TaintConfig;
 pub use defaults::default_config;
 pub use index::{MethodId, MethodIndex, MethodRef};
 pub use issue::{Issue, TraceFrame};
+pub use lifecycle::{
+    default_lifecycle_seeds, exported_classes_from_manifest_xml, lifecycle_seeds_for,
+    load_lifecycle_seeds, LifecycleSeed,
+};
 pub use models::{
     AccessPath, Port, PropagationModel, Rule, SanitizerModel, SinkModel, SourceModel,
 };

@@ -1,0 +1,76 @@
+{
+  "sources": [
+    {
+      "patterns": ["mt.p2.Origin.source", "Origin.source"],
+      "port": "return",
+      "kind": "Source",
+      "features": ["demo-source"]
+    },
+    {
+      "patterns": ["SmsMessage.getMessageBody", "getMessageBody"],
+      "port": "return",
+      "kind": "SmsPii",
+      "features": ["pii"]
+    }
+  ],
+  "sinks": [
+    {
+      "patterns": ["mt.p2.Origin.sink", "Origin.sink"],
+      "port": {"argument": {"index": 0}},
+      "kind": "Sink"
+    },
+    {
+      "patterns": ["startActivity", "Context.startActivity", "Activity.startActivity"],
+      "port": {"argument": {"index": 1}},
+      "kind": "LaunchingComponent"
+    },
+    {
+      "patterns": ["SmsManager.sendTextMessage", "sendTextMessage"],
+      "port": {"argument": {"index": 3}},
+      "kind": "SmsSend"
+    }
+  ],
+  "propagations": [
+    {
+      "patterns": ["HashMap.put", "Map.put"],
+      "from": {"argument": {"index": 2}},
+      "to": {"argument": {"index": 0}}
+    },
+    {
+      "patterns": ["HashMap.get", "Map.get"],
+      "from": {"argument": {"index": 0}},
+      "to": "return"
+    }
+  ],
+  "sanitizers": [],
+  "rules": [
+    {
+      "name": "Demo Source to Sink",
+      "code": 2,
+      "description": "Synthetic Origin.source reaches Origin.sink",
+      "sources": ["Source"],
+      "sinks": ["Sink"]
+    },
+    {
+      "name": "Lifecycle / IPC to Origin.sink",
+      "code": 9,
+      "description": "Lifecycle-seeded Intent reaches Origin.sink",
+      "sources": ["ActivityUserInput", "ReceiverUserInput"],
+      "sinks": ["Sink"]
+    },
+    {
+      "name": "Lifecycle to launch",
+      "code": 10,
+      "description": "Lifecycle / IPC input reaches startActivity",
+      "sources": ["ActivityUserInput", "ReceiverUserInput"],
+      "sinks": ["LaunchingComponent"]
+    },
+    {
+      "name": "PII to SMS send",
+      "code": 23,
+      "description": "SMS body reaches SmsManager.sendTextMessage",
+      "sources": ["SmsPii"],
+      "sinks": ["SmsSend"]
+    }
+  ]
+}

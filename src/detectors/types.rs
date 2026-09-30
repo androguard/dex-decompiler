@@ -57,6 +57,18 @@ pub struct VulnFinding {
     /// All related bytecode offsets (source, copies, uses, sink), sorted unique.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_offsets: Vec<u32>,
+    /// OWASP MASWE weaknesses linked to this finding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maswe: Vec<super::mas::MasLink>,
+    /// OWASP MASVS controls (e.g. MASVS-PLATFORM-1) with docs URLs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub masvs: Vec<super::mas::MasLink>,
+    /// OWASP MASTG Knowledge articles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mastg_know: Vec<super::mas::MasLink>,
+    /// OWASP MASTG Best Practices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mastg_best: Vec<super::mas::MasLink>,
 }
 
 /// Static metadata for a detector category.
@@ -112,6 +124,13 @@ pub fn category_meta(category: &str) -> CategoryMeta {
             severity: "medium",
             message: "Data that may be sensitive (location, identifiers, credentials, clipboard, extras) reaches a logging API. Logs can be read by other apps on older Android or leak via bugreports.",
             recommendation: "Strip or redact PII/secrets before Log.*; never log tokens, passwords, or full Intent extras in production builds.",
+            cwe: Some("CWE-532"),
+        },
+        "logging_pii" => CategoryMeta {
+            title: "PII / credentials logged",
+            severity: "high",
+            message: "Passwords, emails, tokens, or other PII markers reach Log.* (often via StringBuilder/+). Release logcat / bugreports expose credentials to any reader with log access.",
+            recommendation: "Never log passwords, emails, tokens, or auth extras in release builds; gate Log.d behind BuildConfig.DEBUG and redact PII.",
             cwe: Some("CWE-532"),
         },
         "sql_injection" => CategoryMeta {
@@ -213,6 +232,13 @@ pub fn category_meta(category: &str) -> CategoryMeta {
             message: "A cryptographic API associated with weak algorithms or modes (e.g. DES, ECB, MD5 used for security) was detected. Prefer modern algorithms (AES-GCM, SHA-256+) and platform Keystore.",
             recommendation: "Replace DES/3DES/ECB/MD5 (for security) with AES-GCM or ChaCha20-Poly1305 via AndroidKeyStore.",
             cwe: Some("CWE-327"),
+        },
+        "insufficient_key_length" => CategoryMeta {
+            title: "Insufficient cryptographic key length",
+            severity: "medium",
+            message: "Key generation uses a short key size (e.g. RSA ≤1024 or AES ≤128) co-located with KeyPairGenerator/KeyGenerator/setKeySize.",
+            recommendation: "Use RSA ≥2048 (prefer 3072+) or AES-256; prefer AndroidKeyStore KeyGenParameterSpec with adequate setKeySize.",
+            cwe: Some("CWE-326"),
         },
         "unsafe_deserialization" => CategoryMeta {
             title: "Unsafe deserialization",
@@ -389,6 +415,20 @@ pub fn category_meta(category: &str) -> CategoryMeta {
             recommendation: "Use selectionArgs / bindArgs with `?` placeholders; never concatenate Uri segments or extras into SQL.",
             cwe: Some("CWE-89"),
         },
+        "icc_extra_flow" => CategoryMeta {
+            title: "Inter-component Intent extras flow",
+            severity: "high",
+            message: "The method puts const-key Intent extras and launches another component (often with setClass/setClassName/setComponent). Extras written here can be read via get*Extra in the target — classic ICC half-flow link.",
+            recommendation: "Validate Intent targets and extras; do not trust getStringExtra from exported/implicit launches; prefer explicit components with signature permissions.",
+            cwe: Some("CWE-926"),
+        },
+        "jni_taint_import_bridge" => CategoryMeta {
+            title: "Taint reaches JNI with dangerous native imports",
+            severity: "high",
+            message: "Untrusted or sensitive values reach a native (JNI) method whose .so imports system/socket/exec-style APIs. Treat the native as a sink until ARM dataflow proves otherwise.",
+            recommendation: "Avoid passing PII/user input into JNI that performs network/exec; validate and sanitize on the Java side; audit the Java_* export.",
+            cwe: Some("CWE-111"),
+        },
         "webview_weak_host_check" => CategoryMeta {
             title: "Weak WebView / deeplink host validation",
             severity: "high",
@@ -494,6 +534,230 @@ pub fn category_meta(category: &str) -> CategoryMeta {
             recommendation: "Remove custom TrustManagers; never load untrusted URLs into a WebView that disables TLS checks.",
             cwe: Some("CWE-295"),
         },
+        "device_lock_api_check" => CategoryMeta {
+            title: "Device lock / biometric capability API",
+            severity: "info",
+            message: "KeyguardManager.isDeviceSecure or BiometricManager.canAuthenticate is used (inventory for local-auth / resilience checks).",
+            recommendation: "Ensure lock-screen / biometric gates bind crypto keys (setUserAuthenticationRequired) rather than boolean checks alone.",
+            cwe: Some("CWE-287"),
+        },
+        "strict_mode_policy" => CategoryMeta {
+            title: "StrictMode policy enabled",
+            severity: "info",
+            message: "StrictMode.setVmPolicy / setThreadPolicy is configured (often detects leaked SQLite/cursors in debug builds).",
+            recommendation: "Keep StrictMode out of production release builds; fix underlying resource leaks.",
+            cwe: Some("CWE-772"),
+        },
+        "prefs_plaintext_secret" => CategoryMeta {
+            title: "Secret-like data written to SharedPreferences",
+            severity: "high",
+            message: "SharedPreferences putString/putStringSet co-occurs with secret/token/key markers — likely plaintext sensitive storage in the app sandbox.",
+            recommendation: "Encrypt secrets (EncryptedSharedPreferences / Keystore) before persisting; never store API tokens in plain prefs.",
+            cwe: Some("CWE-312"),
+        },
+        "keystore_multipurpose" => CategoryMeta {
+            title: "Keystore key used for multiple purposes",
+            severity: "medium",
+            message: "A Keystore key appears configured or used for both signature and encryption purposes (PURPOSE_SIGN/VERIFY with PURPOSE_ENCRYPT/DECRYPT, or Cipher+Signature on the same key).",
+            recommendation: "Generate separate keys for signing and encryption; do not OR incompatible KeyProperties purposes.",
+            cwe: Some("CWE-1240"),
+        },
+        "anti_frida_maps" => CategoryMeta {
+            title: "Anti-Frida /proc/self/maps scan",
+            severity: "info",
+            message: "The method reads `/proc/self/maps` and checks for Frida/gadget markers (runtime instrumentation detection).",
+            recommendation: "Treat maps-based detection as bypassable; prefer Play Integrity / attestation and defense-in-depth.",
+            cwe: Some("CWE-919"),
+        },
+        "emulator_detection" => CategoryMeta {
+            title: "Emulator detection checks",
+            severity: "info",
+            message: "Build.* property reads co-occur with known emulator fingerprints/package markers (Genymotion, goldfish, ranchu, etc.).",
+            recommendation: "Document resilience posture; combine with integrity attestation rather than relying on Build strings alone.",
+            cwe: Some("CWE-919"),
+        },
+        "hardcoded_crypto_secret" => CategoryMeta {
+            title: "Hardcoded secret used with Cipher",
+            severity: "high",
+            message: "Secret/token-like string constants co-occur with Cipher.doFinal — plaintext material is present in the binary and hookable at the crypto boundary.",
+            recommendation: "Do not hardcode API keys; fetch from a backend or protect with Keystore-bound secrets and anti-tamper.",
+            cwe: Some("CWE-798"),
+        },
+        "insecure_random" => CategoryMeta {
+            title: "Insecure random number generator",
+            severity: "medium",
+            message: "java.util.Random / Math.random is used — unsuitable for tokens, passwords, or keys.",
+            recommendation: "Use java.security.SecureRandom (or platform Keystore) for security-sensitive randomness.",
+            cwe: Some("CWE-330"),
+        },
+        "non_random_source" => CategoryMeta {
+            title: "Non-random time-based token source",
+            severity: "medium",
+            message: "Date/Calendar/System.currentTimeMillis used as a stand-in for randomness.",
+            recommendation: "Do not derive auth tokens from wall-clock time; use SecureRandom.",
+            cwe: Some("CWE-330"),
+        },
+        "external_storage_write" => CategoryMeta {
+            title: "Write to external / shared storage",
+            severity: "medium",
+            message: "App writes via getExternalStorageDirectory / getExternalFilesDir / MediaStore EXTERNAL URIs — data may be world-readable or backed up broadly.",
+            recommendation: "Prefer app-private storage or MediaStore with appropriate scrubbing; avoid secrets on shared storage.",
+            cwe: Some("CWE-922"),
+        },
+        "explicit_security_provider" => CategoryMeta {
+            title: "Explicit cryptographic security provider",
+            severity: "medium",
+            message: "Security.addProvider / Cipher.getInstance with an explicit provider pins crypto to a custom or third-party provider.",
+            recommendation: "Prefer the platform default provider unless a documented, maintained provider is required.",
+            cwe: Some("CWE-757"),
+        },
+        "notification_sensitive" => CategoryMeta {
+            title: "Sensitive data in notifications",
+            severity: "medium",
+            message: "Notification content co-occurs with PII/secret-like strings — lock-screen and other apps may expose it.",
+            recommendation: "Avoid PII in notification titles/text; use publicVersion / secret extras carefully.",
+            cwe: Some("CWE-200"),
+        },
+        "safebrowsing_disabled" => CategoryMeta {
+            title: "WebView SafeBrowsing disabled",
+            severity: "medium",
+            message: "WebSettings.setSafeBrowsingEnabled(false) disables Safe Browsing protections.",
+            recommendation: "Leave SafeBrowsing enabled (default) unless there is a strong product reason.",
+            cwe: Some("CWE-693"),
+        },
+        "flag_secure" => CategoryMeta {
+            title: "FLAG_SECURE window flag",
+            severity: "info",
+            message: "WindowManager.LayoutParams.FLAG_SECURE is set (screenshot / recents protection inventory).",
+            recommendation: "Apply FLAG_SECURE on screens that show secrets; verify it is not stripped in dialogs.",
+            cwe: Some("CWE-200"),
+        },
+        "debugger_check" => CategoryMeta {
+            title: "JDWP debugger attachment check",
+            severity: "info",
+            message: "Debug.isDebuggerConnected / waitingForDebugger is used (anti-debug inventory).",
+            recommendation: "Treat JDWP checks as bypassable; combine with integrity attestation.",
+            cwe: Some("CWE-919"),
+        },
+        "root_detection" => CategoryMeta {
+            title: "Root detection heuristics",
+            severity: "info",
+            message: "Root manager package names or su paths are checked (resilience inventory).",
+            recommendation: "Root checks are bypassable; prefer Play Integrity / attestation.",
+            cwe: Some("CWE-919"),
+        },
+        "deeplink_query_unvalidated" => CategoryMeta {
+            title: "Deep link query parameter use",
+            severity: "medium",
+            message: "Uri.getQueryParameter is used — validate/parse types and bounds before acting on deep-link input.",
+            recommendation: "Treat deep-link params as untrusted; convert types, check ranges, and require auth for sensitive actions.",
+            cwe: Some("CWE-20"),
+        },
+        "tracerpid_check" => CategoryMeta {
+            title: "TracerPid / ptrace anti-debug",
+            severity: "info",
+            message: "Reads /proc/self/status TracerPid (native debugger detection inventory).",
+            recommendation: "TracerPid checks are bypassable; combine with stronger integrity controls.",
+            cwe: Some("CWE-919"),
+        },
+        "overlay_protection_api" => CategoryMeta {
+            title: "Overlay protection API",
+            severity: "info",
+            message: "setFilterTouchesWhenObscured / setHideOverlayWindows is used (overlay defense inventory).",
+            recommendation: "Protect sensitive controls; require HIDE_OVERLAY_WINDOWS where appropriate (API 31+).",
+            cwe: Some("CWE-1021"),
+        },
+        "network_pii" => CategoryMeta {
+            title: "PII sent over the network",
+            severity: "medium",
+            message: "HTTP client APIs co-occur with PII field names (location, email, phone, payment data).",
+            recommendation: "Minimize PII in requests; declare data collection; use TLS and purpose limitation.",
+            cwe: Some("CWE-359"),
+        },
+        "ui_password_cache" => CategoryMeta {
+            title: "Password/PIN field may be cached",
+            severity: "low",
+            message: "EditText/hint patterns suggest password/PIN UI without a clear password inputType.",
+            recommendation: "Use TYPE_TEXT_VARIATION_PASSWORD / SecureTextField so IME and autofill treat fields correctly.",
+            cwe: Some("CWE-522"),
+        },
+        "ssl_socket_no_hostname" => CategoryMeta {
+            title: "SSLSocket without hostname verification",
+            severity: "high",
+            message: "SSLSocket/SSLSocketFactory is used without a HostnameVerifier — hostname mismatches are not rejected (unlike HttpsURLConnection).",
+            recommendation: "Call HttpsURLConnection.getDefaultHostnameVerifier().verify(host, session) after handshake, or use HttpsURLConnection/OkHttp with pinning.",
+            cwe: Some("CWE-295"),
+        },
+        "sdk_int_check" => CategoryMeta {
+            title: "Build.VERSION.SDK_INT check",
+            severity: "info",
+            message: "Code branches on Build.VERSION.SDK_INT (API-level inventory).",
+            recommendation: "Review security-relevant branches for missing modern API protections on older SDK levels.",
+            cwe: None,
+        },
+        "storage_integrity_hmac" => CategoryMeta {
+            title: "HMAC-based storage integrity",
+            severity: "medium",
+            message: "Mac/HMAC is used with SharedPreferences-like storage — integrity depends on key protection.",
+            recommendation: "Do not hardcode HMAC keys; bind verification to Keystore-backed secrets or platform integrity APIs.",
+            cwe: Some("CWE-345"),
+        },
+        "compose_password_visible" => CategoryMeta {
+            title: "Compose SecureTextField with visible text",
+            severity: "medium",
+            message: "SecureTextField is configured with TextObfuscationMode.Visible — secrets may appear in cleartext on screen / screenshots.",
+            recommendation: "Use TextObfuscationMode.RevealLastTyped or Hidden for password/OTP fields.",
+            cwe: Some("CWE-200"),
+        },
+        "allow_backup" => CategoryMeta {
+            title: "Application allowBackup enabled",
+            severity: "medium",
+            message: "android:allowBackup=true — app data may be extractable via Backup Manager / adb backup.",
+            recommendation: "Set allowBackup=false or maintain fullBackupContent/dataExtractionRules that exclude secrets.",
+            cwe: Some("CWE-921"),
+        },
+        "exported_custom_action" => CategoryMeta {
+            title: "Exported component with custom intent action",
+            severity: "medium",
+            message: "An exported activity/receiver declares a custom (non-standard) intent action — other apps can register competing filters.",
+            recommendation: "Use explicit Intents for internal IPC; avoid custom actions on exported components.",
+            cwe: Some("CWE-926"),
+        },
+        "native_root_detection" => CategoryMeta {
+            title: "Native root artifact strings",
+            severity: "info",
+            message: "Native libraries embed su/root path strings (root detection inventory).",
+            recommendation: "Root checks in native code remain bypassable; prefer integrity attestation.",
+            cwe: Some("CWE-919"),
+        },
+        "manifest_debuggable" => CategoryMeta {
+            title: "Application debuggable",
+            severity: "high",
+            message: "android:debuggable=true in the manifest enables JDWP and weakens production hardening.",
+            recommendation: "Ensure release builds set android:debuggable=false (default when minify/release).",
+            cwe: Some("CWE-489"),
+        },
+        "dangerous_permission" => CategoryMeta {
+            title: "Dangerous permission declared",
+            severity: "info",
+            message: "Manifest declares a dangerous/runtime permission (contacts, storage, location, …).",
+            recommendation: "Justify each dangerous permission; request at runtime with clear UX.",
+            cwe: Some("CWE-250"),
+        },
+        "system_alert_window" => CategoryMeta {
+            title: "SYSTEM_ALERT_WINDOW permission",
+            severity: "medium",
+            message: "App requests SYSTEM_ALERT_WINDOW (draw over other apps) — relevant to overlay attacks.",
+            recommendation: "Only request if required; victim apps should use overlay protections on sensitive UI.",
+            cwe: Some("CWE-1021"),
+        },
+        "network_security_config_user_ca" => CategoryMeta {
+            title: "Network security config trusts user CAs",
+            severity: "high",
+            message: "networkSecurityConfig appears to trust user-added certificate authorities.",
+            recommendation: "Trust only system (or pinned) CAs in production; disable user CAs except debug builds.",
+            cwe: Some("CWE-295"),
+        },
         other if other.starts_with("semgrep:") => CategoryMeta {
             title: "Semgrep rule match",
             severity: "medium",
@@ -566,6 +830,16 @@ impl VulnFinding {
             sink_reg,
             &sink_desc,
         );
+        let cwe = meta.cwe.map(|s| s.to_string());
+        let mas = super::mas::enrich_mas(
+            category,
+            meta.title,
+            &message,
+            &problem,
+            meta.recommendation,
+            cwe.as_deref(),
+            None,
+        );
         Self {
             category: category.to_string(),
             title: meta.title.to_string(),
@@ -573,7 +847,7 @@ impl VulnFinding {
             message,
             problem,
             recommendation: meta.recommendation.to_string(),
-            cwe: meta.cwe.map(|s| s.to_string()),
+            cwe,
             class_name: class_name.to_string(),
             method_name: method_name.to_string(),
             source_offset,
@@ -584,6 +858,10 @@ impl VulnFinding {
             sink_desc,
             trace,
             evidence_offsets,
+            maswe: mas.maswe,
+            masvs: mas.masvs,
+            mastg_know: mas.mastg_know,
+            mastg_best: mas.mastg_best,
         }
     }
 
@@ -611,6 +889,24 @@ impl VulnFinding {
             self.sink_reg,
             &self.sink_desc,
         );
+        self.apply_mas_enrichment(None);
+    }
+
+    /// Attach / refresh OWASP MASWE → MASVS → MASTG links from finding text.
+    pub fn apply_mas_enrichment(&mut self, rule_id: Option<&str>) {
+        let mas = super::mas::enrich_mas(
+            &self.category,
+            &self.title,
+            &self.message,
+            &self.problem,
+            &self.recommendation,
+            self.cwe.as_deref(),
+            rule_id,
+        );
+        self.maswe = mas.maswe;
+        self.masvs = mas.masvs;
+        self.mastg_know = mas.mastg_know;
+        self.mastg_best = mas.mastg_best;
     }
 }
 

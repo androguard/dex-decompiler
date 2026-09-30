@@ -2,7 +2,9 @@
 
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
 use crate::decompile::Decompiler;
-use crate::detectors::{invoke_scan, method_matches_any, source_sink_scan, VulnFinding};
+use crate::detectors::{
+    enrich_mas, invoke_scan, method_matches_any, source_sink_scan, MasLink, VulnFinding,
+};
 use crate::java::descriptor_to_java;
 use crate::semgrep::match_java::{PreparedPattern, TokenizedSource};
 use crate::semgrep::rule::{
@@ -28,6 +30,18 @@ pub struct SemgrepFinding {
     pub chain_tag: Option<String>,
     /// How the match was obtained: `native` (SSA/VF), `java_pattern`, or `java_regex`.
     pub match_kind: String,
+    /// OWASP MASWE weaknesses (native enrichment).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maswe: Vec<MasLink>,
+    /// OWASP MASVS controls with docs URLs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub masvs: Vec<MasLink>,
+    /// OWASP MASTG Knowledge articles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mastg_know: Vec<MasLink>,
+    /// OWASP MASTG Best Practices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mastg_best: Vec<MasLink>,
 }
 
 impl SemgrepFinding {
@@ -51,6 +65,18 @@ impl SemgrepFinding {
             if !self.sink_desc.is_empty() {
                 f.message.push_str(&format!(" Sink: `{}`.", self.sink_desc));
             }
+        }
+        if self.maswe.is_empty()
+            && self.masvs.is_empty()
+            && self.mastg_know.is_empty()
+            && self.mastg_best.is_empty()
+        {
+            f.apply_mas_enrichment(Some(&self.rule_id));
+        } else {
+            f.maswe = self.maswe.clone();
+            f.masvs = self.masvs.clone();
+            f.mastg_know = self.mastg_know.clone();
+            f.mastg_best = self.mastg_best.clone();
         }
         f
     }
@@ -399,7 +425,7 @@ fn scan_method_prepared(
         }
     }
 
-    findings
+    dedupe_semgrep_findings(findings)
 }
 
 fn ensure_java(
@@ -423,6 +449,29 @@ fn ensure_java(
     *java = Some(src);
 }
 
+/// Drop exact duplicate hits (same rule + location) that multiple match paths can emit.
+fn dedupe_semgrep_findings(findings: Vec<SemgrepFinding>) -> Vec<SemgrepFinding> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(String, String, String, u32, String)> = HashSet::new();
+    findings
+        .into_iter()
+        .filter(|f| {
+            let sink_key = if f.sink_offset.is_some() {
+                String::new()
+            } else {
+                f.sink_desc.clone()
+            };
+            seen.insert((
+                f.rule_id.clone(),
+                f.class_name.clone(),
+                f.method_name.clone(),
+                f.sink_offset.unwrap_or(u32::MAX),
+                sink_key,
+            ))
+        })
+        .collect()
+}
+
 fn finding_from_rule(
     rule: &SemgrepRule,
     class_name: &str,
@@ -436,14 +485,25 @@ fn finding_from_rule(
         .vuln_class
         .clone()
         .or_else(|| rule.metadata.summary.clone());
+    let message = if rule.message.is_empty() {
+        rule.metadata.summary.clone().unwrap_or_default()
+    } else {
+        rule.message.trim().to_string()
+    };
+    let category = format!("semgrep:{}", rule.id);
+    let mas = enrich_mas(
+        &category,
+        &format!("Semgrep: {}", rule.id),
+        &message,
+        &sink_desc,
+        "",
+        None,
+        Some(&rule.id),
+    );
     SemgrepFinding {
         rule_id: rule.id.clone(),
         severity: rule.severity.as_str().to_string(),
-        message: if rule.message.is_empty() {
-            rule.metadata.summary.clone().unwrap_or_default()
-        } else {
-            rule.message.trim().to_string()
-        },
+        message,
         class_name: class_name.to_string(),
         method_name: method_name.to_string(),
         sink_offset,
@@ -451,6 +511,10 @@ fn finding_from_rule(
         vuln_class: vuln,
         chain_tag: rule.metadata.chain_tag.clone(),
         match_kind: match_kind.to_string(),
+        maswe: mas.maswe,
+        masvs: mas.masvs,
+        mastg_know: mas.mastg_know,
+        mastg_best: mas.mastg_best,
     }
 }
 
@@ -604,7 +668,7 @@ where
             }
         }
     }
-    out
+    dedupe_semgrep_findings(out)
 }
 
 /// Like [`scan_dex_semgrep`], with optional progress callback `(done, total, class#method)`.
@@ -649,7 +713,8 @@ where
     let done = AtomicUsize::new(0);
     let progress_every = (total / 200).max(32);
 
-    jobs.par_iter()
+    let out: Vec<SemgrepFinding> = jobs
+        .par_iter()
         .map_init(
             || Decompiler::new(dex),
             |decompiler, job| {
@@ -671,7 +736,8 @@ where
             },
         )
         .flatten()
-        .collect()
+        .collect();
+    dedupe_semgrep_findings(out)
 }
 
 /// Scan AndroidManifest / XML text with XML-language Semgrep rules (parallel over rules).
@@ -681,7 +747,7 @@ pub fn scan_xml_semgrep(xml: &str, path_label: &str, rules: &[SemgrepRule]) -> V
         return Vec::new();
     }
     let hay = TokenizedSource::new(xml);
-    prepared
+    let out: Vec<SemgrepFinding> = prepared
         .xml
         .par_iter()
         .filter_map(|prep| {
@@ -696,7 +762,8 @@ pub fn scan_xml_semgrep(xml: &str, path_label: &str, rules: &[SemgrepRule]) -> V
                 )
             })
         })
-        .collect()
+        .collect();
+    dedupe_semgrep_findings(out)
 }
 
 /// Sequential XML Semgrep scan (WASM-friendly).
@@ -710,7 +777,7 @@ pub fn scan_xml_semgrep_sequential(
         return Vec::new();
     }
     let hay = TokenizedSource::new(xml);
-    prepared
+    let out: Vec<SemgrepFinding> = prepared
         .xml
         .iter()
         .filter_map(|prep| {
@@ -725,5 +792,6 @@ pub fn scan_xml_semgrep_sequential(
                 )
             })
         })
-        .collect()
+        .collect();
+    dedupe_semgrep_findings(out)
 }

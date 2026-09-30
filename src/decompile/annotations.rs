@@ -212,7 +212,14 @@ fn annotation_set(
         return None;
     }
     let size = read_u32(data, set_off)? as usize;
-    let mut out = Vec::with_capacity(size);
+    if size > data.len().saturating_sub(set_off.saturating_add(4)) / 4 {
+        return None;
+    }
+    let mut out = if size <= (isize::MAX as usize) / std::mem::size_of::<ParsedAnnotation>().max(1) {
+        Vec::with_capacity(size)
+    } else {
+        return None;
+    };
     for i in 0..size {
         let entry_off = set_off + 4 + i * 4;
         if entry_off + 4 > data.len() {
@@ -238,7 +245,14 @@ fn parse_annotation_item(
     pos += 1; // visibility
     let type_idx = read_uleb128(data, &mut pos)?;
     let size = read_uleb128(data, &mut pos)? as usize;
-    let mut elements = Vec::with_capacity(size);
+    if size > data.len().saturating_sub(pos) {
+        return None;
+    }
+    let mut elements = if size <= (isize::MAX as usize) / 32 {
+        Vec::with_capacity(size)
+    } else {
+        return None;
+    };
     for _ in 0..size {
         let name_idx = read_uleb128(data, &mut pos)?;
         let name = get_string(name_idx).unwrap_or_default();
@@ -335,7 +349,14 @@ fn read_encoded_value(data: &[u8], pos: &mut usize) -> Option<EncodedValue> {
         0x1c => {
             // array
             let size = read_uleb128(data, pos)? as usize;
-            let mut items = Vec::with_capacity(size);
+            if size > data.len().saturating_sub(*pos) {
+                return None;
+            }
+            let mut items = if size <= (isize::MAX as usize) / std::mem::size_of::<EncodedValue>().max(1) {
+                Vec::with_capacity(size)
+            } else {
+                return None;
+            };
             for _ in 0..size {
                 items.push(read_encoded_value(data, pos)?);
             }

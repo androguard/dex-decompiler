@@ -1,0 +1,17 @@
+{
+  "sources": [
+    {"patterns": ["getQueryParameter", "Intent.getDataString", "getData"], "port": "return", "kind": "ActivityUserInput", "features": ["deeplink"]}
+  ],
+  "sinks": [],
+  "propagations": [],
+  "sanitizers": [],
+  "rules": [
+    {
+      "name": "Deeplink-heavy WebView (overlay)",
+      "code": 1002,
+      "description": "Example overlay emphasizing deeplink → WebView",
+      "sources": ["ActivityUserInput", "NestedIntent"],
+      "sinks": ["ExecuteJavascript", "CustomTabsLaunch", "Network"]
+    }
+  ]
+}

@@ -135,13 +135,42 @@ pub struct PendingIntentFinding {
 }
 
 impl PendingIntentFinding {
-    /// High-threat per PITracker: empty/implicit base + obtainable destination (or mutable/wrap).
+    /// High-threat per PITracker: empty/implicit base without FLAG_IMMUTABLE, or
+    /// empty/implicit base handed to an obtainable destination / wrap.
     pub fn is_high_threat(&self) -> bool {
         let weak_base = self.base_intent_empty || !self.base_intent_explicit;
+        // Implicit/empty base Intent without FLAG_IMMUTABLE is hijackable even before a sink
+        // (MASTG-DEMO-0147 / Play PendingIntent guidance).
+        if weak_base && !self.immutable_flag {
+            return true;
+        }
         let obtainable = self.dangerous_destination
             || self.wrapped_in_intent
             || (self.mutable_flag && !self.immutable_flag);
         weak_base && obtainable
+    }
+
+    /// Convert a high-threat hit into a [`VulnFinding`] for the unified scanner.
+    pub fn to_vuln_finding(&self) -> Option<crate::detectors::types::VulnFinding> {
+        if !self.is_high_threat() {
+            return None;
+        }
+        Some(crate::detectors::types::VulnFinding::new(
+            "pending_intent",
+            &self.class_name,
+            &self.method_name,
+            None,
+            format!(
+                "PendingIntent.{} (mutable={} immutable={} empty_base={} explicit={})",
+                self.creation_kind,
+                self.mutable_flag,
+                self.immutable_flag,
+                self.base_intent_empty,
+                self.base_intent_explicit
+            ),
+            self.invoke_offset,
+            format!("dest={}", self.destination_kind),
+        ))
     }
 }
 
@@ -376,15 +405,8 @@ fn analyze_flags(
             }
         }
     }
-    // Whole-method fallback for FLAG_* stringified in nearby consts.
-    for text in owned.insn_at.values() {
-        let (m, i) = flags_from_insn_text(text);
-        if m || i {
-            mutable |= m;
-            immutable |= i;
-            break;
-        }
-    }
+    // Do not scan the whole method for FLAG_* — a secure FLAG_IMMUTABLE on a sibling
+    // PendingIntent would mask mutable/implicit creations in the same method (MASTG-DEMO-0147).
     (mutable, immutable)
 }
 

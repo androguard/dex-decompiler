@@ -110,13 +110,27 @@ pub fn parse_tries_and_handlers(
     if pos >= data.len() {
         return Some((try_items, vec![]));
     }
-    let list_size = read_uleb128(data, &mut pos)?;
-    let mut handlers = Vec::with_capacity(list_size as usize);
+    let list_size = read_uleb128(data, &mut pos)? as usize;
+    if list_size > data.len().saturating_sub(pos) {
+        return None;
+    }
+    let mut handlers = if list_size <= (isize::MAX as usize) / std::mem::size_of::<EncodedCatchHandler>().max(1) {
+        Vec::with_capacity(list_size)
+    } else {
+        return None;
+    };
     for _ in 0..list_size {
         let size_signed = read_sleb128(data, &mut pos)?;
         let size_abs = size_signed.unsigned_abs() as usize;
+        if size_abs > data.len().saturating_sub(pos) {
+            return None;
+        }
         let has_catch_all = size_signed <= 0;
-        let mut type_addrs = Vec::with_capacity(size_abs);
+        let mut type_addrs = if size_abs <= (isize::MAX as usize) / std::mem::size_of::<EncodedTypeAddr>().max(1) {
+            Vec::with_capacity(size_abs)
+        } else {
+            return None;
+        };
         for _ in 0..size_abs {
             let type_idx = read_uleb128(data, &mut pos)?;
             let addr = read_uleb128(data, &mut pos)?;
@@ -421,11 +435,21 @@ pub fn try_handler_pairs(
         return Some(vec![]);
     }
     let list_size = read_uleb128(data, &mut pos)? as usize;
-    let mut handler_starts: Vec<usize> = Vec::with_capacity(list_size);
+    if list_size > data.len().saturating_sub(pos) {
+        return None;
+    }
+    let mut handler_starts: Vec<usize> = if list_size <= (isize::MAX as usize) / std::mem::size_of::<usize>() {
+        Vec::with_capacity(list_size)
+    } else {
+        return None;
+    };
     for _ in 0..list_size {
         handler_starts.push(pos);
         let size_signed = read_sleb128(data, &mut pos)?;
         let size_abs = size_signed.unsigned_abs() as usize;
+        if size_abs > data.len().saturating_sub(pos) {
+            return None;
+        }
         for _ in 0..size_abs {
             read_uleb128(data, &mut pos)?;
             read_uleb128(data, &mut pos)?;

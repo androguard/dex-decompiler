@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
+use crate::detectors::is_library_class;
 use crate::error::Result;
 
 use super::index::{MethodId, MethodIndex};
@@ -66,44 +67,52 @@ impl CallGraph {
                     cg.ins.entry(callee).or_default().push(edge);
                 }
             }
-            // Runnable/Executor/Handler shim: resolve the callback object's reaching
-            // definition to either an invoke-custom implementation or an app class
-            // implementing run(). This keeps the edge bounded to the concrete value
-            // passed at the scheduling site.
+            // Callback shims: resolve concrete listener/runnable allocations only.
             let analysis = owned.analysis();
             for (&dispatch_offset, dispatch_ref) in &owned.invoke_method_map {
-                if !is_callback_dispatch(dispatch_ref) {
+                let Some((callback_reg, target_methods)) = callback_dispatch_info(dispatch_ref)
+                else {
                     continue;
-                }
+                };
                 let dispatch_args = owned
                     .rw_map
                     .get(&dispatch_offset)
                     .map(|(reads, _)| reads.clone())
                     .unwrap_or_default();
-                let Some(&callback_reg) = dispatch_args.last() else {
+                let Some(&reg) = dispatch_args.get(callback_reg) else {
+                    // Fall back to last arg (Executor.execute style).
+                    let Some(&reg) = dispatch_args.last() else {
+                        continue;
+                    };
+                    for (callee, captured_args, method_ref) in callback_targets(
+                        index,
+                        owned,
+                        &analysis,
+                        dispatch_offset,
+                        reg,
+                        &target_methods,
+                    ) {
+                        push_shim_edge(&mut cg, mref.id, callee, dispatch_offset, captured_args, method_ref, &include);
+                    }
                     continue;
                 };
-                for (callee, captured_args, method_ref) in
-                    callback_targets(index, owned, &analysis, dispatch_offset, callback_reg)
-                {
-                    if !include(callee)
-                        || cg.outs.get(&mref.id).is_some_and(|edges| {
-                            edges.iter().any(|edge| {
-                                edge.invoke_offset == dispatch_offset && edge.callee == callee
-                            })
-                        })
-                    {
-                        continue;
-                    }
-                    let edge = CallEdge {
-                        caller: mref.id,
+                for (callee, captured_args, method_ref) in callback_targets(
+                    index,
+                    owned,
+                    &analysis,
+                    dispatch_offset,
+                    reg,
+                    &target_methods,
+                ) {
+                    push_shim_edge(
+                        &mut cg,
+                        mref.id,
                         callee,
-                        invoke_offset: dispatch_offset,
-                        arg_regs: captured_args,
+                        dispatch_offset,
+                        captured_args,
                         method_ref,
-                    };
-                    cg.outs.entry(mref.id).or_default().push(edge.clone());
-                    cg.ins.entry(callee).or_default().push(edge);
+                        &include,
+                    );
                 }
             }
         }
@@ -115,11 +124,71 @@ impl CallGraph {
     }
 }
 
-fn is_callback_dispatch(method_ref: &str) -> bool {
-    method_ref.contains("Executor.execute")
+fn push_shim_edge(
+    cg: &mut CallGraph,
+    caller: MethodId,
+    callee: MethodId,
+    invoke_offset: u32,
+    arg_regs: Vec<u32>,
+    method_ref: String,
+    include: &impl Fn(MethodId) -> bool,
+) {
+    if !include(callee) {
+        return;
+    }
+    if cg.outs.get(&caller).is_some_and(|edges| {
+        edges
+            .iter()
+            .any(|edge| edge.invoke_offset == invoke_offset && edge.callee == callee)
+    }) {
+        return;
+    }
+    let shim_ref = if method_ref.starts_with("shim:") {
+        method_ref
+    } else {
+        format!("shim:{method_ref}")
+    };
+    let edge = CallEdge {
+        caller,
+        callee,
+        invoke_offset,
+        arg_regs,
+        method_ref: shim_ref,
+    };
+    cg.outs.entry(caller).or_default().push(edge.clone());
+    cg.ins.entry(callee).or_default().push(edge);
+}
+
+/// Returns (callback arg index, method names to resolve on the concrete class).
+fn callback_dispatch_info(method_ref: &str) -> Option<(usize, Vec<&'static str>)> {
+    if method_ref.contains("Executor.execute")
         || method_ref.contains("ExecutorService.submit")
         || method_ref.contains("Handler.post")
         || method_ref.contains("Handler.postDelayed")
+        || method_ref.contains("ScheduledExecutorService.schedule")
+        || method_ref.contains("Timer.schedule")
+    {
+        return Some((usize::MAX, vec!["run"])); // MAX → last arg
+    }
+    if method_ref.contains("AsyncTask.execute") {
+        return Some((0, vec!["doInBackground", "onPostExecute"]));
+    }
+    if method_ref.contains("setOnClickListener") {
+        return Some((1, vec!["onClick"]));
+    }
+    if method_ref.contains("setOnLongClickListener") {
+        return Some((1, vec!["onLongClick"]));
+    }
+    if method_ref.contains("setOnCheckedChangeListener") {
+        return Some((1, vec!["onCheckedChanged"]));
+    }
+    if method_ref.contains("LiveData.observe") || method_ref.contains(".observe(") {
+        return Some((1, vec!["onChanged"]));
+    }
+    if method_ref.contains("addObserver") {
+        return Some((1, vec!["onChanged", "onCreate", "onStart", "onResume"]));
+    }
+    None
 }
 
 fn callback_targets(
@@ -128,6 +197,7 @@ fn callback_targets(
     analysis: &crate::decompile::value_flow::ValueFlowAnalysis<'_>,
     dispatch_offset: u32,
     callback_reg: u32,
+    target_methods: &[&str],
 ) -> Vec<(MethodId, Vec<u32>, String)> {
     let mut out = Vec::new();
     for (def_offset, _) in analysis.use_def(dispatch_offset, callback_reg) {
@@ -138,9 +208,18 @@ fn callback_targets(
             .unwrap_or("");
         if label.starts_with("new-instance") {
             if let Some(class_name) = label.rsplit_once(',').map(|(_, class)| class.trim()) {
-                let method_ref = format!("{class_name}.run");
-                for callee in index.resolve_callees(&method_ref) {
-                    out.push((callee, vec![callback_reg], method_ref.clone()));
+                let java = class_name
+                    .trim_start_matches('L')
+                    .trim_end_matches(';')
+                    .replace('/', ".");
+                if is_library_class(&java) {
+                    continue;
+                }
+                for meth in target_methods {
+                    let method_ref = format!("{java}.{meth}");
+                    for callee in index.resolve_callees(&method_ref) {
+                        out.push((callee, vec![callback_reg], method_ref.clone()));
+                    }
                 }
             }
             continue;

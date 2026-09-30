@@ -182,7 +182,14 @@ fn escape(s: &str) -> String {
 fn parse_encoded_array(data: &[u8], off: usize) -> Option<Vec<EncodedValue>> {
     let mut pos = off;
     let size = read_uleb128(data, &mut pos)? as usize;
-    let mut items = Vec::with_capacity(size);
+    if size > data.len().saturating_sub(pos) {
+        return None;
+    }
+    let mut items = if size <= (isize::MAX as usize) / std::mem::size_of::<EncodedValue>().max(1) {
+        Vec::with_capacity(size)
+    } else {
+        return None;
+    };
     for _ in 0..size {
         items.push(read_encoded_value(data, &mut pos)?);
     }

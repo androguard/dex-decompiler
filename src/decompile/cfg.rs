@@ -43,7 +43,11 @@ fn parse_switch_payload(data: &[u8], switch_ins_off: usize) -> Option<Vec<(i32, 
     })?;
     let (ident, size) = try_payload(payload_off)?;
     let size = size as usize;
-    let mut out = Vec::with_capacity(size);
+    let mut out = if size <= (isize::MAX as usize) / std::mem::size_of::<(i32, u32)>() {
+        Vec::with_capacity(size)
+    } else {
+        return None;
+    };
     match ident {
         0x0100 => {
             if payload_off + 8 + size * 4 > data.len() {

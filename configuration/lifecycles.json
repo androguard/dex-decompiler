@@ -1,0 +1,18 @@
+[
+  {"patterns": [".onCreate(", "Activity.onCreate"], "argument": 1, "kind": "ActivityUserInput"},
+  {"patterns": [".onStart(", "Activity.onStart", "Fragment.onStart"], "argument": 0, "kind": "ActivityUserInput"},
+  {"patterns": [".onResume(", "Activity.onResume"], "argument": 0, "kind": "ActivityUserInput"},
+  {"patterns": [".onNewIntent("], "argument": 1, "kind": "ActivityUserInput"},
+  {"patterns": [".onActivityResult("], "argument": 3, "kind": "ActivityUserInput"},
+  {"patterns": [".onStartCommand("], "argument": 1, "kind": "ActivityUserInput"},
+  {"patterns": [".onBind("], "argument": 1, "kind": "ActivityUserInput"},
+  {"patterns": [".onHandleIntent("], "argument": 1, "kind": "ActivityUserInput"},
+  {"patterns": [".onReceive("], "argument": 2, "kind": "ReceiverUserInput"},
+  {"patterns": ["ContentProvider.query", ".query("], "argument": 2, "kind": "ProviderUserInput"},
+  {"patterns": ["ContentProvider.insert", ".insert("], "argument": 2, "kind": "ProviderUserInput"},
+  {"patterns": ["ContentProvider.update", ".update("], "argument": 2, "kind": "ProviderUserInput"},
+  {"patterns": ["ContentProvider.call", ".call("], "argument": 2, "kind": "ProviderUserInput"},
+  {"patterns": ["Fragment.onCreate("], "argument": 1, "kind": "ActivityUserInput"},
+  {"patterns": [".onViewCreated("], "argument": 2, "kind": "ActivityUserInput"},
+  {"patterns": [".onClick("], "argument": 1, "kind": "UserInput"}
+]

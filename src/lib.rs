@@ -26,9 +26,10 @@ pub use decompile::{
 pub use detectors::pending_intent::{scan_pending_intents, PendingIntentFinding};
 pub use detectors::{
     category_meta, class_matches_exclude_regexps, class_matches_prefixes, count_method_jobs_scoped,
-    count_method_jobs_scoped_ex, is_com_android_lab_app, is_library_class, run_all_detectors,
-    scan_dex_parallel, scan_dex_parallel_scoped, scan_pending_intents_dex_parallel,
-    scan_pending_intents_dex_parallel_scoped, CategoryMeta, VulnFinding, VulnTraceStep,
+    count_method_jobs_scoped_ex, enrich_mas, is_com_android_lab_app, is_library_class,
+    run_all_detectors, scan_dex_parallel, scan_dex_parallel_scoped,
+    scan_pending_intents_dex_parallel, scan_pending_intents_dex_parallel_scoped, CategoryMeta,
+    MasEnrichment, MasLink, VulnFinding, VulnTraceStep,
 };
 pub use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod};
 pub use error::{DexDecompilerError, Result};
@@ -49,9 +50,11 @@ pub use semgrep::{
     ANDROID_GENERAL_RULES_YAML,
 };
 pub use taint::{
-    convert_models_json, convert_rules_json, default_config, load_mt_case_config, method_patterns,
-    parse_mt_port, solve_dex, solve_dexes, write_issues_json, Issue, IssueReport, MethodIndex,
-    Port, SolveOptions, SolveResult, TaintConfig,
+    convert_models_json, convert_rules_json, default_config, default_lifecycle_seeds,
+    exported_classes_from_manifest_xml, load_lifecycle_seeds, load_mt_case_config, method_patterns,
+    parse_mt_port, solve_dex, solve_dexes, write_issues_json, CallGraph, Issue, IssueReport,
+    LifecycleSeed, MethodIndex, Port, PropagationModel, Rule, SanitizerModel, SinkModel,
+    SolveOptions, SolveResult, SourceModel, TaintConfig,
 };
 pub use xref::{
     find_field_xrefs, find_field_xrefs_fast, find_method_call_traces,

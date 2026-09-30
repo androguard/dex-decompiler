@@ -218,28 +218,63 @@ fn collect_patterns(v: &serde_yaml::Value, out: &mut Vec<String>, skip_negatives
         serde_yaml::Value::Mapping(map) => {
             for (k, val) in map {
                 let key = k.as_str().unwrap_or("");
-                if key == "pattern" || key == "pattern-inside" {
+                if key == "pattern" {
                     if let Some(s) = val.as_str() {
-                        out.push(s.to_string());
+                        if is_usable_match_pattern(s) {
+                            out.push(s.to_string());
+                        }
                     }
+                } else if key == "pattern-inside" || key == "pattern-not-inside" {
+                    // Structural constraints only. Collecting `$M(...){ ... }` as an OR
+                    // candidate makes the rule match every method body.
+                    continue;
                 } else if key == "pattern-not"
-                    || key == "pattern-not-inside"
                     || key == "pattern-not-regex"
                     || key == "metavariable-regex"
                     || key == "metavariable-pattern"
+                    || key == "metavariable-comparison"
+                    || key == "metavariable-name"
+                    || key == "focus-metavariable"
                 {
                     // Negations / metavariable constraints: ignored in the native subset.
                     continue;
                 } else if key == "pattern-either" || key == "patterns" {
                     collect_patterns(val, out, skip_negatives);
                 } else {
-                    collect_patterns(val, out, skip_negatives);
+                    // Unknown nested keys — do not scrape strings (avoids `$DURATION` from
+                    // metavariable-comparison values matching every identifier).
+                    continue;
                 }
             }
         }
-        serde_yaml::Value::String(s) => out.push(s.clone()),
+        serde_yaml::Value::String(s) => {
+            if is_usable_match_pattern(s) {
+                out.push(s.clone());
+            }
+        }
         _ => {}
     }
+}
+
+/// Patterns that are too broad / not meaningful as standalone matches in our subset.
+fn is_usable_match_pattern(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // Bare metavariable or comparison scraped from metavariable-comparison.
+    if t.starts_with('$') && !t.contains('(') && !t.contains('.') && !t.contains(' ') {
+        return false;
+    }
+    if t.starts_with('$') && (t.contains('>') || t.contains('<') || t.contains("==")) {
+        return false;
+    }
+    // Universal method-body wrapper used with pattern-inside.
+    let compact: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact == "$M(...){...}" || compact == "$F(...){...}" || compact == "$METHOD(...){...}" {
+        return false;
+    }
+    true
 }
 
 fn collect_regexes(v: &serde_yaml::Value, out: &mut Vec<String>) {
@@ -294,5 +329,50 @@ mod count_tests {
         let rules = load_rules_from_dir(&dir).unwrap();
         println!("mastg dir: OK {} rules", rules.len());
         assert!(rules.len() >= 60, "mastg dir too small: {}", rules.len());
+    }
+
+    #[test]
+    fn noisy_mastg_rules_do_not_collect_universal_patterns() {
+        let bio = load_rules_from_str(include_str!(
+            "../../rules/semgrep/android/mastg/mastg-android-biometric-validity-duration.yml"
+        ))
+        .unwrap();
+        let pats = bio[0].pattern_strings();
+        assert!(
+            pats.iter().all(|p| p.contains("setUserAuthentication")),
+            "unexpected biometric patterns: {pats:?}"
+        );
+        assert!(
+            !pats
+                .iter()
+                .any(|p| p.trim() == "$DURATION" || (p.contains('$') && p.contains('>'))),
+            "metavariable-comparison leaked: {pats:?}"
+        );
+
+        let non_rand = load_rules_from_str(include_str!(
+            "../../rules/semgrep/android/mastg/mastg-android-non-random-use.yml"
+        ))
+        .unwrap();
+        let pats = non_rand[0].pattern_strings();
+        assert!(
+            !pats.iter().any(|p| p.contains("$M(...)")),
+            "pattern-inside wrapper leaked: {pats:?}"
+        );
+        assert!(pats
+            .iter()
+            .any(|p| p.contains("Date") || p.contains("currentTimeMillis")));
+
+        let entropy = load_rules_from_str(include_str!(
+            "../../rules/semgrep/android/mastg/mastg-android-random-apis-insufficient-entropy.yml"
+        ))
+        .unwrap();
+        let pats = entropy[0].pattern_strings();
+        assert!(
+            !pats.iter().any(|p| p.contains("$M(...)")),
+            "pattern-inside wrapper leaked: {pats:?}"
+        );
+        assert!(pats
+            .iter()
+            .any(|p| p.contains("random") || p.contains("Random")));
     }
 }

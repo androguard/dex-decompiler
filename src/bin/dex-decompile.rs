@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
 use dex_decompiler::{
-    build_deobf_rename_map, default_config, extract_android_manifest_from_apk, load_android_rules,
-    load_dexes_from_path, load_dexes_from_paths, load_mapping_file, looks_like_text_xml,
+    build_deobf_rename_map, default_config, exported_classes_from_manifest_xml,
+    extract_android_manifest_from_apk, load_android_rules, load_dexes_from_path,
+    load_dexes_from_paths, load_mapping_file, looks_like_text_xml,
     mapping_format_from_path, merge_rename_maps, parse_dex, save_mapping_file, scan_dex_parallel,
     scan_dex_semgrep_with_progress, scan_pending_intents_dex_parallel, scan_xml_semgrep,
     solve_dexes, write_issues_json, DecompilationMode, Decompiler, DecompilerOptions,
@@ -783,12 +784,36 @@ fn main() -> Result<()> {
         if args.taint_include_framework {
             opts.exclude_prefixes.clear();
         }
+        opts.priority_entry_classes
+            .extend(args.taint_priority_entry.iter().cloned());
 
         let mut owned_dexes = Vec::new();
         for path in &args.input {
-            let data = fs::read(path).with_context(|| format!("read {}", path))?;
-            let dex = parse_dex(&data).context("parse DEX")?;
-            owned_dexes.push(dex);
+            let p = Path::new(path);
+            // Prefer APK multi-DEX loader; fall back to bare DEX.
+            match load_dexes_from_path(p) {
+                Ok(dexes) => {
+                    // Best-effort: seed priority entries from decoded text manifests.
+                    if opts.priority_entry_classes.is_empty() {
+                        if let Ok(data) = fs::read(p) {
+                            if let Ok(manifest) = extract_android_manifest_from_apk(&data) {
+                                if looks_like_text_xml(&manifest) {
+                                    if let Ok(xml) = std::str::from_utf8(&manifest) {
+                                        opts.priority_entry_classes
+                                            .extend(exported_classes_from_manifest_xml(xml));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    owned_dexes.extend(dexes);
+                }
+                Err(_) => {
+                    let data = fs::read(path).with_context(|| format!("read {}", path))?;
+                    let dex = parse_dex(&data).context("parse DEX")?;
+                    owned_dexes.push(dex);
+                }
+            }
         }
         let refs: Vec<&DexFile> = owned_dexes.iter().collect();
         let result = solve_dexes(&refs, &config, &opts).context("taint solve")?;
@@ -1274,6 +1299,12 @@ struct Args {
     /// Do not skip android/androidx/kotlin/java framework packages during taint solve.
     #[arg(long = "taint-include-framework")]
     taint_include_framework: bool,
+
+    /// Prioritize these entry classes (Activity/Receiver/…) during taint seeding.
+    /// Repeatable. When omitted and input is an APK with a decoded text manifest,
+    /// exported components are used when recoverable.
+    #[arg(long = "taint-priority-entry", value_name = "CLASS")]
+    taint_priority_entry: Vec<String>,
 
     /// Emulate method CLASS#METHOD with optional params; print console output and return value to stdout.
     #[arg(long = "emulate", value_name = "CLASS#METHOD")]

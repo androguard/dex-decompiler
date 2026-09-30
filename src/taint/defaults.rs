@@ -24,18 +24,26 @@ const DEFAULT_JSON: &str = r#"
     {"patterns": [".onActivityResult("], "port": {"argument": {"index": 3}}, "kind": "ActivityUserInput"},
     {"patterns": [".onBind("], "port": {"argument": {"index": 1}}, "kind": "ActivityUserInput"},
     {"patterns": ["ContentResolver.query"], "port": "return", "kind": "ProviderUserInput"},
-    {"patterns": ["getInstalledPackages", "createPackageContext", "getApplicationInfo", "File.getAbsolutePath", "Environment.getExternalStorageDirectory"], "port": "return", "kind": "UntrustedCodePath"}
+    {"patterns": ["getInstalledPackages", "createPackageContext", "getApplicationInfo", "File.getAbsolutePath", "Environment.getExternalStorageDirectory"], "port": "return", "kind": "UntrustedCodePath"},
+    {"patterns": ["SmsMessage.getMessageBody", "SmsMessage.getDisplayMessageBody"], "port": "return", "kind": "SmsPii", "features": ["pii"]},
+    {"patterns": ["TelephonyManager.getLine1Number", "getLine1Number"], "port": "return", "kind": "SmsPii", "features": ["pii"]},
+    {"patterns": ["AccountManager.getAccounts", "AccountManager.getAccountsByType"], "port": "return", "kind": "AccountPii", "features": ["pii"]},
+    {"patterns": ["MediaStore", "ACTION_GET_CONTENT", "ACTION_OPEN_DOCUMENT", "getData", "ClipData.Item.getUri"], "port": "return", "kind": "ActivityUserInput"},
+    {"patterns": ["SharedPreferences.getString", "SharedPreferences.getStringSet"], "port": "return", "kind": "StorageRead"}
   ],
   "sinks": [
     {"patterns": ["Runtime.exec", "ProcessBuilder.<init>", "ProcessBuilder.start"], "port": {"argument": {"index": 0}}, "kind": "CodeExecution"},
+    {"patterns": ["Runtime.exec"], "port": {"argument": {"index": 1}}, "kind": "CodeExecution"},
     {"patterns": ["DexClassLoader.<init>", "PathClassLoader.<init>", "InMemoryDexClassLoader.<init>"], "port": {"argument": {"index": 1}}, "kind": "CodeExecution"},
     {"patterns": ["loadClass", "System.load", "System.loadLibrary", "Method.invoke", "Class.forName"], "port": {"argument": {"index": 1}}, "kind": "CodeExecution"},
     {"patterns": ["rawQuery", "execSQL", "compileStatement"], "port": {"argument": {"index": 1}}, "kind": "SQLQuery"},
+    {"patterns": ["SQLiteDatabase.query", "SQLiteDatabase.queryWithFactory", "android.database.sqlite.SQLiteDatabase.query"], "port": {"argument": {"index": 3}}, "kind": "SQLQuery"},
+    {"patterns": ["Cipher.getInstance", "javax.crypto.Cipher.getInstance"], "port": {"argument": {"index": 1}}, "kind": "WeakCrypto"},
     {"patterns": ["WebView.loadUrl", "loadData", "loadDataWithBaseURL", "evaluateJavascript"], "port": {"argument": {"index": 1}}, "kind": "ExecuteJavascript"},
     {"patterns": ["addJavascriptInterface"], "port": {"argument": {"index": 1}}, "kind": "JavascriptInterface"},
     {"patterns": ["setAllowFileAccessFromFileURLs", "setAllowUniversalAccessFromFileURLs"], "port": {"argument": {"index": 1}}, "kind": "WebViewFileAccess"},
     {"patterns": ["Log.d", "Log.i", "Log.w", "Log.e", "Log.v", "println"], "port": {"argument": {"index": 1}}, "kind": "Logging"},
-    {"patterns": ["startActivity", "startActivityForResult", "startService", "bindService", "sendBroadcast", "sendOrderedBroadcast"], "port": {"argument": {"index": 1}}, "kind": "LaunchingComponent"},
+    {"patterns": ["startActivity", "startActivityForResult", "startActivities", "startService", "bindService", "sendBroadcast", "sendOrderedBroadcast"], "port": {"argument": {"index": 1}}, "kind": "LaunchingComponent"},
     {"patterns": ["setResult"], "port": {"argument": {"index": 2}}, "kind": "SetResult"},
     {"patterns": ["Intent.setClipData", "setClipData", "Intent.addFlags", "addFlags"], "port": {"argument": {"index": 1}}, "kind": "UriGrant"},
     {"patterns": ["grantUriPermission", "takePersistableUriPermission", "ContentResolver.takePersistableUriPermission"], "port": {"argument": {"index": 2}}, "kind": "UriGrant"},
@@ -52,19 +60,29 @@ const DEFAULT_JSON: &str = r#"
     {"patterns": ["java.io.File.<init>", "File.<init>"], "port": {"argument": {"index": 1}}, "kind": "FileWrite"},
     {"patterns": ["SharedPreferences$Editor.putString", "Editor.putString"], "port": {"argument": {"index": 2}}, "kind": "SharedPrefsWrite"},
     {"patterns": ["ObjectInputStream.readObject", "readObject"], "port": {"argument": {"index": 0}}, "kind": "Deserialization"},
-    {"patterns": ["SecretKeySpec.<init>", "IvParameterSpec.<init>"], "port": {"argument": {"index": 1}}, "kind": "WeakCrypto"}
+    {"patterns": ["SecretKeySpec.<init>", "IvParameterSpec.<init>"], "port": {"argument": {"index": 1}}, "kind": "WeakCrypto"},
+    {"patterns": ["SmsManager.sendTextMessage", "SmsManager.sendMultipartTextMessage", "sendTextMessage"], "port": {"argument": {"index": 3}}, "kind": "SmsSend"},
+    {"patterns": ["Notification.Builder.setContentText", "Notification.Builder.setContentTitle", "setTicker"], "port": {"argument": {"index": 1}}, "kind": "Notification"},
+    {"patterns": ["ContentResolver.insert", "ContentResolver.update", "ContentResolver.delete"], "port": {"argument": {"index": 2}}, "kind": "ProviderWrite"},
+    {"patterns": ["Picasso.load", "Glide.with", "RequestBuilder.load", "ImageRequest.Builder.setSource"], "port": {"argument": {"index": 1}}, "kind": "Network"},
+    {"patterns": ["PendingIntent.getActivity", "PendingIntent.getBroadcast", "PendingIntent.getService"], "port": {"argument": {"index": 2}}, "kind": "PendingIntentBuild"}
   ],
   "propagations": [
     {"patterns": ["StringBuilder.append", "StringBuffer.append"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
     {"patterns": ["StringBuilder.toString", "StringBuffer.toString"], "from": {"argument": {"index": 0}}, "to": "return"},
-    {"patterns": ["String.valueOf", "String.copyValueOf", "String.concat", "String.substring", "String.subSequence", "String.trim", "String.toLowerCase", "String.toUpperCase", "String.replace", "String.getBytes", "CharSequence.toString"], "from": {"argument": {"index": 0}}, "to": "return"},
+    {"patterns": ["String.valueOf", "String.copyValueOf", "String.concat", "String.substring", "String.subSequence", "String.trim", "String.toLowerCase", "String.toUpperCase", "String.replace", "String.getBytes", "CharSequence.toString", "String.format", "TextUtils.join"], "from": {"argument": {"index": 0}}, "to": "return"},
+    {"patterns": ["String.format"], "from": {"argument": {"index": 1}}, "to": "return"},
     {"patterns": ["Arrays.copyOf", "Arrays.copyOfRange", "Collections.unmodifiableList", "Collections.unmodifiableMap", "Objects.requireNonNull"], "from": {"argument": {"index": 0}}, "to": "return"},
-    {"patterns": ["Uri.parse", "Uri.Builder.build", "Uri.Builder.appendQueryParameter"], "from": {"argument": {"index": 0}}, "to": "return"},
-    {"patterns": ["Intent.putExtra", "putExtra"], "from": {"argument": {"index": 2}}, "to": {"argument": {"index": 0}}},
+    {"patterns": ["Uri.parse", "Uri.Builder.build", "Uri.Builder.appendQueryParameter", "Uri.Builder.appendPath", "Uri.Builder.appendEncodedPath"], "from": {"argument": {"index": 0}}, "to": "return"},
+    {"patterns": ["Uri.Builder.appendQueryParameter"], "from": {"argument": {"index": 2}}, "to": {"argument": {"index": 0}}},
+    {"patterns": ["Intent.putExtra", "putExtra", "Intent.putExtras"], "from": {"argument": {"index": 2}}, "to": {"argument": {"index": 0}}},
+    {"patterns": ["Intent.putExtras"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
     {"patterns": ["Intent.setData", "setData", "setDataAndType"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
     {"patterns": ["Intent.setClipData", "setClipData"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
     {"patterns": ["Intent.addFlags", "addFlags", "Intent.setFlags", "setFlags"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
     {"patterns": ["Bundle.putString", "Bundle.putStringArray", "Bundle.putStringArrayList", "Bundle.putCharSequence", "Bundle.putParcelable", "Bundle.putParcelableArray", "Bundle.putParcelableArrayList", "Bundle.putSerializable", "Bundle.putBundle", "PersistableBundle.putString", "PersistableBundle.putStringArray", "PersistableBundle.putPersistableBundle"], "from": {"argument": {"index": 2}}, "to": {"argument": {"index": 0}}},
+    {"patterns": ["JSONObject.put", "Map.put", "HashMap.put"], "from": {"argument": {"index": 2}}, "to": {"argument": {"index": 0}}},
+    {"patterns": ["JSONObject.getString", "JSONObject.optString", "Map.get", "HashMap.get"], "from": {"argument": {"index": 0}}, "to": "return"},
     {"patterns": ["ClipData.newRawUri", "ClipData.newUri", "ClipData.Item.getUri"], "from": {"argument": {"index": 1}}, "to": "return"},
     {"patterns": ["setLoginUrl"], "from": {"argument": {"index": 1}}, "to": {"argument": {"index": 0}}},
     {"patterns": ["Cipher.doFinal", "javax.crypto.Cipher.doFinal"], "from": {"argument": {"index": 1}}, "to": "return"},
@@ -76,7 +94,8 @@ const DEFAULT_JSON: &str = r#"
   "sanitizers": [
     {"patterns": ["MessageDigest.digest", "MessageDigest.update", "hashCode", "Objects.hash"], "kinds": []},
     {"patterns": ["URLEncoder.encode", "Uri.encode"], "kinds": []},
-    {"patterns": ["Base64.encode", "Base64.encodeToString"], "kinds": []}
+    {"patterns": ["Base64.encode", "Base64.encodeToString"], "kinds": []},
+    {"patterns": ["File.getCanonicalPath", "File.getCanonicalFile", "java.io.File.getCanonicalPath", "java.io.File.getCanonicalFile"], "kinds": ["ActivityUserInput", "UserInput", "ProviderUserInput", "UntrustedCodePath"]}
   ],
   "rules": [
     {
@@ -197,6 +216,41 @@ const DEFAULT_JSON: &str = r#"
       "description": "BroadcastReceiver-controlled values may reach launch, WebView, or cookie sinks",
       "sources": ["ReceiverUserInput", "NestedIntent"],
       "sinks": ["LaunchingComponent", "ExecuteJavascript", "CookieWrite", "CookieRead", "UriGrant"]
+    },
+    {
+      "name": "PII to SMS send",
+      "code": 23,
+      "description": "SMS or account PII may flow into SmsManager send APIs",
+      "sources": ["SmsPii", "AccountPii", "DeviceId", "UserInput", "ActivityUserInput"],
+      "sinks": ["SmsSend"]
+    },
+    {
+      "name": "PII to notification",
+      "code": 24,
+      "description": "Sensitive values may flow into notification content",
+      "sources": ["SmsPii", "AccountPii", "DeviceId", "Location", "ActivityUserInput", "UserInput"],
+      "sinks": ["Notification"]
+    },
+    {
+      "name": "Provider input to provider write",
+      "code": 25,
+      "description": "Provider/user input may flow into ContentResolver insert/update/delete",
+      "sources": ["ProviderUserInput", "ActivityUserInput", "UserInput"],
+      "sinks": ["ProviderWrite"]
+    },
+    {
+      "name": "Nested Intent to PendingIntent",
+      "code": 26,
+      "description": "Parcelable/nested Intent may flow into PendingIntent construction",
+      "sources": ["NestedIntent", "ActivityUserInput", "ReceiverUserInput"],
+      "sinks": ["PendingIntentBuild", "LaunchingComponent"]
+    },
+    {
+      "name": "Storage read to network / log",
+      "code": 27,
+      "description": "SharedPreferences reads may flow into network or logging sinks",
+      "sources": ["StorageRead"],
+      "sinks": ["Network", "Logging", "CookieWrite"]
     }
   ]
 }

@@ -10,6 +10,7 @@ mod command_receiver;
 mod credential_broadcast;
 mod custom_tabs;
 mod hardcoded_secrets;
+mod icc;
 mod implicit_intent;
 mod insecure_logging;
 mod intent_parse_uri;
@@ -18,6 +19,8 @@ mod intent_spoofing;
 mod ipc_intent_validation;
 mod keystore;
 mod logcat_external;
+pub mod mas;
+mod api_misuse;
 mod next_wave;
 mod package_context;
 mod path_traversal;
@@ -26,6 +29,7 @@ mod pick_file_theft;
 mod pinning_bypass;
 mod rce_dynamic_loading;
 mod reflection_rce;
+mod resilience_static;
 mod sensitive_broadcast;
 mod sql_injection;
 mod sqlcipher_passphrase;
@@ -48,6 +52,7 @@ pub use command_receiver::scan_command_receiver;
 pub use credential_broadcast::scan_credential_broadcast;
 pub use custom_tabs::scan_custom_tabs;
 pub use hardcoded_secrets::scan_hardcoded_secrets;
+pub use icc::scan_icc_extra;
 pub use implicit_intent::scan_implicit_intent;
 pub use insecure_logging::scan_insecure_logging;
 pub use intent_parse_uri::scan_intent_parse_uri;
@@ -56,6 +61,8 @@ pub use intent_spoofing::scan_intent_spoofing;
 pub use ipc_intent_validation::scan_ipc_intent_validation;
 pub use keystore::scan_keystore_misuse;
 pub use logcat_external::scan_logcat_external;
+pub use mas::{enrich_mas, MasEnrichment, MasLink};
+pub use api_misuse::scan_api_misuse;
 pub use next_wave::scan_next_wave;
 pub use package_context::scan_package_context_ace;
 pub use path_traversal::scan_path_traversal;
@@ -64,6 +71,7 @@ pub use pick_file_theft::scan_pick_file_theft;
 pub use pinning_bypass::scan_pinning_bypass;
 pub use rce_dynamic_loading::scan_rce_dynamic_loading;
 pub use reflection_rce::scan_reflection_rce;
+pub use resilience_static::scan_resilience_static;
 pub use sensitive_broadcast::scan_sensitive_broadcast;
 pub use sql_injection::scan_sql_injection;
 pub use sqlcipher_passphrase::scan_sqlcipher_passphrase;
@@ -76,7 +84,7 @@ pub use types::{
 };
 pub use unsafe_deserialization::scan_unsafe_deserialization;
 pub use uri_grant::scan_uri_grant;
-pub use weak_crypto::scan_weak_crypto;
+pub use weak_crypto::{scan_insufficient_key_length, scan_weak_crypto};
 pub use weak_host_check::scan_weak_host_validation;
 pub use webresource_response::scan_webresource_response;
 pub use webview::scan_webview_unsafe;
@@ -274,7 +282,7 @@ fn collect_method_jobs_scoped(
     jobs
 }
 
-/// Run all detectors (except PendingIntent) and return findings, deduplicated by category+class+method+sink_offset.
+/// Run all detectors and return findings, deduplicated by category+class+method+sink_offset.
 pub fn run_all_detectors(
     owned: &ValueFlowAnalysisOwned,
     class_name: &str,
@@ -284,6 +292,7 @@ pub fn run_all_detectors(
     let mut all = Vec::new();
     all.extend(scan_intent_spoofing(owned, class_name, method_name));
     all.extend(scan_intent_redirect(owned, class_name, method_name));
+    all.extend(scan_icc_extra(owned, class_name, method_name));
     all.extend(scan_broadcast_intent_redirect(
         owned,
         class_name,
@@ -326,6 +335,13 @@ pub fn run_all_detectors(
     all.extend(scan_weak_host_validation(owned, class_name, method_name));
     all.extend(scan_pick_file_theft(owned, class_name, method_name));
     all.extend(scan_next_wave(owned, class_name, method_name));
+    all.extend(scan_api_misuse(owned, class_name, method_name));
+    all.extend(scan_resilience_static(owned, class_name, method_name));
+    all.extend(
+        scan_pending_intents(owned, class_name, method_name)
+            .into_iter()
+            .filter_map(|p| p.to_vuln_finding()),
+    );
     let mut seen: HashSet<(String, String, String, u32)> = HashSet::new();
     all.into_iter()
         .filter(|f| {

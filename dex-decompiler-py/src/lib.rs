@@ -2,10 +2,10 @@
 
 use ::dex_decompiler::java;
 use ::dex_decompiler::{
-    default_config, find_field_xrefs_fast, find_method_xrefs_fast, getclass_java,
+    default_config, enrich_mas, find_field_xrefs_fast, find_method_xrefs_fast, getclass_java,
     load_dexes_from_bytes, parse_dex, scan_dex_parallel, slice_class_from_input, solve_dexes,
     to_dalvik_descriptor, Decompiler, DecompilerOptions, DexFile, EncodedMethod, FastRefSite,
-    MethodCaller, RenameMap, SolveOptions,
+    MasLink, MethodCaller, RenameMap, SolveOptions,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -286,7 +286,7 @@ impl DexFileWrapper {
         })
     }
 
-    /// Run all vulnerability detectors; returns list of finding dicts.
+    /// Run all vulnerability detectors; returns list of finding dicts (includes MASWE/MASVS/MASTG).
     fn scan_vulns(&self) -> PyResult<Vec<PyObject>> {
         let dex = parse_dex(&self.data).map_err(|e| PyValueError::new_err(e.to_string()))?;
         let findings = scan_dex_parallel(&dex, None);
@@ -295,32 +295,36 @@ impl DexFileWrapper {
                 .into_iter()
                 .map(|f| {
                     let dict = PyDict::new(py);
-                    dict.set_item("category", f.category)?;
-                    dict.set_item("title", f.title)?;
-                    dict.set_item("severity", f.severity)?;
-                    dict.set_item("message", f.message)?;
-                    dict.set_item("problem", f.problem)?;
-                    dict.set_item("recommendation", f.recommendation)?;
-                    dict.set_item("cwe", f.cwe)?;
-                    dict.set_item("class_name", f.class_name)?;
-                    dict.set_item("method_name", f.method_name)?;
+                    dict.set_item("category", &f.category)?;
+                    dict.set_item("title", &f.title)?;
+                    dict.set_item("severity", &f.severity)?;
+                    dict.set_item("message", &f.message)?;
+                    dict.set_item("problem", &f.problem)?;
+                    dict.set_item("recommendation", &f.recommendation)?;
+                    dict.set_item("cwe", &f.cwe)?;
+                    dict.set_item("class_name", &f.class_name)?;
+                    dict.set_item("method_name", &f.method_name)?;
                     dict.set_item("source_offset", f.source_offset)?;
                     dict.set_item("source_reg", f.source_reg)?;
-                    dict.set_item("source_desc", f.source_desc)?;
+                    dict.set_item("source_desc", &f.source_desc)?;
                     dict.set_item("sink_offset", f.sink_offset)?;
                     dict.set_item("sink_reg", f.sink_reg)?;
-                    dict.set_item("sink_desc", f.sink_desc)?;
-                    dict.set_item("evidence_offsets", f.evidence_offsets)?;
-                    let trace_list = pyo3::types::PyList::empty(py);
-                    for step in f.trace {
+                    dict.set_item("sink_desc", &f.sink_desc)?;
+                    dict.set_item("evidence_offsets", &f.evidence_offsets)?;
+                    let trace_list = PyList::empty(py);
+                    for step in &f.trace {
                         let s = PyDict::new(py);
                         s.set_item("offset", step.offset)?;
                         s.set_item("reg", step.reg)?;
-                        s.set_item("kind", step.kind)?;
-                        s.set_item("description", step.description)?;
+                        s.set_item("kind", &step.kind)?;
+                        s.set_item("description", &step.description)?;
                         trace_list.append(s)?;
                     }
                     dict.set_item("trace", trace_list)?;
+                    dict.set_item("maswe", mas_links_to_py(py, &f.maswe)?)?;
+                    dict.set_item("masvs", mas_links_to_py(py, &f.masvs)?)?;
+                    dict.set_item("mastg_know", mas_links_to_py(py, &f.mastg_know)?)?;
+                    dict.set_item("mastg_best", mas_links_to_py(py, &f.mastg_best)?)?;
                     Ok(dict.into_any().unbind())
                 })
                 .collect()
@@ -548,6 +552,44 @@ fn to_dalvik(class_name: &str) -> String {
     to_dalvik_descriptor(class_name)
 }
 
+fn mas_link_to_py(py: Python<'_>, link: &MasLink) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", &link.id)?;
+    dict.set_item("title", &link.title)?;
+    dict.set_item("family", &link.family)?;
+    dict.set_item("url", &link.url)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn mas_links_to_py(py: Python<'_>, links: &[MasLink]) -> PyResult<PyObject> {
+    let list = PyList::empty(py);
+    for link in links {
+        list.append(mas_link_to_py(py, link)?)?;
+    }
+    Ok(list.into_any().unbind())
+}
+
+/// Enrich a finding category with OWASP MASWE / MASVS / MASTG KNOW+BEST links.
+#[pyfunction(name = "enrich_mas")]
+#[pyo3(signature = (category, title="", message="", recommendation="", cwe=None))]
+fn enrich_mas_py(
+    category: &str,
+    title: &str,
+    message: &str,
+    recommendation: &str,
+    cwe: Option<&str>,
+) -> PyResult<PyObject> {
+    let mas = enrich_mas(category, title, message, "", recommendation, cwe, None);
+    Python::with_gil(|py| {
+        let dict = PyDict::new(py);
+        dict.set_item("maswe", mas_links_to_py(py, &mas.maswe)?)?;
+        dict.set_item("masvs", mas_links_to_py(py, &mas.masvs)?)?;
+        dict.set_item("mastg_know", mas_links_to_py(py, &mas.mastg_know)?)?;
+        dict.set_item("mastg_best", mas_links_to_py(py, &mas.mastg_best)?)?;
+        Ok(dict.into_any().unbind())
+    })
+}
+
 /// ASC findrefs over DEX or APK bytes.
 ///
 /// `kind` is one of: `"string"`, `"type"`, `"method"`, `"field"`.
@@ -626,5 +668,6 @@ fn dex_decompiler(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(slice_class, m)?)?;
     m.add_function(wrap_pyfunction!(findrefs, m)?)?;
     m.add_function(wrap_pyfunction!(to_dalvik, m)?)?;
+    m.add_function(wrap_pyfunction!(enrich_mas_py, m)?)?;
     Ok(())
 }

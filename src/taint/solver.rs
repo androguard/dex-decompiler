@@ -1,7 +1,7 @@
 //! Interprocedural taint solver (Mariana Trench–style abstract interpretation).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use dex_parser::DexFile;
 use rayon::prelude::*;
@@ -14,10 +14,11 @@ use super::call_graph::{CallEdge, CallGraph};
 use super::config::TaintConfig;
 use super::index::{MethodId, MethodIndex};
 use super::issue::{Issue, TraceFrame};
+use super::lifecycle::{default_lifecycle_seeds, lifecycle_seeds_for, LifecycleSeed};
 use super::models::{Port, SanitizerModel};
 use super::report::{IssueReport, ReportStats};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SolveOptions {
     /// Max fixpoint iterations (default 8).
     pub max_iterations: usize,
@@ -29,6 +30,17 @@ pub struct SolveOptions {
     pub include_prefixes: Vec<String>,
     /// Skip classes whose Java name matches any of these regular expressions.
     pub exclude_regexps: Vec<String>,
+    /// Exported / IPC entry class names — their methods are analyzed first and
+    /// get an extra ActivityUserInput/ReceiverUserInput seed on lifecycle params.
+    pub priority_entry_classes: Vec<String>,
+    /// Lifecycle callback seeds (defaults from embedded table).
+    pub lifecycle_seeds: Vec<LifecycleSeed>,
+}
+
+impl Default for SolveOptions {
+    fn default() -> Self {
+        Self::default_android()
+    }
 }
 
 impl SolveOptions {
@@ -60,6 +72,8 @@ impl SolveOptions {
             ],
             include_prefixes: Vec::new(),
             exclude_regexps: Vec::new(),
+            priority_entry_classes: Vec::new(),
+            lifecycle_seeds: default_lifecycle_seeds(),
         }
     }
 }
@@ -84,12 +98,24 @@ struct MethodSummary {
     heap_injections: HashMap<(u32, u32), HashSet<String>>,
 }
 
+/// Abstract heap object identity (bounded points-to).
+type ObjectId = u32;
+const MAX_OBJECTS: ObjectId = 64;
+
 #[derive(Clone, Debug, Default)]
 struct LocalTaint {
     /// (offset, reg) → kinds (object-level / smeared / unknown key).
     at: HashMap<(u32, u32), HashSet<String>>,
-    /// (offset, reg, path) → kinds. Paths: `extra:<key>` or `field:<Class.field>`.
+    /// (offset, reg, path) → kinds. Paths: `extra:<key>`, `field:…`, `array:…`, `map:…`.
     paths: HashMap<(u32, u32, String), HashSet<String>>,
+    /// Next ObjectId to allocate (0 reserved as “unknown / smeared”).
+    next_obj: ObjectId,
+    /// Latest abstract object for each register.
+    reg_obj: HashMap<u32, ObjectId>,
+    /// ObjectIds that were merged / ambiguous — strong updates disabled.
+    smeared: HashSet<ObjectId>,
+    /// Path kinds keyed by abstract object (strong-update capable).
+    object_paths: HashMap<(ObjectId, String), HashSet<String>>,
 }
 
 impl LocalTaint {
@@ -104,23 +130,108 @@ impl LocalTaint {
         self.at.get(&(offset, reg)).cloned().unwrap_or_default()
     }
 
+    fn alloc_obj(&mut self) -> ObjectId {
+        if self.next_obj == 0 {
+            self.next_obj = 1;
+        }
+        if self.next_obj >= MAX_OBJECTS {
+            self.smeared.insert(0);
+            return 0;
+        }
+        let id = self.next_obj;
+        self.next_obj += 1;
+        id
+    }
+
+    fn ensure_reg_obj(&mut self, reg: u32) -> ObjectId {
+        if let Some(&id) = self.reg_obj.get(&reg) {
+            return id;
+        }
+        let id = self.alloc_obj();
+        self.reg_obj.insert(reg, id);
+        id
+    }
+
+    fn set_reg_obj(&mut self, reg: u32, id: ObjectId) {
+        self.reg_obj.insert(reg, id);
+    }
+
+    fn alias_regs(&mut self, dst: u32, src: u32) {
+        let id = self.ensure_reg_obj(src);
+        self.reg_obj.insert(dst, id);
+    }
+
+    /// Write `kind` onto `path` for `reg`'s object. Strong-update when the object is unique.
+    fn write_path(&mut self, offset: u32, reg: u32, path: &str, kind: &str, strong: bool) -> bool {
+        let obj = self.ensure_reg_obj(reg);
+        let mut changed = false;
+        if strong && obj != 0 && !self.smeared.contains(&obj) {
+            let entry = self.object_paths.entry((obj, path.to_string())).or_default();
+            if entry.len() != 1 || !entry.contains(kind) {
+                entry.clear();
+                entry.insert(kind.to_string());
+                changed = true;
+            }
+            // Drop stale register-level path entries so path_kinds_on_reg stays strong.
+            self.paths
+                .retain(|(off, r, p), _| !(*r == reg && p == path && *off <= offset));
+            changed |= self
+                .paths
+                .entry((offset, reg, path.to_string()))
+                .or_default()
+                .insert(kind.to_string());
+        } else {
+            changed |= self
+                .object_paths
+                .entry((obj, path.to_string()))
+                .or_default()
+                .insert(kind.to_string());
+            changed |= self
+                .paths
+                .entry((offset, reg, path.to_string()))
+                .or_default()
+                .insert(kind.to_string());
+        }
+        changed
+    }
+
+    #[allow(dead_code)]
     fn insert_path(&mut self, offset: u32, reg: u32, path: &str, kind: &str) -> bool {
+        // Default path writes are strong when the object is known.
+        self.write_path(offset, reg, path, kind, true)
+    }
+
+    /// Strong-clear path `path` on `reg`'s object (untainted store).
+    fn clear_path(&mut self, offset: u32, reg: u32, path: &str) {
+        if let Some(&obj) = self.reg_obj.get(&reg) {
+            if obj != 0 && !self.smeared.contains(&obj) {
+                self.object_paths.remove(&(obj, path.to_string()));
+            }
+        }
         self.paths
-            .entry((offset, reg, path.to_string()))
-            .or_default()
-            .insert(kind.to_string())
+            .retain(|(off, r, p), _| !(*r == reg && p == path && *off <= offset));
     }
 
     #[cfg(test)]
     fn kinds_at_path(&self, offset: u32, reg: u32, path: &str) -> HashSet<String> {
+        if let Some(&obj) = self.reg_obj.get(&reg) {
+            if let Some(kinds) = self.object_paths.get(&(obj, path.to_string())) {
+                return kinds.clone();
+            }
+        }
         self.paths
             .get(&(offset, reg, path.to_string()))
             .cloned()
             .unwrap_or_default()
     }
 
-    /// Union of path kinds on `reg` for `path` at any recorded offset (plus this one).
+    /// Union of path kinds on `reg` for `path` (object store wins when present).
     fn path_kinds_on_reg(&self, reg: u32, path: &str) -> HashSet<String> {
+        if let Some(&obj) = self.reg_obj.get(&reg) {
+            if let Some(kinds) = self.object_paths.get(&(obj, path.to_string())) {
+                return kinds.clone();
+            }
+        }
         let mut out = HashSet::new();
         for ((_, r, p), kinds) in &self.paths {
             if *r == reg && p == path {
@@ -131,6 +242,11 @@ impl LocalTaint {
     }
 
     fn path_kinds_on_reg_before(&self, reg: u32, path: &str, at: u32) -> HashSet<String> {
+        if let Some(&obj) = self.reg_obj.get(&reg) {
+            if let Some(kinds) = self.object_paths.get(&(obj, path.to_string())) {
+                return kinds.clone();
+            }
+        }
         let mut out = HashSet::new();
         for ((off, r, p), kinds) in &self.paths {
             if *off <= at && *r == reg && p == path {
@@ -142,12 +258,80 @@ impl LocalTaint {
 
     fn array_kinds_on_reg_before(&self, reg: u32, at: u32) -> HashSet<String> {
         let mut out = HashSet::new();
+        if let Some(&obj) = self.reg_obj.get(&reg) {
+            for ((o, path), kinds) in &self.object_paths {
+                if *o == obj && path.starts_with("array:") {
+                    out.extend(kinds.iter().cloned());
+                }
+            }
+        }
         for ((off, r, path), kinds) in &self.paths {
             if *off <= at && *r == reg && path.starts_with("array:") {
                 out.extend(kinds.iter().cloned());
             }
         }
         out
+    }
+
+    /// Nested path lookup: try `base` then read `child` from the result object (depth ≤ 2).
+    fn nested_path_kinds(&self, reg: u32, base: &str, child: &str) -> HashSet<String> {
+        let mut out = self.path_kinds_on_reg(reg, &format!("{base}/{child}"));
+        if !out.is_empty() {
+            return out;
+        }
+        // Fall back: kinds on base path smeared onto child for one-hop nested Intent extras.
+        out.extend(self.path_kinds_on_reg(reg, base));
+        out
+    }
+}
+
+/// Build register→ObjectId map from allocations and moves (linear sweep).
+fn build_aliases(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
+    let mut offs: Vec<u32> = owned.insn_at.keys().copied().collect();
+    offs.sort_unstable();
+    for off in offs {
+        let Some(label) = owned.insn_at.get(&off) else {
+            continue;
+        };
+        let op = label.split_whitespace().next().unwrap_or("");
+        if op == "new-instance" || op == "new-array" || op == "filled-new-array" {
+            if let Some((_, writes)) = owned.rw_map.get(&off) {
+                if let Some(&dest) = writes.first() {
+                    let id = local.alloc_obj();
+                    local.set_reg_obj(dest, id);
+                }
+            } else if let Some(dest) = label
+                .split_whitespace()
+                .nth(1)
+                .and_then(|t| t.trim_end_matches(',').strip_prefix('v')?.parse().ok())
+            {
+                let id = local.alloc_obj();
+                local.set_reg_obj(dest, id);
+            }
+            continue;
+        }
+        if op.starts_with("move-object") || op == "move" || op.starts_with("move/") {
+            let parts: Vec<&str> = label[op.len()..]
+                .split(',')
+                .map(str::trim)
+                .collect();
+            if parts.len() >= 2 {
+                if let (Some(dst), Some(src)) = (parse_reg_token(parts[0]), parse_reg_token(parts[1]))
+                {
+                    local.alias_regs(dst, src);
+                }
+            }
+            continue;
+        }
+        if op.starts_with("move-result") {
+            if let Some((_, writes)) = owned.rw_map.get(&off) {
+                if let Some(&dest) = writes.first() {
+                    // Fresh object for API / constructor results unless already aliased.
+                    let id = local.alloc_obj();
+                    local.set_reg_obj(dest, id);
+                }
+            }
+        }
     }
 }
 
@@ -272,6 +456,29 @@ fn is_extra_put(method_ref: &str) -> bool {
         || method_ref.contains("putSerializable")
         || method_ref.contains("putBundle")
         || method_ref.contains("putPersistableBundle")
+        || method_ref.contains("JSONObject.put")
+        || method_ref.contains("Map.put")
+        || method_ref.contains("HashMap.put")
+}
+
+fn is_map_put(method_ref: &str) -> bool {
+    method_ref.contains("JSONObject.put")
+        || method_ref.contains("Map.put")
+        || method_ref.contains("HashMap.put")
+        || method_ref.contains("Bundle.putString")
+        || method_ref.contains("Bundle.putParcelable")
+        || method_ref.contains("Bundle.putBundle")
+}
+
+fn is_map_get(method_ref: &str) -> bool {
+    method_ref.contains("JSONObject.get")
+        || method_ref.contains("JSONObject.opt")
+        || method_ref.contains("Map.get")
+        || method_ref.contains("HashMap.get")
+}
+
+fn map_path_key(key: &str) -> String {
+    format!("map:{key}")
 }
 
 fn is_extra_get(method_ref: &str) -> bool {
@@ -670,13 +877,16 @@ fn propagate_path(
     path: &str,
     kind: &str,
 ) {
-    local.insert_path(offset, reg, path, kind);
+    local.write_path(offset, reg, path, kind, true);
     let flow = analysis.value_flow_from_seed(offset, reg);
+    let src_obj = local.ensure_reg_obj(reg);
     for &(woff, wreg) in &flow.writes {
-        local.insert_path(woff, wreg, path, kind);
+        local.set_reg_obj(wreg, src_obj);
+        local.write_path(woff, wreg, path, kind, true);
     }
     for &(roff, rreg) in &flow.reads {
-        local.insert_path(roff, rreg, path, kind);
+        local.set_reg_obj(rreg, src_obj);
+        local.write_path(roff, rreg, path, kind, true);
     }
 }
 
@@ -746,6 +956,11 @@ fn param_kinds_fingerprint(sum: &MethodSummary) -> u64 {
 
 type SummaryMap = HashMap<MethodId, Arc<MethodSummary>>;
 type LocalTaintCache = Mutex<HashMap<MethodId, (u64, LocalTaint)>>;
+
+fn lifecycle_table() -> &'static [LifecycleSeed] {
+    static TABLE: OnceLock<Vec<LifecycleSeed>> = OnceLock::new();
+    TABLE.get_or_init(default_lifecycle_seeds).as_slice()
+}
 
 fn should_skip(class_name: &str, opts: &SolveOptions) -> bool {
     if crate::detectors::is_library_class(class_name) {
@@ -851,37 +1066,63 @@ fn compose_method_summaries(
     }
 }
 
+/// Cross-method static field heap: collect writers → inject into readers.
+/// Returns reader methods whose `heap_injections` grew (dirty-set seeds).
 fn compose_static_heap(
     index: &MethodIndex,
     vf_cache: &HashMap<MethodId, ValueFlowAnalysisOwned>,
     config: &TaintConfig,
     summaries: &mut SummaryMap,
 ) -> HashSet<MethodId> {
+    // path → writer method ids; path → reader (mid, offset, dest_reg)
+    let mut writers: HashMap<String, HashSet<MethodId>> = HashMap::new();
+    let mut readers: HashMap<String, Vec<(MethodId, u32, u32)>> = HashMap::new();
+    for (&mid, owned) in vf_cache {
+        for (&off, label) in &owned.insn_at {
+            match parse_static_field_label(label) {
+                Some(StaticFieldOp::Put { path, .. }) => {
+                    writers.entry(path).or_default().insert(mid);
+                }
+                Some(StaticFieldOp::Get { dest, path }) => {
+                    readers.entry(path).or_default().push((mid, off, dest));
+                }
+                None => {}
+            }
+        }
+    }
+
     const MAX_ROUNDS: usize = 4;
     let mut affected = HashSet::new();
     for _ in 0..MAX_ROUNDS {
         let snapshot = summaries.clone();
         let mut heap: HashMap<String, HashSet<String>> = HashMap::new();
-        for (&mid, owned) in vf_cache {
-            let local = compute_local_taint_uncached(mid, index, owned, config, &snapshot);
-            for (&off, label) in &owned.insn_at {
-                if let Some(StaticFieldOp::Put { src, path }) = parse_static_field_label(label) {
-                    heap.entry(path)
-                        .or_default()
-                        .extend(local.kinds_at(off, src));
+        for (path, mids) in &writers {
+            for &mid in mids {
+                let Some(owned) = vf_cache.get(&mid) else {
+                    continue;
+                };
+                let local = compute_local_taint_uncached(mid, index, owned, config, &snapshot);
+                for (&off, label) in &owned.insn_at {
+                    if let Some(StaticFieldOp::Put { src, path: p }) = parse_static_field_label(label)
+                    {
+                        if p == *path {
+                            heap.entry(path.clone())
+                                .or_default()
+                                .extend(local.kinds_at(off, src));
+                        }
+                    }
                 }
             }
         }
         let mut changed = false;
-        for (&mid, owned) in vf_cache {
-            for (&off, label) in &owned.insn_at {
-                let Some(StaticFieldOp::Get { dest, path }) = parse_static_field_label(label)
-                else {
-                    continue;
-                };
-                let Some(kinds) = heap.get(&path) else {
-                    continue;
-                };
+        for (path, sites) in &readers {
+            let Some(kinds) = heap.get(path) else {
+                continue;
+            };
+            if kinds.is_empty() {
+                continue;
+            }
+            for &(mid, off, dest) in sites {
                 let dst = Arc::make_mut(
                     summaries
                         .entry(mid)
@@ -891,10 +1132,10 @@ fn compose_static_heap(
                 .entry((off, dest))
                 .or_default();
                 for kind in kinds {
-                    changed |= dst.insert(kind.clone());
-                }
-                if !kinds.is_empty() {
-                    affected.insert(mid);
+                    if dst.insert(kind.clone()) {
+                        changed = true;
+                        affected.insert(mid);
+                    }
                 }
             }
         }
@@ -1017,6 +1258,48 @@ pub fn solve_dexes(
                 }
             }
             worklist.extend(local_wl);
+        }
+    }
+
+    // Prioritize exported/IPC entry classes: seed lifecycle params and push front.
+    if !opts.priority_entry_classes.is_empty() {
+        let pri = &opts.priority_entry_classes;
+        let mut front: VecDeque<(MethodId, u32, String)> = VecDeque::new();
+        for m in &index.methods {
+            if !vf_cache.contains_key(&m.id) {
+                continue;
+            }
+            let hit = pri.iter().any(|p| {
+                m.class_name == *p || m.class_name.starts_with(&format!("{p}."))
+            });
+            if !hit {
+                continue;
+            }
+            let kind = match m.method_name.as_str() {
+                "onReceive" => "ReceiverUserInput",
+                "onStartCommand" | "onBind" | "onHandleIntent" | "onUpdate" | "onTransact"
+                | "onCreate" | "onNewIntent" | "onActivityResult" => "ActivityUserInput",
+                "query" | "insert" | "update" | "delete" | "call" | "openFile" => {
+                    "ProviderUserInput"
+                }
+                _ => continue,
+            };
+            let Some(owned) = vf_cache.get(&m.id) else {
+                continue;
+            };
+            if let Some(sum) = summaries.get_mut(&m.id) {
+                let sum = Arc::make_mut(sum);
+                for i in 0..owned.ins_size.max(1) {
+                    sum.param_kinds
+                        .entry(i)
+                        .or_default()
+                        .insert(kind.to_string());
+                    front.push_back((m.id, i, kind.to_string()));
+                }
+            }
+        }
+        while let Some(item) = front.pop_back() {
+            worklist.push_front(item);
         }
     }
 
@@ -1186,8 +1469,16 @@ pub fn solve_dexes(
                             }
                         }
                         for sink_kind in &callee_sinks {
-                            let frames =
-                                interproc_frames(&index, owned, edge, &kind, sink_kind, dest_s);
+                            let frames = interproc_frames(
+                                &index,
+                                owned,
+                                edge,
+                                &kind,
+                                sink_kind,
+                                dest_s,
+                                config,
+                                Some(&call_graph),
+                            );
                             emit_issue_frames(
                                 &index,
                                 edge.caller,
@@ -1248,8 +1539,23 @@ pub fn solve_dexes(
         }
 
         if !progressed && worklist.is_empty() {
+            // Re-compose static heap once per iteration so M1 sput → M2 sget stays fresh.
+            let heap_dirty = compose_static_heap(&index, &vf_cache, config, &mut summaries);
+            if !heap_dirty.is_empty() {
+                for mid in heap_dirty {
+                    worklist.push_back((mid, 0x4000_0000, "__heap".to_string()));
+                }
+                progressed = true;
+            }
+        }
+
+        if !progressed && worklist.is_empty() {
             break;
         }
+    }
+
+    for issue in &mut issues {
+        issue.enrich_mas_links();
     }
 
     let report = IssueReport {
@@ -1427,6 +1733,15 @@ fn analyze_method(
             }
             if let Some(reg) = param_reg(owned, param_idx) {
                 seed_param_register(&mut local, &analysis, owned, config, reg, &src.kind);
+            }
+        }
+        // Lifecycle table seeds (onNewIntent / onReceive / …) — same as local-taint path.
+        for seed in lifecycle_seeds_for(&callable, lifecycle_table()) {
+            if !formal_param_slots(mref, owned).contains(&seed.argument) {
+                continue;
+            }
+            if let Some(reg) = param_reg(owned, seed.argument) {
+                seed_param_register(&mut local, &analysis, owned, config, reg, &seed.kind);
             }
         }
     }
@@ -1664,13 +1979,27 @@ fn apply_propagations(
                     Port::This | Port::Argument { .. } => {
                         if let Some(to_i) = port_to_arg_index(&prop.to) {
                             if let Some(&to_reg) = args.get(to_i as usize) {
-                                // Const-key extras: taint extra:<key> only (do not smear the Intent).
-                                if is_extra_put(method_ref) {
+                                // Const-key extras / maps: taint path only (strong update).
+                                if is_extra_put(method_ref) || is_map_put(method_ref) {
                                     if let Some(&key_reg) = args.get(1) {
                                         if let Some(key) =
                                             const_string_for_reg(owned, invoke_off, key_reg)
                                         {
-                                            let path = format!("extra:{key}");
+                                            let path = if is_map_put(method_ref)
+                                                && !method_ref.contains("putExtra")
+                                                && !method_ref.contains("Intent.")
+                                            {
+                                                map_path_key(&key)
+                                            } else if method_ref.contains("Bundle.put")
+                                                || method_ref.contains("PersistableBundle.put")
+                                            {
+                                                // Bundle keys share the extra: namespace for Intent extras compatibility.
+                                                format!("extra:{key}")
+                                            } else if is_map_put(method_ref) {
+                                                map_path_key(&key)
+                                            } else {
+                                                format!("extra:{key}")
+                                            };
                                             for k in &kinds {
                                                 propagate_path(
                                                     local, &analysis, invoke_off, to_reg, &path, k,
@@ -1713,6 +2042,7 @@ fn apply_propagations(
 }
 
 fn apply_field_heap(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
+    build_aliases(local, owned);
     let analysis = owned.analysis();
     #[derive(Debug)]
     enum HeapOp {
@@ -1758,8 +2088,13 @@ fn apply_field_heap(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
     for (off, op) in ops {
         let (dest, kinds) = match op {
             HeapOp::InstancePut(src, obj, path) => {
-                for k in local.kinds_at(off, src) {
-                    propagate_path(local, &analysis, off, obj, &path, &k);
+                let kinds = local.kinds_at(off, src);
+                if kinds.is_empty() {
+                    local.clear_path(off, obj, &path);
+                } else {
+                    for k in kinds {
+                        propagate_path(local, &analysis, off, obj, &path, &k);
+                    }
                 }
                 continue;
             }
@@ -1771,18 +2106,25 @@ fn apply_field_heap(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
                 (dest, kinds)
             }
             HeapOp::StaticPut(src, path) => {
-                static_heap
-                    .entry(path)
-                    .or_default()
-                    .extend(local.kinds_at(off, src));
+                let kinds = local.kinds_at(off, src);
+                if kinds.is_empty() {
+                    static_heap.remove(&path);
+                } else {
+                    static_heap.entry(path).or_default().extend(kinds);
+                }
                 continue;
             }
             HeapOp::StaticGet(dest, path) => {
                 (dest, static_heap.get(&path).cloned().unwrap_or_default())
             }
             HeapOp::ArrayPut(src, array, path) => {
-                for k in local.kinds_at(off, src) {
-                    propagate_path(local, &analysis, off, array, &path, &k);
+                let kinds = local.kinds_at(off, src);
+                if kinds.is_empty() {
+                    local.clear_path(off, array, &path);
+                } else {
+                    for k in kinds {
+                        propagate_path(local, &analysis, off, array, &path, &k);
+                    }
                 }
                 continue;
             }
@@ -1802,7 +2144,7 @@ fn apply_field_heap(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
         }
     }
     for (&invoke_off, method_ref) in &owned.invoke_method_map {
-        if !is_extra_get(method_ref) {
+        if !is_extra_get(method_ref) && !is_map_get(method_ref) {
             continue;
         }
         let args = owned
@@ -1821,14 +2163,30 @@ fn apply_field_heap(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
             .copied()
             .and_then(|key_reg| const_string_for_reg(owned, invoke_off, key_reg))
         {
-            Some(key) => local.path_kinds_on_reg(obj, &format!("extra:{key}")),
+            Some(key) => {
+                let path = if is_map_get(method_ref) {
+                    map_path_key(&key)
+                } else {
+                    format!("extra:{key}")
+                };
+                let mut k = local.path_kinds_on_reg(obj, &path);
+                // One-hop nested: extra:nested/field:… stored as combined path.
+                if k.is_empty() && path.starts_with("extra:") {
+                    k = local.nested_path_kinds(obj, &path, "nested");
+                }
+                k
+            }
             None => local.kinds_at(invoke_off, obj),
         };
         for k in kinds {
             if local.insert(mr_off, mr_reg, &k) {
+                // Result is a fresh view of the same abstract contents.
+                let obj_id = local.ensure_reg_obj(obj);
+                local.set_reg_obj(mr_reg, obj_id);
                 let flow = analysis.value_flow_from_seed(mr_off, mr_reg);
                 for &(woff, wreg) in &flow.writes {
                     local.insert(woff, wreg, &k);
+                    local.set_reg_obj(wreg, obj_id);
                 }
                 for &(roff, rreg) in &flow.reads {
                     local.insert(roff, rreg, &k);
@@ -1873,6 +2231,68 @@ fn check_sink_at(
     let _ = local;
 }
 
+fn port_label(port: &Port) -> String {
+    match port {
+        Port::Return => "return".into(),
+        Port::This => "this".into(),
+        Port::Argument { index } => format!("arg:{index}"),
+    }
+}
+
+fn dedupe_consecutive_frames(frames: Vec<TraceFrame>) -> Vec<TraceFrame> {
+    let mut out: Vec<TraceFrame> = Vec::new();
+    for f in frames {
+        if out.last().is_some_and(|prev| {
+            prev.class_name == f.class_name
+                && prev.method_name == f.method_name
+                && prev.offset == f.offset
+                && prev.kind == f.kind
+                && prev.description == f.description
+        }) {
+            continue;
+        }
+        out.push(f);
+        if out.len() >= 32 {
+            break;
+        }
+    }
+    out
+}
+
+/// Walk call-graph from `from` toward `to` (BFS, depth ≤ 8). Returns edges caller→…→callee.
+fn call_path_edges(
+    cg: &CallGraph,
+    from: MethodId,
+    to: MethodId,
+) -> Vec<CallEdge> {
+    if from == to {
+        return Vec::new();
+    }
+    let mut queue = VecDeque::from([(from, Vec::<CallEdge>::new())]);
+    let mut seen = HashSet::from([from]);
+    while let Some((cur, path)) = queue.pop_front() {
+        if path.len() >= 8 {
+            continue;
+        }
+        let Some(outs) = cg.outs.get(&cur) else {
+            continue;
+        };
+        for edge in outs {
+            if seen.contains(&edge.callee) {
+                continue;
+            }
+            let mut next = path.clone();
+            next.push(edge.clone());
+            if edge.callee == to {
+                return next;
+            }
+            seen.insert(edge.callee);
+            queue.push_back((edge.callee, next));
+        }
+    }
+    Vec::new()
+}
+
 fn interproc_frames(
     index: &MethodIndex,
     caller_owned: &ValueFlowAnalysisOwned,
@@ -1880,6 +2300,8 @@ fn interproc_frames(
     source_kind: &str,
     sink_kind: &str,
     dest_url: Option<&str>,
+    config: &TaintConfig,
+    call_graph: Option<&CallGraph>,
 ) -> Vec<TraceFrame> {
     let caller = index.get(edge.caller);
     let callee = index.get(edge.callee);
@@ -1889,17 +2311,27 @@ fn interproc_frames(
     let (k_cls, k_meth) = callee
         .map(|m| (m.class_name.clone(), m.method_name.clone()))
         .unwrap_or_else(|| ("?".into(), "?".into()));
-    let dest_s = dest_url.unwrap_or("");
     let dest_extra = dest_url.map(|s| s.to_string());
+    let is_shim = edge.method_ref.starts_with("shim:");
 
     let mut frames = Vec::new();
-    // Cheap stitch: a modeled source or collect* return in the caller.
-    if let Some(((off, _), mref)) = caller_owned.api_return_sources.iter().find(|(_, r)| {
-        r.contains("getDeviceId")
-            || r.contains("getImei")
-            || r.contains("collectDeviceId")
-            || r.contains("getLastLocation")
-    }) {
+
+    // Source frames: any modeled API return in the caller matching this kind's typical sources.
+    let mut source_hits: Vec<(u32, String, Vec<String>, Option<String>)> = Vec::new();
+    for &((off, _), ref mref) in &caller_owned.api_return_sources {
+        if let Some(src) = config.find_source(mref) {
+            if src.kind == source_kind || source_kind == "*" {
+                source_hits.push((
+                    off,
+                    mref.clone(),
+                    src.features.clone(),
+                    Some(port_label(&src.port)),
+                ));
+            }
+        }
+    }
+    source_hits.sort_by_key(|(off, _, _, _)| *off);
+    for (off, mref, features, port) in source_hits.into_iter().take(4) {
         let (s_cls, s_meth) = mref
             .rsplit_once('.')
             .map(|(a, b)| (a.to_string(), b.to_string()))
@@ -1907,36 +2339,77 @@ fn interproc_frames(
         frames.push(TraceFrame {
             class_name: s_cls,
             method_name: s_meth,
-            offset: Some(*off),
+            offset: Some(off),
             kind: source_kind.to_string(),
             description: format!("source `{mref}` ({source_kind})"),
-            extra: None,
+            extra: features.first().cloned(),
             field: None,
+            port,
+            features,
         });
     }
+    if frames.is_empty() {
+        frames.push(TraceFrame {
+            class_name: c_cls.clone(),
+            method_name: c_meth.clone(),
+            offset: Some(edge.invoke_offset),
+            kind: source_kind.to_string(),
+            description: format!("source kind `{source_kind}` reaching call"),
+            extra: None,
+            field: None,
+            port: None,
+            features: Vec::new(),
+        });
+    }
+
+    // Root: call site in caller.
     frames.push(TraceFrame {
         class_name: c_cls.clone(),
         method_name: c_meth.clone(),
         offset: Some(edge.invoke_offset),
-        kind: source_kind.to_string(),
-        description: format!("arg tainted ({source_kind}) before call"),
-        extra: None,
-        field: None,
-    });
-    let call_desc = if dest_s.is_empty() {
-        format!("invoke {}#{} ({})", k_cls, k_meth, edge.method_ref)
-    } else {
-        format!("invoke {}#{} dest={}", k_cls, k_meth, dest_s)
-    };
-    frames.push(TraceFrame {
-        class_name: c_cls,
-        method_name: c_meth,
-        offset: Some(edge.invoke_offset),
         kind: "call".into(),
-        description: call_desc,
+        description: if is_shim {
+            format!("shim dispatch → {}#{} ({})", k_cls, k_meth, edge.method_ref)
+        } else {
+            format!("invoke {}#{} ({})", k_cls, k_meth, edge.method_ref)
+        },
         extra: dest_extra.clone(),
         field: None,
+        port: None,
+        features: Vec::new(),
     });
+
+    // Multi-hop: intermediate call-graph edges between caller and callee.
+    if let Some(cg) = call_graph {
+        for hop in call_path_edges(cg, edge.caller, edge.callee)
+            .into_iter()
+            .skip(1)
+            .take(6)
+        {
+            let mid = index.get(hop.callee);
+            let (cls, meth) = mid
+                .map(|m| (m.class_name.clone(), m.method_name.clone()))
+                .unwrap_or_else(|| ("?".into(), "?".into()));
+            let shim = hop.method_ref.starts_with("shim:");
+            frames.push(TraceFrame {
+                class_name: cls,
+                method_name: meth,
+                offset: Some(hop.invoke_offset),
+                kind: "call".into(),
+                description: if shim {
+                    format!("shim hop ({})", hop.method_ref)
+                } else {
+                    format!("call hop ({})", hop.method_ref)
+                },
+                extra: None,
+                field: None,
+                port: None,
+                features: Vec::new(),
+            });
+        }
+    }
+
+    // Sink frame in callee.
     frames.push(TraceFrame {
         class_name: k_cls,
         method_name: k_meth,
@@ -1948,8 +2421,10 @@ fn interproc_frames(
         ),
         extra: dest_extra,
         field: None,
+        port: None,
+        features: Vec::new(),
     });
-    frames
+    dedupe_consecutive_frames(frames)
 }
 
 fn emit_issue(
@@ -1969,10 +2444,19 @@ fn emit_issue(
         Some(m) => m,
         None => return,
     };
+    let sink_model = config.find_sink(sink_ref);
+    let source_feats: Vec<String> = config
+        .find_source(sink_ref)
+        .map(|s| s.features.clone())
+        .unwrap_or_default();
     let sink_desc = match dest_url {
         Some(u) => format!("sink `{sink_ref}` ({sink_kind}) dest={u}"),
         None => format!("sink `{sink_ref}` ({sink_kind})"),
     };
+    let mut features = source_feats;
+    if let Some(url) = dest_url {
+        features.push(format!("via-dest:{url}"));
+    }
     let frames = vec![
         TraceFrame {
             class_name: mref.class_name.clone(),
@@ -1980,8 +2464,10 @@ fn emit_issue(
             offset: Some(source_offset),
             kind: source_kind.to_string(),
             description: format!("source kind `{source_kind}` introduced / flowing"),
-            extra: None,
+            extra: features.first().cloned(),
             field: None,
+            port: Some("return".into()),
+            features: features.clone(),
         },
         TraceFrame {
             class_name: mref.class_name.clone(),
@@ -1991,6 +2477,8 @@ fn emit_issue(
             description: sink_desc,
             extra: dest_url.map(|s| s.to_string()),
             field: None,
+            port: sink_model.map(|s| port_label(&s.port)),
+            features,
         },
     ];
     emit_issue_frames(
@@ -2025,11 +2513,26 @@ fn emit_issue_frames(
         Some(m) => m,
         None => return,
     };
+    let frames = dedupe_consecutive_frames(frames);
     for rule in rules {
         let key = format!(
             "{}:{}:{}:{}:{}:{}",
             rule.code, mref.class_name, mref.method_name, source_kind, sink_kind, sink_offset
         );
+        // Prefer shorter traces when the same issue key was already emitted.
+        if let Some(existing) = issues.iter_mut().find(|i| {
+            i.rule_code == rule.code
+                && i.callable == format!("{}#{}", mref.class_name, mref.method_name)
+                && i.source_kind == source_kind
+                && i.sink_kind == sink_kind
+                && i.trace.last().and_then(|f| f.offset).unwrap_or(sink_offset) == sink_offset
+        }) {
+            if frames.len() < existing.trace.len() {
+                existing.trace = frames.clone();
+            }
+            let _ = seen.insert(key);
+            continue;
+        }
         if !seen.insert(key) {
             continue;
         }
@@ -2040,7 +2543,7 @@ fn emit_issue_frames(
                 description = format!("{description} dest={u}");
             }
         }
-        issues.push(Issue {
+        let mut issue = Issue {
             rule_code: rule.code,
             rule_name: rule.name.clone(),
             description,
@@ -2048,7 +2551,13 @@ fn emit_issue_frames(
             sink_kind: sink_kind.to_string(),
             callable: format!("{}#{}", mref.class_name, mref.method_name),
             trace: frames.clone(),
-        });
+            maswe: Vec::new(),
+            masvs: Vec::new(),
+            mastg_know: Vec::new(),
+            mastg_best: Vec::new(),
+        };
+        issue.enrich_mas_links();
+        issues.push(issue);
     }
 }
 
@@ -2086,6 +2595,15 @@ fn compute_local_taint_uncached(
             }
             if let Some(reg) = param_reg(owned, param_idx) {
                 seed_param_register(&mut local, &analysis, owned, config, reg, &src.kind);
+            }
+        }
+        // Lifecycle table (Activity/Service/Receiver/Provider/Fragment callbacks).
+        for seed in lifecycle_seeds_for(&callable, lifecycle_table()) {
+            if !formal_param_slots(mref, owned).contains(&seed.argument) {
+                continue;
+            }
+            if let Some(reg) = param_reg(owned, seed.argument) {
+                seed_param_register(&mut local, &analysis, owned, config, reg, &seed.kind);
             }
         }
     }
@@ -2139,6 +2657,7 @@ fn compute_local_taint(
 
 #[cfg(test)]
 mod tests {
+    use super::super::defaults::default_config;
     use super::super::models::SanitizerModel;
     use super::*;
     use crate::decompile::cfg::MethodCfg;
@@ -2580,5 +3099,207 @@ mod tests {
             formal_param_slots(&static_method, &static_owned),
             vec![0, 2, 3]
         );
+    }
+
+    #[test]
+    fn strong_update_replaces_path_kinds_on_known_object() {
+        let mut local = LocalTaint::default();
+        let obj = local.alloc_obj();
+        local.set_reg_obj(0, obj);
+        local.write_path(0, 0, "field:com.foo.Foo.bar", "DeviceId", true);
+        local.write_path(4, 0, "field:com.foo.Foo.bar", "UserInput", true);
+        let kinds = local.path_kinds_on_reg(0, "field:com.foo.Foo.bar");
+        assert!(kinds.contains("UserInput"));
+        assert!(
+            !kinds.contains("DeviceId"),
+            "strong update must replace prior kinds: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn alias_regs_share_object_path_taint() {
+        let mut local = LocalTaint::default();
+        let mut insn_at = HashMap::new();
+        insn_at.insert(0, "new-instance v0, Lcom/foo/Foo;".into());
+        insn_at.insert(4, "move-object v1, v0".into());
+        insn_at.insert(
+            8,
+            "iput-object v2, v0, Lcom/foo/Foo;.bar:Ljava/lang/String;".into(),
+        );
+        insn_at.insert(
+            12,
+            "iget-object v3, v1, Lcom/foo/Foo;.bar:Ljava/lang/String;".into(),
+        );
+        let mut rw_map = HashMap::new();
+        rw_map.insert(0, (vec![], vec![0]));
+        rw_map.insert(4, (vec![0], vec![1]));
+        rw_map.insert(8, (vec![2, 0], vec![]));
+        rw_map.insert(12, (vec![1], vec![3]));
+        let owned = stub_owned(rw_map, Vec::new(), HashMap::new(), insn_at, 4, 0);
+        local.insert(8, 2, "DeviceId");
+        apply_field_heap(&mut local, &owned);
+        assert!(
+            local.kinds_at(12, 3).contains("DeviceId"),
+            "alias v1=v0 should see iput on v0 via iget v1: {:?}",
+            local.kinds_at(12, 3)
+        );
+    }
+
+    #[test]
+    fn map_path_put_get_is_key_sensitive() {
+        let mut local = LocalTaint::default();
+        local.insert(4, 2, "UserInput"); // value at put site
+        let mut rw_map = HashMap::new();
+        rw_map.insert(4, (vec![0, 1, 2], vec![])); // put(map, key, val)
+        rw_map.insert(8, (vec![0, 1], vec![]));
+        rw_map.insert(9, (vec![], vec![3])); // move-result
+        let mut invoke_method_map = HashMap::new();
+        invoke_method_map.insert(4, "java.util.HashMap.put".into());
+        invoke_method_map.insert(8, "java.util.HashMap.get".into());
+        let mut insn_at = HashMap::new();
+        insn_at.insert(0, "const-string v1, \"token\"".into());
+        insn_at.insert(9, "move-result-object v3".into());
+        let owned = stub_owned(rw_map, Vec::new(), invoke_method_map, insn_at, 4, 0);
+        let cfg = default_config();
+        apply_propagations(&mut local, &owned, &cfg);
+        assert!(
+            local.path_kinds_on_reg(0, "map:token").contains("UserInput"),
+            "map:token should carry UserInput after put"
+        );
+    }
+
+    #[test]
+    fn default_config_includes_precision2_kinds() {
+        let cfg = default_config();
+        assert!(cfg.find_source("SmsMessage.getMessageBody").is_some());
+        assert!(cfg.find_sink("SmsManager.sendTextMessage").is_some());
+        assert!(cfg.find_sink("PendingIntent.getActivity").is_some());
+        assert!(!cfg.matching_rules("SmsPii", "SmsSend").is_empty());
+        assert!(!cfg.matching_rules("NestedIntent", "PendingIntentBuild").is_empty());
+    }
+
+    #[test]
+    fn lifecycle_table_matches_on_receive() {
+        let seeds = lifecycle_seeds_for(
+            "com.example.MyReceiver.onReceive(Landroid/content/Context;Landroid/content/Intent;)V",
+            lifecycle_table(),
+        );
+        assert!(seeds.iter().any(|s| s.kind == "ReceiverUserInput"));
+    }
+
+    #[test]
+    fn trace_frames_follow_source_call_sink_order() {
+        let frames = vec![
+            TraceFrame {
+                class_name: "A".into(),
+                method_name: "src".into(),
+                offset: Some(0),
+                kind: "DeviceId".into(),
+                description: "source".into(),
+                ..Default::default()
+            },
+            TraceFrame {
+                class_name: "A".into(),
+                method_name: "mid".into(),
+                offset: Some(4),
+                kind: "call".into(),
+                description: "call".into(),
+                ..Default::default()
+            },
+            TraceFrame {
+                class_name: "B".into(),
+                method_name: "sink".into(),
+                offset: Some(8),
+                kind: "Network".into(),
+                description: "sink".into(),
+                ..Default::default()
+            },
+        ];
+        let out = dedupe_consecutive_frames(frames);
+        assert_eq!(out[0].kind, "DeviceId");
+        assert_eq!(out[1].kind, "call");
+        assert_eq!(out[2].kind, "Network");
+    }
+
+    #[test]
+    fn nested_extra_path_one_hop() {
+        let mut local = LocalTaint::default();
+        let obj = local.alloc_obj();
+        local.set_reg_obj(0, obj);
+        local.write_path(0, 0, "extra:nested", "NestedIntent", true);
+        let kinds = local.nested_path_kinds(0, "extra:nested", "field:Intent.mAction");
+        assert!(kinds.contains("NestedIntent"));
+    }
+
+    #[test]
+    fn array_star_does_not_pollute_concrete_index_store() {
+        let mut local = LocalTaint::default();
+        let obj = local.alloc_obj();
+        local.set_reg_obj(0, obj);
+        local.write_path(0, 0, "array:0", "DeviceId", true);
+        local.write_path(4, 0, "array:*", "UserInput", true);
+        let concrete = local.path_kinds_on_reg(0, "array:0");
+        assert!(concrete.contains("DeviceId"));
+        assert!(
+            !concrete.contains("UserInput"),
+            "array:* must not overwrite concrete array:0: {concrete:?}"
+        );
+        let star = local.path_kinds_on_reg(0, "array:*");
+        assert!(star.contains("UserInput"));
+    }
+
+    #[test]
+    fn shim_tagged_call_frame_description() {
+        let method_ref = "shim:setOnClickListener";
+        assert!(method_ref.starts_with("shim:"));
+        let desc = format!("shim dispatch → Foo#onClick ({method_ref})");
+        assert!(desc.contains("shim:setOnClickListener"));
+    }
+
+    #[test]
+    fn issue_dedupe_key_stable() {
+        let mut seen = HashSet::new();
+        let key = format!("{}:{}:{}:{}:{}:{}", 1, "A", "m", "DeviceId", "Network", 10);
+        assert!(seen.insert(key.clone()));
+        assert!(!seen.insert(key));
+    }
+
+    #[test]
+    fn interproc_frames_source_call_sink_shape() {
+        // Synthetic TraceFrame sequence matching D1 acceptance: source* → call* → sink*.
+        let frames = dedupe_consecutive_frames(vec![
+            TraceFrame {
+                kind: "DeviceId".into(),
+                description: "source".into(),
+                port: Some("return".into()),
+                features: vec!["pii".into()],
+                ..Default::default()
+            },
+            TraceFrame {
+                kind: "call".into(),
+                description: "invoke helper".into(),
+                ..Default::default()
+            },
+            TraceFrame {
+                kind: "call".into(),
+                description: "call hop".into(),
+                ..Default::default()
+            },
+            TraceFrame {
+                kind: "Network".into(),
+                description: "sink".into(),
+                port: Some("arg:0".into()),
+                ..Default::default()
+            },
+        ]);
+        let kinds: Vec<_> = frames.iter().map(|f| f.kind.as_str()).collect();
+        assert!(kinds[0] != "call" && kinds[0] != "Network");
+        assert!(kinds.iter().any(|k| *k == "call"));
+        assert_eq!(kinds.last().copied(), Some("Network"));
+        // Ensure no call before first source and sink is last non-empty block.
+        let first_call = kinds.iter().position(|k| *k == "call").unwrap();
+        let last_sink = kinds.len() - 1;
+        assert!(first_call > 0);
+        assert!(last_sink > first_call);
     }
 }

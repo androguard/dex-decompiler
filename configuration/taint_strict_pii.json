@@ -1,0 +1,17 @@
+{
+  "sources": [
+    {"patterns": ["SharedPreferences.getString"], "port": "return", "kind": "StorageRead", "features": ["strict-pii"]}
+  ],
+  "sinks": [],
+  "propagations": [],
+  "sanitizers": [],
+  "rules": [
+    {
+      "name": "Strict storage to network (overlay)",
+      "code": 1001,
+      "description": "Example overlay: SharedPreferences → Network",
+      "sources": ["StorageRead"],
+      "sinks": ["Network"]
+    }
+  ]
+}
