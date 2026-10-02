@@ -468,9 +468,25 @@ fn category_maswe(category: &str) -> &'static [&'static str] {
         "webview_file_access" => &["MASWE-0034"],
         "webview_javascript_interface" | "ExecuteJavascript" | "JavascriptInterface" => &["MASWE-0033"],
         "webview_js_bridge_user_url" => &["MASWE-0033", "MASWE-0035"],
+        "webview_js_bridge_file_url" => &["MASWE-0033", "MASWE-0034"],
+        "webview_postmessage" => &["MASWE-0033", "MASWE-0035"],
+        "webview_resource_response_file" => &["MASWE-0034", "MASWE-0050"],
         "webview_unsafe_url" | "LoadUrl" => &["MASWE-0035"],
         "webview_url_override" => &["MASWE-0035"],
         "webview_weak_host_check" => &["MASWE-0035"],
+        "activity_result_contracts" => &["MASWE-0032"],
+        "activity_result_grant_smuggle" => &["MASWE-0032"],
+        "aidl_stub_as_interface" => &["MASWE-0032", "MASWE-0018"],
+        "binder_intent_control" => &["MASWE-0032"],
+        "deeplink_webview_path_traversal" => &["MASWE-0029", "MASWE-0033", "MASWE-0050"],
+        "dynamic_register_receiver" => &["MASWE-0032"],
+        "intent_url_network_fetch" => &["MASWE-0029", "MASWE-0026"],
+        "jni_taint_import_bridge" => &["MASWE-0049"],
+        "logcat_external_storage" => &["MASWE-0005", "MASWE-0002"],
+        "rce_package_context" => &["MASWE-0049"],
+        "slice_provider_api" => &["MASWE-0018"],
+        "uri_permission_grant_flow" | "uri_permission_result_forward"
+        | "uri_permission_setresult_passthrough" => &["MASWE-0032"],
         "world_readable_storage" => &["MASWE-0001", "MASWE-0002"],
         "zip_slip" => &["MASWE-0050"],
         "LaunchingComponent" | "StartActivity" | "StartService" | "SendBroadcast" => &["MASWE-0032"],
@@ -489,10 +505,11 @@ fn maswe_hints() -> &'static [Hint] {
         };
         [
             mk(r"(?i)backup|allowbackup|fullbackup|dataextraction|backup.?rules", &["MASWE-0006"]),
-            mk(r"(?i)logcat|logging_pii|insecure_logging|android\\.util\\.log|sensitive.?data.?in.?log", &["MASWE-0005"]),
+            mk(r"(?i)logcat|logging_pii|insecure_logging|android\\.util\\.log|\blogging\b|sensitive.?data.?in.?log|Log\.[devwi]", &["MASWE-0005"]),
             mk(r"(?i)hardcoded.?secret|hardcoded.?crypto|secretkeyspec|hardcoded.?aes|hardcoded.?key", &["MASWE-0004", "MASWE-0003"]),
-            mk(r"(?i)shared.?storage|external.?storage|mediastore|getexternal|scoped.?storage", &["MASWE-0002"]),
-            mk(r"(?i)shared.?prefer|datastore|sqlite|sqlcipher|internal.?storage|openfileoutput|sandbox", &["MASWE-0001"]),
+            // Prefer API/path tokens over bare "MediaStore" so method names like mastgTestMediaStore do not match.
+            mk(r"(?i)shared.?storage|external.?storage|MediaStore\.|getExternal(?:Files|Storage|Cache)|scoped.?storage", &["MASWE-0002"]),
+            mk(r"(?i)shared.?prefer|datastore|sqlite|sqlcipher|internal.?storage|openfileoutput|app.?sandbox|sandbox.?storage", &["MASWE-0001"]),
             mk(r"(?i)broken.?encrypt|encryption.?mode|encryption.?algorithm|weak_crypto|insufficient.?key|cipher\\.getinstance|ecb", &["MASWE-0007"]),
             mk(r"(?i)hmac|mac.?valid", &["MASWE-0009"]),
             mk(r"(?i)non.?random|random.?apis|math\\.random|java\\.util\\.random|securerandom|insufficient.?entropy", &["MASWE-0012"]),
@@ -502,27 +519,29 @@ fn maswe_hints() -> &'static [Hint] {
             mk(r"(?i)biometric.?device.?credential|device.?credential.?fallback", &["MASWE-0021"]),
             mk(r"(?i)biometric.?invalidat|invalidatedbybiometric", &["MASWE-0022"]),
             mk(r"(?i)biometric|passcode|local.?auth|event.?bound|no.?confirmation|validity.?duration", &["MASWE-0020", "MASWE-0016"]),
-            mk(r"(?i)ssl.?trust|trust.?all|checkservertrusted|hostname.?verif|onreceivedsslerror|trust.?anchor|pinning|network.?security|cleartext", &["MASWE-0027", "MASWE-0028"]),
+            mk(r"(?i)ssl.?trust|trust.?all|checkservertrusted|hostname.?verif|onreceivedsslerror|trust.?anchor|cert(?:ificate)?.?pinning|ssl.?pinning|pinning.?bypass|network.?security|cleartext", &["MASWE-0027", "MASWE-0028"]),
             mk(r"(?i)deeplink|deep.?link|autoverify|custom.?scheme|intent.?filter", &["MASWE-0029"]),
             mk(r"(?i)pending.?intent", &["MASWE-0032"]),
-            mk(r"(?i)implicit.?intent|intent.?leak|intent.?redirect|intent.?spoof|icc_|ipc_intent|broadcast", &["MASWE-0032"]),
+            mk(r"(?i)implicit.?intent|intent.?leak|intent.?redirect|intent.?spoof|icc_|ipc_intent|broadcast.?receiver|sendbroadcast|sticky.?broadcast|ordered.?broadcast|sensitive.?broadcast|credential.?broadcast", &["MASWE-0032"]),
             mk(r"(?i)content.?provider|provider.?exported|fileprovider|sql.?inject", &["MASWE-0018", "MASWE-0050"]),
             mk(r"(?i)javascript.?interface|js.?bridge|addjavascriptinterface|webview.?bridges", &["MASWE-0033"]),
-            mk(r"(?i)webview.?file|file.?access|allowfileaccess|content.?access|webview.?settings", &["MASWE-0034"]),
-            mk(r"(?i)webview|loadurl|safebrowsing|webviewclient", &["MASWE-0035", "MASWE-0034"]),
+            mk(r"(?i)webview.?file|allowfileaccess|setAllowFileAccess|allowcontentaccess|setAllowContentAccess|WebResourceResponse|shouldInterceptRequest", &["MASWE-0034"]),
+            // Inventory WebViewClient / loadUrl → loading-untrusted-content weakness only (not local-file MASWE-0034).
+            mk(r"(?i)webviewclient|shouldOverrideUrlLoading|setWebViewClient|\bloadUrl\b|safebrowsing", &["MASWE-0035"]),
+            mk(r"(?i)\bWebView\b", &["MASWE-0035"]),
             mk(r"(?i)keyboard.?cache|input.?type|textpassword|textnonsuggestion|input.?field", &["MASWE-0036"]),
-            mk(r"(?i)notification", &["MASWE-0037"]),
+            mk(r"(?i)NotificationManager|NotificationCompat|notification_sensitive|sensitive.?data.?in.?notification|post.?notification|android\.permission\.POST_NOTIFICATIONS", &["MASWE-0037"]),
             mk(r"(?i)flag.?secure|screenshot|setsecure|recents.?screenshot", &["MASWE-0038"]),
-            mk(r"(?i)overlay|system.?alert.?window|hideoverlay|filtertouches", &["MASWE-0039"]),
+            mk(r"(?i)overlay.?attack|system.?alert.?window|hideoverlay|filtertouches|tapjack|draw.?over", &["MASWE-0039"]),
             mk(r"(?i)minsdk|sdk.?version|target.?sdk", &["MASWE-0041", "MASWE-0042"]),
             mk(r"(?i)debuggable|strictmode", &["MASWE-0061", "MASWE-0063"]),
             mk(r"(?i)debugger|tracerpid|ptrace|anti.?debug", &["MASWE-0064"]),
             mk(r"(?i)root.?detect|su.?binary|test.?keys", &["MASWE-0051"]),
             mk(r"(?i)emulator|virtual.?device", &["MASWE-0053"]),
             mk(r"(?i)deserial|object.?input|serializable", &["MASWE-0050"]),
-            mk(r"(?i)rce_dynamic|dexclassloader|pathclassloader|dynamic.?code|reflection_rce", &["MASWE-0049"]),
+            mk(r"(?i)rce_dynamic|dexclassloader|pathclassloader|dynamic.?code|reflection_rce|\\bRuntime\\.exec\\b", &["MASWE-0049"]),
             mk(r"(?i)path.?traversal|zip.?slip|uri.?permission|uri.?grant", &["MASWE-0050", "MASWE-0018"]),
-            mk(r"(?i)permission|dangerous.?android.?permissions", &["MASWE-0066"]),
+            mk(r"(?i)dangerous.?permission|uses.?permission|runtime.?permission|app.?permission|permission.?protect|detect-dangerous-android-permissions", &["MASWE-0066"]),
         ]
         .into_iter()
         .flatten()
@@ -542,20 +561,20 @@ fn know_hints() -> &'static [Hint] {
             mk(r"(?i)debugger|tracerpid|ptrace|anti.?debug", &["MASTG-KNOW-0008", "MASTG-KNOW-0028"]),
             mk(r"(?i)strictmode", &["MASTG-KNOW-0009"]),
             mk(r"(?i)key.?gen|keygen|asymmetric.?key|key.?length|keystore|keychain|crypto.?key|hardcoded.?crypto", &["MASTG-KNOW-0012", "MASTG-KNOW-0043", "MASTG-KNOW-0047"]),
-            mk(r"(?i)random|entropy|securerandom", &["MASTG-KNOW-0013"]),
+            mk(r"(?i)non.?random|random.?apis|math\\.random|java\\.util\\.random|securerandom|insufficient.?entropy", &["MASTG-KNOW-0013"]),
             mk(r"(?i)network.?security|cleartext|trust.?anchor|insecure.?trust", &["MASTG-KNOW-0014"]),
-            mk(r"(?i)hostname.?verif|ssl.?error|checkservertrusted|certificate.?pin|ssl.?socket|pinning", &["MASTG-KNOW-0015", "MASTG-KNOW-0014"]),
-            mk(r"(?i)permission", &["MASTG-KNOW-0017"]),
-            mk(r"(?i)webview|javascript.?interface|file.?access|safebrowsing|cookie|custom.?tabs", &["MASTG-KNOW-0018"]),
+            mk(r"(?i)hostname.?verif|ssl.?error|checkservertrusted|certificate.?pin|ssl.?socket|cert(?:ificate)?.?pinning|ssl.?pinning|pinning.?bypass", &["MASTG-KNOW-0015", "MASTG-KNOW-0014"]),
+            mk(r"(?i)dangerous.?permission|uses.?permission|runtime.?permission|app.?permission|permission.?protect|detect-dangerous-android-permissions", &["MASTG-KNOW-0017"]),
+            mk(r"(?i)webview|javascript.?interface|allowfileaccess|setAllowFileAccess|safebrowsing|cookiemanager|http.?cookie|session.?cookie|webview.?cookie|custom.?tabs", &["MASTG-KNOW-0018"]),
             mk(r"(?i)deeplink|deep.?link|autoverify|custom.?scheme|intent.?filter", &["MASTG-KNOW-0019"]),
             mk(r"(?i)content.?provider|provider.?exported|fileprovider", &["MASTG-KNOW-0117", "MASTG-KNOW-0020"]),
             mk(r"(?i)serializ|object.?input|parcelable", &["MASTG-KNOW-0021"]),
-            mk(r"(?i)overlay|system.?alert.?window|draw.?over|tapjack", &["MASTG-KNOW-0022"]),
+            mk(r"(?i)overlay.?attack|system.?alert.?window|draw.?over|tapjack|hideoverlay|filtertouches", &["MASTG-KNOW-0022"]),
             mk(r"(?i)sdk.?version|target.?sdk|min.?sdk|enforced.?updat", &["MASTG-KNOW-0023"]),
             mk(r"(?i)pending.?intent", &["MASTG-KNOW-0024"]),
             mk(r"(?i)implicit.?intent|intent.?leak|intent.?spoof|intent.?inject", &["MASTG-KNOW-0025", "MASTG-KNOW-0020"]),
-            mk(r"(?i)broadcast|receiver|sticky.?broadcast|ordered.?broadcast", &["MASTG-KNOW-0134", "MASTG-KNOW-0020"]),
-            mk(r"(?i)ipc|exported.?activit|exported.?service|component.?exposure|uri.?grant", &["MASTG-KNOW-0020", "MASTG-KNOW-0132"]),
+            mk(r"(?i)broadcast.?receiver|BroadcastReceiver|registerreceiver|sendbroadcast|sticky.?broadcast|ordered.?broadcast", &["MASTG-KNOW-0134", "MASTG-KNOW-0020"]),
+            mk(r"(?i)\bipc\b|ipc_|exported.?activit|exported.?service|component.?exposure|uri.?grant", &["MASTG-KNOW-0020", "MASTG-KNOW-0132"]),
             mk(r"(?i)root.?detect|jailbreak", &["MASTG-KNOW-0027"]),
             mk(r"(?i)emulator|virtual.?device", &["MASTG-KNOW-0031", "MASTG-KNOW-0135"]),
             mk(r"(?i)obfuscat", &["MASTG-KNOW-0033"]),
@@ -564,21 +583,21 @@ fn know_hints() -> &'static [Hint] {
             mk(r"(?i)sql.?inject|sqlite|room.?sql", &["MASTG-KNOW-0037"]),
             mk(r"(?i)sqlcipher", &["MASTG-KNOW-0038"]),
             mk(r"(?i)firebase", &["MASTG-KNOW-0039"]),
-            mk(r"(?i)realm", &["MASTG-KNOW-0040"]),
-            mk(r"(?i)external.?storage|shared.?storage|mediastore|getexternal|world.?readable|world.?writable", &["MASTG-KNOW-0042"]),
+            mk(r"(?i)io\\.realm|\brealm\\.|realm.?database|RealmConfiguration", &["MASTG-KNOW-0040"]),
+            mk(r"(?i)external.?storage|shared.?storage|MediaStore\.|getExternal(?:Files|Storage|Cache)|world.?readable|world.?writable", &["MASTG-KNOW-0042"]),
             mk(r"(?i)internal.?storage|getfilesdir|openfileoutput", &["MASTG-KNOW-0041"]),
             mk(r"(?i)logcat|insecure.?logging|android\.util\.log|\blogging\b", &["MASTG-KNOW-0049"]),
             mk(r"(?i)backup|allowbackup|fullbackup|dataextraction", &["MASTG-KNOW-0050"]),
             mk(r"(?i)screenshot|flag_secure|secure.?flag", &["MASTG-KNOW-0053"]),
-            mk(r"(?i)notification", &["MASTG-KNOW-0054"]),
+            mk(r"(?i)NotificationManager|NotificationCompat|notification_sensitive|sensitive.?data.?in.?notification|post.?notification|android\.permission\.POST_NOTIFICATIONS", &["MASTG-KNOW-0054"]),
             mk(r"(?i)keyboard.?cache|input.?type|textpassword|textnonsuggestion", &["MASTG-KNOW-0055"]),
             mk(r"(?i)input.?field|edittext|autofill", &["MASTG-KNOW-0052"]),
             mk(r"(?i)zip.?slip|path.?traversal|zipentry", &["MASTG-KNOW-0042", "MASTG-KNOW-0041"]),
-            mk(r"(?i)encryption|cipher|aes|des|rc4|broken.?encrypt|weak.?crypto", &["MASTG-KNOW-0012", "MASTG-KNOW-0011"]),
+            mk(r"(?i)encryption|cipher|\baes\b|\bdes\b|\brc4\b|broken.?encrypt|weak.?crypto", &["MASTG-KNOW-0012", "MASTG-KNOW-0011"]),
             mk(r"(?i)tracker|analytics|third.?party.?service", &["MASTG-KNOW-0026"]),
-            mk(r"(?i)rce|dexclassloader|runtime\.exec|reflection.?rce|dynamic.?load", &["MASTG-KNOW-0005", "MASTG-KNOW-0004"]),
+            mk(r"(?i)rce_dynamic|dexclassloader|pathclassloader|runtime\.exec|reflection_rce|dynamic.?load|dynamic.?code", &["MASTG-KNOW-0005", "MASTG-KNOW-0004"]),
             mk(r"(?i)nsc|cleartext.?traffic", &["MASTG-KNOW-0014"]),
-            mk(r"(?i)jni|native.?lib|\belf\b", &["MASTG-KNOW-0005", "MASTG-KNOW-0006"]),
+            mk(r"(?i)\bjni\b|native.?lib|\belf\b", &["MASTG-KNOW-0005", "MASTG-KNOW-0006"]),
         ]
         .into_iter()
         .flatten()
@@ -640,6 +659,47 @@ fn push_unique(out: &mut Vec<String>, id: &str) {
     }
 }
 
+/// Strip class/method locations and sink site noise so free-text MAS hints do not
+/// fire on identifiers like `mastgTestMediaStore` / `Foo#onReceiveBroadcast`.
+fn strip_location_noise(s: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(
+            r"(?x)
+            `[^`]*\#[^`]*`                                   # `Class#method`
+            | \b(?:[a-z_][\w$]*\.)+[A-Za-z_][\w$]*\#[\w$<>]+ # fqcn#method
+            | \b[A-Z][\w$]*\#[\w$<>]+                        # Simple#method
+            | \bSink:\s*`[^`]+`(?:\s+in\s+`[^`]+`)?
+            | \s@\s*0x[0-9a-fA-F]+
+            ",
+        )
+        .expect("location noise regex")
+    });
+    re.replace_all(s, " ").into_owned()
+}
+
+/// Corpus used for heuristic MASWE/KNOW hints (locations removed).
+fn hint_blob(
+    category: &str,
+    title: &str,
+    message: &str,
+    problem: &str,
+    recommendation: &str,
+    cwe: &str,
+    rule_id: &str,
+) -> String {
+    [
+        category,
+        title,
+        strip_location_noise(message).as_str(),
+        strip_location_noise(problem).as_str(),
+        recommendation,
+        cwe,
+        rule_id,
+    ]
+    .join(" ")
+}
+
 /// Resolve MASWE / MASVS / MASTG links for a detector or Semgrep finding.
 pub fn enrich_mas(
     category: &str,
@@ -650,25 +710,32 @@ pub fn enrich_mas(
     cwe: Option<&str>,
     rule_id: Option<&str>,
 ) -> MasEnrichment {
-    let blob = [
+    let cwe_s = cwe.unwrap_or("");
+    let rule_s = rule_id.unwrap_or("");
+    let blob = [category, title, message, problem, recommendation, cwe_s, rule_s].join(" ");
+    let hints_blob = hint_blob(
         category,
         title,
         message,
         problem,
         recommendation,
-        cwe.unwrap_or(""),
-        rule_id.unwrap_or(""),
-    ]
-    .join(" ");
+        cwe_s,
+        rule_s,
+    );
 
     let mut maswe_ids: Vec<String> = Vec::new();
-    for id in category_maswe(category) {
+    let from_category = category_maswe(category);
+    for id in from_category {
         push_unique(&mut maswe_ids, id);
     }
-    for (re, ids) in maswe_hints().iter() {
-        if re.is_match(&blob) {
-            for id in *ids {
-                push_unique(&mut maswe_ids, id);
+    // Heuristic text hints only when the category has no catalog mapping.
+    // Locations are stripped so class/method names cannot pollute the match.
+    if from_category.is_empty() {
+        for (re, ids) in maswe_hints().iter() {
+            if re.is_match(&hints_blob) {
+                for id in *ids {
+                    push_unique(&mut maswe_ids, id);
+                }
             }
         }
     }
@@ -691,10 +758,12 @@ pub fn enrich_mas(
             push_unique(&mut know_ids, k);
         }
     }
-    for (re, ids) in know_hints().iter() {
-        if re.is_match(&blob) {
-            for id in *ids {
-                push_unique(&mut know_ids, id);
+    if from_category.is_empty() {
+        for (re, ids) in know_hints().iter() {
+            if re.is_match(&hints_blob) {
+                for id in *ids {
+                    push_unique(&mut know_ids, id);
+                }
             }
         }
     }
@@ -751,5 +820,137 @@ mod tests {
         );
         assert!(e.maswe.iter().any(|l| l.id == "MASWE-0005"));
         assert!(e.masvs.iter().any(|l| l.id == "MASVS-STORAGE-2"));
+        assert_eq!(e.maswe.len(), 1, "expected only MASWE-0005, got {:?}", e.maswe);
+    }
+
+    #[test]
+    fn logging_ignores_mediastore_method_name_hint() {
+        // MASTG-DEMO-0001: logging_pii in mastgTestMediaStore — "MediaStore" must not
+        // pull MASWE-0002 / KNOW-0042 via free-text hints.
+        let e = enrich_mas(
+            "logging_pii",
+            "PII / credentials logged",
+            "Passwords, emails, tokens, or other PII markers reach Log.* Sink: `Log.e` in `org.owasp.mastestapp.MastgTest#mastgTestMediaStore`.",
+            "org.owasp.mastestapp.MastgTest#mastgTestMediaStore @ 0x146",
+            "Strip or redact PII/secrets before Log.*",
+            Some("CWE-532"),
+            None,
+        );
+        assert_eq!(
+            e.maswe.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+            vec!["MASWE-0005"],
+            "{:?}",
+            e.maswe
+        );
+        assert!(
+            e.masvs.iter().all(|l| l.id == "MASVS-STORAGE-2"),
+            "{:?}",
+            e.masvs
+        );
+        assert!(
+            e.mastg_know.iter().any(|l| l.id == "MASTG-KNOW-0049"),
+            "{:?}",
+            e.mastg_know
+        );
+        assert!(
+            !e.mastg_know.iter().any(|l| l.id == "MASTG-KNOW-0042"),
+            "MediaStore method name must not add External Storage KNOW: {:?}",
+            e.mastg_know
+        );
+        assert!(
+            !e.maswe.iter().any(|l| l.id == "MASWE-0002"),
+            "{:?}",
+            e.maswe
+        );
+    }
+
+    #[test]
+    fn semgrep_logging_ignores_method_location_media_store() {
+        // Unmapped Semgrep rule id → hints run, but Class#mastgTestMediaStore must not
+        // add MASWE-0002 / KNOW-0042.
+        let e = enrich_mas(
+            "semgrep:mastg-android-logging-apis",
+            "Semgrep: mastg-android-logging-apis",
+            "References to logging APIs. Sink: `Log.e` in `org.owasp.mastestapp.MastgTest#mastgTestMediaStore`.",
+            "org.owasp.mastestapp.MastgTest#mastgTestMediaStore @ 0x146",
+            "",
+            None,
+            Some("mastg-android-logging-apis"),
+        );
+        assert!(
+            e.maswe.iter().any(|l| l.id == "MASWE-0005"),
+            "{:?}",
+            e.maswe
+        );
+        assert!(
+            !e.maswe.iter().any(|l| l.id == "MASWE-0002"),
+            "{:?}",
+            e.maswe
+        );
+        assert!(
+            !e.mastg_know.iter().any(|l| l.id == "MASTG-KNOW-0042"),
+            "{:?}",
+            e.mastg_know
+        );
+    }
+
+    #[test]
+    fn webviewclient_inventory_does_not_attach_file_access_or_rce_know() {
+        // INFO inventory rule: setWebViewClient — MASWE-0035 ok; not 0034 (local files),
+        // and "intercept" must not match bare "rce" → KNOW-0004/0005.
+        let e = enrich_mas(
+            "semgrep:mastg-android-webviewclient-url-handlers",
+            "Semgrep: mastg-android-webviewclient-url-handlers",
+            "[MASVS-CODE-4] Detected WebViewClient URL interception method.",
+            "pattern match: mastg-android-webviewclient-url-handlers",
+            "",
+            None,
+            Some("mastg-android-webviewclient-url-handlers"),
+        );
+        assert!(
+            e.maswe.iter().any(|l| l.id == "MASWE-0035"),
+            "{:?}",
+            e.maswe
+        );
+        assert!(
+            !e.maswe.iter().any(|l| l.id == "MASWE-0034"),
+            "setWebViewClient inventory must not attach local-file MASWE-0034: {:?}",
+            e.maswe
+        );
+        assert!(
+            !e.mastg_know
+                .iter()
+                .any(|l| l.id == "MASTG-KNOW-0004" || l.id == "MASTG-KNOW-0005"),
+            "\"intercept\" must not map to RCE KNOW: {:?}",
+            e.mastg_know
+        );
+        assert!(
+            e.mastg_know.iter().any(|l| l.id == "MASTG-KNOW-0018"),
+            "{:?}",
+            e.mastg_know
+        );
+    }
+
+    #[test]
+    fn newly_mapped_uri_grant_flow_skips_webview_name_pollution() {
+        let e = enrich_mas(
+            "uri_permission_grant_flow",
+            "Intent data reaches URI grant / setResult API",
+            "Untrusted Intent data flows into setResult. in Foo#testWebViewLogin",
+            "com.example.Foo#testWebViewLogin",
+            "",
+            None,
+            None,
+        );
+        assert!(
+            e.maswe.iter().all(|l| l.id == "MASWE-0032"),
+            "expected only MASWE-0032, got {:?}",
+            e.maswe
+        );
+        assert!(
+            !e.maswe.iter().any(|l| l.id == "MASWE-0035" || l.id == "MASWE-0034"),
+            "{:?}",
+            e.maswe
+        );
     }
 }

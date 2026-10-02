@@ -234,7 +234,9 @@ pub fn looks_like_finally(handler_java: &str) -> bool {
         t.contains(" e.") || t.contains("(e)") || t.contains(" e)") || t.contains("= e;");
 
     // Cleanup-only patterns even without rethrow, when exception local unused.
+    // `CloseableKt.closeFinally` is Kotlin's `use {}` / try-with-resources epilogue.
     let cleanup = t.contains(".close(")
+        || t.contains("closefinally")
         || t.contains(".recycle(")
         || t.contains(".unlock(")
         || t.contains(".disconnect(")
@@ -493,6 +495,12 @@ mod tests {
         assert!(looks_like_finally("    lock.unlock();\n"));
         assert!(looks_like_finally(
             "    cursor.close();\n    db.endTransaction();\n"
+        ));
+        assert!(looks_like_finally(
+            "    kotlin.io.CloseableKt.closeFinally(local0, 0);\n"
+        ));
+        assert!(looks_like_finally(
+            "    kotlin.io.CloseableKt.closeFinally(r, th);\n    throw th;\n"
         ));
     }
 

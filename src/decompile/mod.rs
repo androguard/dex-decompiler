@@ -2666,24 +2666,54 @@ impl<'a> Decompiler<'a> {
 
             if let Some(hstart) = first_handler_start_byte(handler, &handler_ranges) {
                 if hstart > try_end_byte {
+                    // Code between try-end and the first handler (Kotlin `use` /
+                    // closeFinally holes, success-path Log.*, …). Must emit the full
+                    // CFG region — a single-block walk drops later blocks (e.g. Log.d
+                    // after CloseableKt.closeFinally in MASTG-DEMO-0001).
                     if let Some(gap_entry) = cfg.block_id_at_offset(try_end_byte) {
-                        let _ = self.emit_block_instructions(
-                            cfg,
-                            instructions,
-                            code.insns_off,
-                            gap_entry,
-                            None,
-                            None,
-                            encoded,
-                            code,
-                            &mut try_body,
-                            2,
-                            &mut declared,
-                            Some(global_used_regs),
-                            false,
-                            Some((try_end_byte, hstart)),
-                            class_name,
-                        )?;
+                        let gap_blocks = blocks_overlapping(try_end_byte, hstart);
+                        let mut gap_emitted = false;
+                        if let Some(gap_region) =
+                            build_regions_filtered(cfg, gap_entry, &gap_blocks)
+                        {
+                            let before = try_body.len();
+                            self.emit_region(
+                                &gap_region,
+                                cfg,
+                                instructions,
+                                code.insns_off,
+                                encoded,
+                                code,
+                                &mut try_body,
+                                2,
+                                None,
+                                None,
+                                &mut declared,
+                                Some(global_used_regs),
+                                Some((try_end_byte, hstart)),
+                                class_name,
+                            )?;
+                            gap_emitted = try_body.len() > before;
+                        }
+                        if !gap_emitted {
+                            let _ = self.emit_block_instructions(
+                                cfg,
+                                instructions,
+                                code.insns_off,
+                                gap_entry,
+                                None,
+                                None,
+                                encoded,
+                                code,
+                                &mut try_body,
+                                2,
+                                &mut declared,
+                                Some(global_used_regs),
+                                false,
+                                Some((try_end_byte, hstart)),
+                                class_name,
+                            )?;
+                        }
                     }
                 }
             }
