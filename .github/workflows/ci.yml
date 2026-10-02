@@ -29,19 +29,19 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check
-        run: cargo check --locked --all-targets
+        run: cargo check --all-targets
 
       - name: Unit + integration tests
-        run: cargo test --locked --all-targets --verbose
+        run: cargo test --all-targets --verbose
 
       - name: Decompiler fidelity suite
         # Explicit gate for fixture / source-fidelity / type-fidelity regressions.
         # type_fidelity uses testdata/classes4.dex when the sibling AndroguardTest APK
         # is not present (standalone CI clone).
-        run: cargo test --locked --test decompiler_tests --verbose
+        run: cargo test --test decompiler_tests --verbose
 
       - name: Release binary builds
-        run: cargo build --locked --release --bin dex-decompile
+        run: cargo build --release --bin dex-decompile
 
   clippy:
     name: clippy
@@ -55,4 +55,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Warn-only: pre-existing dead_code noise must not block correctness CI.
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -W clippy::all
+        run: cargo clippy --all-targets -- -W clippy::all

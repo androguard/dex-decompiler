@@ -205,15 +205,13 @@ let java = Decompiler::with_options(
 GitHub Actions (`.github/workflows/ci.yml`) runs on every push and PR:
 
 ```bash
-cargo check --locked --all-targets
-cargo test --locked --all-targets
-cargo test --locked --test decompiler_tests   # fixture + source/type fidelity
-cargo build --locked --release --bin dex-decompile
+cargo check --all-targets
+cargo test --all-targets
+cargo test --test decompiler_tests   # fixture + source/type fidelity
+cargo build --release --bin dex-decompile
 ```
 
 `type_fidelity` prefers a local AndroguardTest APK when present, otherwise uses in-repo `testdata/classes4.dex` so CI does not need a sibling androguard checkout. Override with `ANDROGUARD_TEST_APK=/path/to/app-debug.apk`.
-
-`--locked` requires a committed `Cargo.lock` at the repo root (CI will fail if it is missing or stale).
 
 ## Benchmark vs Droid ASC
 
