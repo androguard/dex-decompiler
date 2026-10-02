@@ -306,14 +306,31 @@ mod count_tests {
 
     #[test]
     fn parse_rule_bundles() {
-        for (label, path) in [
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for (label, rel) in [
             ("all.yml", "rules/semgrep/android/all.yml"),
             ("general.yml", "rules/semgrep/android/general.yml"),
+        ] {
+            let path = root.join(rel);
+            let t = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{label} ({}): {e}", path.display()));
+            let rules = load_rules_from_str(&t).unwrap_or_else(|e| panic!("{label}: {e}"));
+            println!("{label}: OK {} rules", rules.len());
+            assert!(!rules.is_empty(), "{label} empty");
+        }
+        // Optional sibling droid2web copies (local monorepo only — not on CI).
+        for (label, rel) in [
             ("web-mastg", "../droid2web/web/rules/semgrep-mastg.yml"),
             ("web-all", "../droid2web/web/rules/semgrep-all.yml"),
             ("web-mobhunt", "../droid2web/web/rules/semgrep-mobhunt.yml"),
         ] {
-            let t = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let path = root.join(rel);
+            if !path.is_file() {
+                println!("{label}: skipped (no {})", path.display());
+                continue;
+            }
+            let t = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{label} ({}): {e}", path.display()));
             let rules = load_rules_from_str(&t).unwrap_or_else(|e| panic!("{label}: {e}"));
             println!("{label}: OK {} rules", rules.len());
             assert!(!rules.is_empty(), "{label} empty");
@@ -325,7 +342,7 @@ mod count_tests {
             "expected full MobHunt+MASTG set, got {}",
             embedded.len()
         );
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules/semgrep/android/mastg");
+        let dir = root.join("rules/semgrep/android/mastg");
         let rules = load_rules_from_dir(&dir).unwrap();
         println!("mastg dir: OK {} rules", rules.len());
         assert!(rules.len() >= 60, "mastg dir too small: {}", rules.len());
