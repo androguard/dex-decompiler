@@ -22,3 +22,7 @@ target
 
 # ASC compare benchmark cache (cloned repo + venv)
 scripts/.cache/
+
+# Local Cargo config (often path-patches sibling dex-parser). Must stay out of
+# the repo — a path patch rewrites Cargo.lock and breaks CI `--locked`.
+.cargo/
