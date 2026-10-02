@@ -970,6 +970,69 @@ pub(crate) fn fold_running_arithmetic(body: &str) -> String {
     rebuild_skip_repl(&lines, &skip, &repl, body.ends_with('\n'))
 }
 
+
+
+/// `j_0 = (j_0 + 1) / i; i = j_0; j_0 = j_0;` → `i = j++ / i;`
+pub(crate) fn repair_self_ref_postinc_div(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut skip = HashSet::new();
+    let mut repl: HashMap<usize, String> = HashMap::new();
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        let Some((t0, rhs0)) = parse_simple_assign_line(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        let compact = rhs0.replace(' ', "");
+        let Some((numer, divisor)) = compact.split_once('/') else {
+            i += 1;
+            continue;
+        };
+        let numer = numer.trim_start_matches('(').trim_end_matches(')');
+        let Some(base) = numer.strip_suffix("+1") else {
+            i += 1;
+            continue;
+        };
+        if base != t0.as_str() {
+            i += 1;
+            continue;
+        }
+        let divisor = divisor.trim();
+        if !is_java_ident(divisor) {
+            i += 1;
+            continue;
+        }
+        let Some((t1, rhs1)) = parse_simple_assign_line(lines[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        if rhs1 != t0 {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 2;
+        if i + 2 < lines.len() {
+            if let Some((t2, rhs2)) = parse_simple_assign_line(lines[i + 2]) {
+                if t2 == t0 && rhs2 == t0 {
+                    end = i + 3;
+                }
+            }
+        }
+        let base_name = t0.split('_').next().unwrap_or(t0.as_str());
+        let indent = leading_indent(lines[i]);
+        repl.insert(i, format!("{indent}{t1} = {base_name}++ / {divisor};"));
+        skip.insert(i + 1);
+        if end > i + 2 {
+            skip.insert(i + 2);
+        }
+        i = end;
+    }
+    if repl.is_empty() {
+        return body.to_string();
+    }
+    rebuild_skip_repl(&lines, &skip, &repl, body.ends_with('\n'))
+}
+
 /// `int t = j + 1; j = j / i; i = j; j = t;` → `i = j++ / i;`.
 pub(crate) fn fold_postinc_division(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
@@ -1055,6 +1118,7 @@ pub(crate) fn wrap_postinc_div_try(
     // that only joins the delayed `j++` store (`foo4`) must not add one.
     // `foo2` still gets `continue` because the statement is not last, or the
     // loop is `while (true)`.
+    // Wrap runs after `fold_const_break_into_while`, so foobis already has `&&`.
     let explicit_continue = catch_continues && enclosing_while_has_and(&lines, idx);
     if explicit_continue || !next.starts_with('}') || body.contains("while (true)") {
         wrapped.push_str(&format!("{inner}continue;\n"));

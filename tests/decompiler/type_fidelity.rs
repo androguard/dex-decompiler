@@ -1,27 +1,46 @@
-//! Fidelity checks against the AndroguardTest APK (`TestDefault`).
+//! Fidelity checks against the AndroguardTest APK / DEX (`TestDefault`).
 //!
 //! Covers debug-typed numeric locals (`testDouble` / unused consts in `test_base`),
 //! `synchronized` + try-in-loop (`pouet2`), `while (true)` + catch-continue (`foo2`),
 //! and folded arithmetic.
+//!
+//! Input resolution (first hit wins):
+//! 1. `ANDROGUARD_TEST_APK` env var
+//! 2. Sibling checkout `../androguard/.../app-debug.apk`
+//! 3. In-repo `testdata/classes4.dex` (contains `TestDefault`; used in CI)
 
 use std::path::PathBuf;
 
 use dex_decompiler::{load_dexes_from_path, Decompiler};
 
-fn androguard_test_apk() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+fn androguard_test_input() -> PathBuf {
+    if let Ok(p) = std::env::var("ANDROGUARD_TEST_APK") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return path;
+        }
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let sibling = root.join(
         "../androguard/tests/data/AndroguardTest/app/build/outputs/apk/debug/app-debug.apk",
-    )
+    );
+    if sibling.is_file() {
+        return sibling;
+    }
+    // Multi-DEX APK's classes4.dex — already checked in; keeps CI self-contained.
+    let fixture = root.join("testdata/classes4.dex");
+    assert!(
+        fixture.is_file(),
+        "missing AndroguardTest input (set ANDROGUARD_TEST_APK, or keep \
+         testdata/classes4.dex); looked for {}",
+        fixture.display()
+    );
+    fixture
 }
 
 fn decompile_method(class_name: &str, method_name: &str) -> String {
-    let path = androguard_test_apk();
-    assert!(
-        path.is_file(),
-        "missing AndroguardTest apk at {}",
-        path.display()
-    );
-    let dexes = load_dexes_from_path(&path).unwrap_or_else(|e| panic!("load apk: {e}"));
+    let path = androguard_test_input();
+    let dexes = load_dexes_from_path(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
     let simple = class_name.rsplit('.').next().unwrap_or(class_name);
     for dex in &dexes {
         let dc = Decompiler::new(dex);
@@ -373,9 +392,8 @@ fn test_base_try_is_not_the_rest_of_the_method() {
 }
 
 fn decompile_test_default_class() -> String {
-    let path = androguard_test_apk();
-    assert!(path.is_file(), "missing apk at {}", path.display());
-    let dexes = load_dexes_from_path(&path).unwrap_or_else(|e| panic!("load apk: {e}"));
+    let path = androguard_test_input();
+    let dexes = load_dexes_from_path(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
     for dex in &dexes {
         let dc = Decompiler::new(dex);
         for cd in dex.class_defs().flatten() {

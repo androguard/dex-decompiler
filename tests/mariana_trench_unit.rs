@@ -74,8 +74,10 @@ fn default_android_config_has_mt_aligned_rules() {
 
 #[test]
 fn call_graph_builds_on_sample_dex() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/classes.dex");
-    let data = std::fs::read(path).expect("testdata/classes.dex");
+    // Use the small in-repo AndroguardTest DEX — not testdata/classes.dex (~56k
+    // methods), which would hang CI by running value-flow on every method.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/classes4.dex");
+    let data = std::fs::read(path).expect("testdata/classes4.dex");
     let dex = parse_dex(&data).unwrap();
     let index = MethodIndex::from_dexes(&[&dex]);
     let decompiler = Decompiler::new(&dex);

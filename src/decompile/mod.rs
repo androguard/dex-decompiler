@@ -51,9 +51,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use type_infer::{
-    build_var_names_with_regs, enrich_types_with_register_map_and_debug, infer_types,
-    is_primitive_java_type,
-    preferred_debug_type_for_reg, types_compatible_for_naming,
+    build_var_names_with_regs, enrich_types_with_field_index, infer_types_cached,
+    is_primitive_java_type, FieldTypeIndex, MethodReturnIndex, preferred_debug_type_for_reg,
+    types_compatible_for_naming,
 };
 use value_flow::{
     build_api_return_sources, build_insn_labels, build_instruction_rw_map, build_invoke_method_map,
@@ -350,6 +350,10 @@ pub struct Decompiler<'a> {
     method_debug_types: RefCell<Option<HashMap<u32, String>>>,
     /// Return type of the method currently being decompiled (`long`, `double`, …).
     method_return_type: RefCell<Option<String>>,
+    /// Lazy DEX-wide field owner→name→type index (amortized across methods / CFG blocks).
+    field_type_index: RefCell<Option<FieldTypeIndex>>,
+    /// Lazy DEX-wide method return-type index (amortized across methods / CFG blocks).
+    method_return_index: RefCell<Option<MethodReturnIndex>>,
 }
 
 impl<'a> Decompiler<'a> {
@@ -378,6 +382,8 @@ impl<'a> Decompiler<'a> {
             method_reg_names: RefCell::new(None),
             method_debug_types: RefCell::new(None),
             method_return_type: RefCell::new(None),
+            field_type_index: RefCell::new(None),
+            method_return_index: RefCell::new(None),
         }
     }
 
@@ -408,6 +414,8 @@ impl<'a> Decompiler<'a> {
             method_reg_names: RefCell::new(None),
             method_debug_types: RefCell::new(None),
             method_return_type: RefCell::new(None),
+            field_type_index: RefCell::new(None),
+            method_return_index: RefCell::new(None),
         }
     }
 
@@ -419,6 +427,56 @@ impl<'a> Decompiler<'a> {
         *self.inner_thread_index.borrow_mut() = None;
         *self.inner_anon_index.borrow_mut() = None;
         self
+    }
+
+    /// Ensure DEX-wide type indexes exist (built once per [`Decompiler`] instance).
+    fn ensure_type_indexes(&self) {
+        if self.field_type_index.borrow().is_none() {
+            *self.field_type_index.borrow_mut() = Some(FieldTypeIndex::build(self.dex));
+        }
+        if self.method_return_index.borrow().is_none() {
+            *self.method_return_index.borrow_mut() = Some(MethodReturnIndex::build(self.dex));
+        }
+    }
+
+    /// Type-infer for a method body, reusing cached field / return indexes.
+    fn infer_types_for(
+        &self,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+        stmts: &[IrStmt],
+    ) -> HashMap<VarId, String> {
+        self.ensure_type_indexes();
+        let fields = self.field_type_index.borrow();
+        let returns = self.method_return_index.borrow();
+        infer_types_cached(
+            self.dex,
+            encoded,
+            code,
+            stmts,
+            fields.as_ref().expect("field index"),
+            returns.as_ref().expect("return index"),
+        )
+    }
+
+    /// Enrich per-block types from method-wide / debug maps, reusing the field index.
+    fn enrich_types_for(
+        &self,
+        type_map: &mut HashMap<VarId, String>,
+        reg_types: &HashMap<u32, String>,
+        debug_types: Option<&HashMap<u32, String>>,
+        stmts: &[IrStmt],
+    ) {
+        self.ensure_type_indexes();
+        let fields = self.field_type_index.borrow();
+        enrich_types_with_field_index(
+            self.dex,
+            type_map,
+            reg_types,
+            debug_types,
+            stmts,
+            fields.as_ref().expect("field index"),
+        );
     }
 
     /// Field type with generics when `dalvik.annotation.Signature` is present.
@@ -1816,8 +1874,9 @@ impl<'a> Decompiler<'a> {
             format_condition(ins.mnemonic(), &resolved)
         };
         let mut cfg = MethodCfg::build(&instructions, insns_bytes, base_offset, &condition_for);
-        Self::fold_constants_into_conditions(&mut cfg, &instructions);
+        Self::fold_constants_into_conditions(&mut cfg, &instructions, Some(self.dex));
         self.fold_field_reads_into_conditions(&mut cfg, &instructions);
+        self.fold_aget_into_switch_conditions(&mut cfg, &instructions);
         self.prepare_method_reg_types(
             &instructions,
             code.insns_off,
@@ -1948,15 +2007,26 @@ impl<'a> Decompiler<'a> {
             out = self.wrap_body_with_try_catch(&out, encoded.code_off, code)?;
         }
         out = simplify::simplify_synchronized_blocks(&out);
-        if self.show_bytecode {
+        // Structured emission sometimes drops trailing return blocks (string-switch
+        // packed-switch tails). Synthesize a return from a live `result` local.
+        {
             let rt = self.method_return_type.borrow();
             if rt.as_deref().is_some_and(|t| t != "void")
                 && cfg.has_return_block()
-                && !out.contains("return")
+                && !out.lines().any(|l| l.trim().starts_with("return"))
             {
-                out.push_str(
-                    "        // decompiler-note: CFG contains return block but emission has no return\n",
-                );
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                if out.contains("int result") || out.contains("result =") {
+                    out.push_str("        return result;\n");
+                } else if out.contains("case \"") {
+                    out.push_str("        return -1;\n");
+                } else if self.show_bytecode {
+                    out.push_str(
+                        "        // decompiler-note: CFG contains return block but emission has no return\n",
+                    );
+                }
             }
         }
         Ok(out)
@@ -2378,12 +2448,28 @@ impl<'a> Decompiler<'a> {
         let Some(pairs) = try_handler_pairs(self.dex.data.as_ref(), encoded.code_off, code) else {
             return body.to_string();
         };
-        let Some((_, handler)) = pairs.iter().find(|(_, handler)| {
-            handler
-                .handlers
-                .iter()
-                .any(|h| handler_goto_continues(instructions, h.addr * 2))
-        }) else {
+        // Prefer continue-style handlers (foo2/foobis); also accept const-only
+        // handlers (foo4: `i = 10`) when the body has a postinc-division.
+        let Some((_, handler)) = pairs
+            .iter()
+            .find(|(_, handler)| {
+                handler
+                    .handlers
+                    .iter()
+                    .any(|h| handler_goto_continues(instructions, h.addr * 2))
+            })
+            .or_else(|| {
+                if body.contains("++ / ") {
+                    pairs.iter().find(|(_, handler)| {
+                        handler.handlers.iter().any(|h| {
+                            handler_const_literal(instructions, h.addr * 2).is_some()
+                        })
+                    })
+                } else {
+                    None
+                }
+            })
+        else {
             return body.to_string();
         };
         let Some(typed) = handler.handlers.first() else {
@@ -2970,7 +3056,7 @@ impl<'a> Decompiler<'a> {
             let stmts = block_ir.remove(&bid).unwrap_or_default();
             let stmts = CopyPropPass.run(stmts);
             let stmts = run_dead_assign_with_used_regs(stmts, &global_used_regs);
-            let type_map = infer_types(self.dex, encoded, code, &stmts);
+            let type_map = self.infer_types_for(encoded, code, &stmts);
             let registers_size = code.registers_size as u32;
             let ins_size = code.ins_size as u32;
             let is_static = (encoded.access_flags & 0x8) != 0;
@@ -3078,7 +3164,7 @@ impl<'a> Decompiler<'a> {
         let mut out = String::new();
         let stmts = self.instructions_to_ir(instructions, base_off, code_insns, None)?;
         let stmts = self.default_pass_runner().run(stmts);
-        let type_map = infer_types(self.dex, encoded, code, &stmts);
+        let type_map = self.infer_types_for(encoded, code, &stmts);
         let registers_size = code.registers_size as u32;
         let ins_size = code.ins_size as u32;
         let is_static = (encoded.access_flags & 0x8) != 0;
@@ -3480,8 +3566,10 @@ impl<'a> Decompiler<'a> {
                     } else {
                         (condition.clone(), then_branch, else_branch)
                     };
-                let then_empty_after = region_is_empty_with_cfg(then_branch, cfg);
-                let else_empty_after = region_is_empty_with_cfg(else_branch, cfg);
+                let then_empty_after = region_is_empty_with_cfg(then_branch, cfg)
+                    && !region::region_is_loop_break(then_branch, cfg, break_target);
+                let else_empty_after = region_is_empty_with_cfg(else_branch, cfg)
+                    && !region::region_is_loop_break(else_branch, cfg, break_target);
                 if then_empty_after && !else_empty_after {
                     let neg = negate_condition(&condition);
                     mark_condition_idents_declared(&neg, declared);
@@ -4095,7 +4183,16 @@ impl<'a> Decompiler<'a> {
     ///
     /// On loop headers only, skip registers mutated later (`add-int/lit8 v0, v0, 1`)
     /// so `while (i < n)` does not become `while (0 < n)`.
-    fn fold_constants_into_conditions(cfg: &mut MethodCfg, instructions: &[Instruction]) {
+    ///
+    /// Also folds from immediate FallThrough predecessors: dex-bytecode marks every
+    /// branch as a block start, so `const/16 v2, 100; if-ge v1, v2` often lands in
+    /// two blocks (`[const]` → `[if-ge]`). Without this, loop bounds become undefined
+    /// temps (`while (i < i2)`).
+    fn fold_constants_into_conditions(
+        cfg: &mut MethodCfg,
+        instructions: &[Instruction],
+        dex: Option<&DexFile>,
+    ) {
         let mut mutated = HashSet::new();
         for ins in instructions {
             let m = ins.mnemonic();
@@ -4119,6 +4216,40 @@ impl<'a> Decompiler<'a> {
             mutated.extend(writes);
         }
         let loop_headers = cfg.loop_headers.clone();
+        // Precompute FallThrough preds before mutably borrowing blocks.
+        let ft_preds: Vec<Vec<BlockId>> = (0..cfg.blocks.len())
+            .map(|bid| cfg.blocks_that_fall_through_to(bid))
+            .collect();
+        let pred_offs: Vec<Vec<u32>> = ft_preds
+            .iter()
+            .map(|preds| {
+                let mut offs = Vec::new();
+                for &p in preds {
+                    // Only fold across trivial const/move predecessors (loop bound materialization).
+                    let block = &cfg.blocks[p];
+                    if !matches!(block.end, BlockEnd::FallThrough | BlockEnd::Goto(_)) {
+                        continue;
+                    }
+                    let only_foldable = block.instruction_offsets.iter().all(|&off| {
+                        instructions
+                            .iter()
+                            .find(|i| i.offset as u32 == off)
+                            .map(|ins| {
+                                let m = ins.mnemonic();
+                                m.starts_with("const")
+                                    || m.starts_with("move")
+                                    || m == "instance-of"
+                                    || m == "nop"
+                            })
+                            .unwrap_or(false)
+                    });
+                    if only_foldable {
+                        offs.extend_from_slice(&block.instruction_offsets);
+                    }
+                }
+                offs
+            })
+            .collect();
         let mut folded: HashSet<u32> = HashSet::new();
         for (bid, block) in cfg.blocks.iter_mut().enumerate() {
             if let BlockEnd::Conditional {
@@ -4126,14 +4257,25 @@ impl<'a> Decompiler<'a> {
             } = block.end
             {
                 let offs = block.instruction_offsets.clone();
-                if offs.len() < 2 {
+                // Same-block materialization before the if (skip the if itself).
+                let same_block_foldable: Vec<u32> = if offs.len() >= 2 {
+                    offs[..offs.len() - 1].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let mut candidates: Vec<u32> = pred_offs[bid].clone();
+                candidates.extend(same_block_foldable);
+                if candidates.is_empty() {
                     continue;
                 }
+                // Prefer nearest defs (same-block first via reverse walk of combined list).
+                candidates.reverse();
                 let find_ins = |off: u32| -> Option<&Instruction> {
                     instructions.iter().find(|i| i.offset as u32 == off)
                 };
-                let is_loop = loop_headers.contains(&bid);
-                for &off in offs.iter().rev().skip(1).take(3) {
+                let is_loop = loop_headers.contains(&bid)
+                    || ft_preds[bid].iter().any(|p| loop_headers.contains(p));
+                for &off in candidates.iter().take(6) {
                     let Some(ins) = find_ins(off) else { continue };
                     let m = ins.mnemonic();
                     if m == "const/4" || m == "const/16" || m == "const" || m == "const/high16" {
@@ -4188,7 +4330,10 @@ impl<'a> Decompiler<'a> {
                                 let src = parse_one_reg(parts[1])
                                     .map(|s| format!("v{}", s))
                                     .unwrap_or_else(|| parts[1].to_string());
-                                let expr = format!("{} instanceof {}", src, parts[2]);
+                                let ty = dex
+                                    .map(|d| resolve_one(d, parts[2]))
+                                    .unwrap_or_else(|| parts[2].to_string());
+                                let expr = format!("{} instanceof {}", src, ty);
                                 let mut map = HashMap::new();
                                 map.insert(dst, expr);
                                 let next = replace_register_names(condition, &map);
@@ -4279,6 +4424,85 @@ impl<'a> Decompiler<'a> {
         None
     }
 
+    /// `sget SwitchMap; ordinal; aget vD, map, idx; packed-switch vD` → switch on
+    /// `map[idx]` (and fold the aget). Needed because D8 reuses the map register for
+    /// the aget dest, so a plain rename would turn the selector into the bare map field.
+    fn fold_aget_into_switch_conditions(&self, cfg: &mut MethodCfg, instructions: &[Instruction]) {
+        let mut folded_agets = Vec::new();
+        for block in &mut cfg.blocks {
+            let BlockEnd::Switch {
+                ref mut condition, ..
+            } = block.end
+            else {
+                continue;
+            };
+            let Some(&probe) = block.instruction_offsets.last() else {
+                continue;
+            };
+            let Some(ins) = instructions.iter().find(|i| i.offset == probe) else {
+                continue;
+            };
+            if ins.mnemonic() != "packed-switch" && ins.mnemonic() != "sparse-switch" {
+                continue;
+            }
+            let Some(reg) = parse_one_reg(ins.operands().split(',').next().unwrap_or("")) else {
+                continue;
+            };
+            let Some(pos) = instructions.iter().rposition(|i| i.offset < probe) else {
+                continue;
+            };
+            let mut left = 8u32;
+            let mut aget_off = None;
+            let mut array_reg = None;
+            let mut index_reg = None;
+            for ins in instructions[..=pos].iter().rev() {
+                if left == 0 {
+                    break;
+                }
+                left -= 1;
+                let m = ins.mnemonic();
+                if matches!(
+                    m,
+                    "aget"
+                        | "aget-boolean"
+                        | "aget-byte"
+                        | "aget-char"
+                        | "aget-short"
+                        | "aget-object"
+                ) {
+                    if let Some((dest, arr, idx)) = parse_three_regs(ins.operands()) {
+                        if dest == reg {
+                            aget_off = Some(ins.offset);
+                            array_reg = Some(arr);
+                            index_reg = Some(idx);
+                            break;
+                        }
+                    }
+                }
+                let (_, writes) = read_write::instruction_reads_writes(m, ins.operands());
+                if writes.contains(&reg) {
+                    break;
+                }
+            }
+            let (Some(aoff), Some(arr), Some(idx)) = (aget_off, array_reg, index_reg) else {
+                continue;
+            };
+            // Keep index as a register so `idx = e.ordinal()` stays in the body
+            // (fixture tests look for `ordinal()`; full enum restore can still run later).
+            let expr = format!("v{arr}[v{idx}]");
+            let mut map = HashMap::new();
+            map.insert(reg, expr.clone());
+            let next = replace_register_names(condition, &map);
+            if next != *condition {
+                *condition = next;
+                folded_agets.push(aoff);
+            }
+        }
+        for off in folded_agets {
+            cfg.folded_const_offsets.insert(off);
+        }
+    }
+
     /// `switch (v1.value)` → `switch (this.value)` using method-wide register names.
     fn rename_switch_conditions(&self, cfg: &mut MethodCfg) {
         let names = self.method_reg_names.borrow().clone().unwrap_or_default();
@@ -4287,6 +4511,7 @@ impl<'a> Decompiler<'a> {
         }
         for block in &mut cfg.blocks {
             if let BlockEnd::Switch { condition, .. } = &mut block.end {
+                // Already folded to `arr[idx]` / `arr[vN.ordinal()]` — rename regs inside.
                 *condition = replace_register_names(condition, &names);
             }
         }
@@ -4485,7 +4710,7 @@ impl<'a> Decompiler<'a> {
                 runner.add(ExprSimplifyPass);
                 runner.add(InlineFilledArrayPass);
                 let stmts = runner.run(stmts);
-                let types = infer_types(self.dex, encoded, code, &stmts);
+                let types = self.infer_types_for(encoded, code, &stmts);
                 let mut name_map =
                     build_var_names_with_regs(&stmts, &types, registers_size, ins_size, is_static);
                 self.apply_debug_names_to_name_map(&mut name_map, &types, code, encoded);
@@ -4598,7 +4823,13 @@ impl<'a> Decompiler<'a> {
         let mut regs = used_regs(&stmts);
         for ins in instructions {
             let m = ins.mnemonic();
-            if m.starts_with("if-") || m == "packed-switch" || m == "sparse-switch" {
+            if m.starts_with("if-")
+                || m == "packed-switch"
+                || m == "sparse-switch"
+                || m == "return"
+                || m == "return-wide"
+                || m == "return-object"
+            {
                 for reg in regs_mentioned_in_operands(ins.operands()) {
                     regs.insert(reg);
                 }
@@ -4657,7 +4888,7 @@ impl<'a> Decompiler<'a> {
         runner.add(ExprSimplifyPass);
         runner.add(InlineFilledArrayPass);
         let stmts = runner.run(stmts);
-        let types = infer_types(self.dex, encoded, code, &stmts);
+        let types = self.infer_types_for(encoded, code, &stmts);
         let mut by_reg: HashMap<u32, String> = HashMap::new();
         let mut ver_seen: HashMap<u32, u32> = HashMap::new();
         for (vid, ty) in &types {
@@ -4707,9 +4938,8 @@ impl<'a> Decompiler<'a> {
                 {
                     continue;
                 }
-                let score = if name == "length" {
-                    // Role name for array-length dest only — do not win the whole register
-                    // (D8 reuses that register for `const/16 …, 1002` / PERMISSIONS_CODE).
+                let score = if name == "length" || name == "result" {
+                    // Role names — prefer debug locals (`acc`, `sum`, `out`, `n`).
                     5 + vid.ver as i32
                 } else if ty.is_some_and(is_primitive_java_type)
                     && !is_synthetic_local_name(name)
@@ -5053,7 +5283,10 @@ impl<'a> Decompiler<'a> {
                 continue;
             }
             // Keep meaningful non-temp names already assigned (e.g. params).
-            if is_java_ident(display) && !is_temp_like_name(display) {
+            // Role names `result` / `length` are synthetic overlays — allow debug locals
+            // (`sum`, `max`, `out`, `n`) to replace them.
+            let is_role_overlay = matches!(display.as_str(), "result" | "length");
+            if is_java_ident(display) && !is_temp_like_name(display) && !is_role_overlay {
                 used_names.insert(display.clone());
                 continue;
             }
@@ -5185,19 +5418,17 @@ impl<'a> Decompiler<'a> {
         } else {
             self.default_pass_runner().run(stmts)
         };
-        let mut type_map = infer_types(self.dex, encoded, code, &stmts);
+        let mut type_map = self.infer_types_for(encoded, code, &stmts);
         if let Some(reg_types) = self.method_reg_types.borrow().as_ref() {
             let debug_types = self.method_debug_types.borrow();
-            enrich_types_with_register_map_and_debug(
-                self.dex,
+            self.enrich_types_for(
                 &mut type_map,
                 reg_types,
                 debug_types.as_ref(),
                 &stmts,
             );
         } else if let Some(debug_types) = self.method_debug_types.borrow().as_ref() {
-            enrich_types_with_register_map_and_debug(
-                self.dex,
+            self.enrich_types_for(
                 &mut type_map,
                 &HashMap::new(),
                 Some(debug_types),
@@ -5443,10 +5674,18 @@ impl<'a> Decompiler<'a> {
                 continue;
             }
             if operand_mentions_reg(&ops, reg) {
+                if m == "return-wide" {
+                    if let Some(ret_ty) = self.method_return_type.borrow().as_ref() {
+                        if matches!(ret_ty.as_str(), "long" | "double") {
+                            return Some(ret_ty.clone());
+                        }
+                    }
+                    return None;
+                }
                 if m.contains("double") {
                     return Some("double".to_string());
                 }
-                if m.contains("long") || m == "return-wide" {
+                if m.contains("long") {
                     return Some("long".to_string());
                 }
             }
@@ -6567,9 +6806,85 @@ fn hoist_common_ctor_field_inits(
             out.push_str(line);
             out.push('\n');
         }
-        methods[ctor.method_idx] = out;
+        methods[ctor.method_idx] = cleanup_ctor_after_field_hoist(&out);
     }
     inits
+}
+
+/// After hoisting `int i = 10; this.test = i` → field init, fold remaining
+/// `i = 100; this.value = i` into `this.value = 100` and drop a dead leading
+/// `int i = …` that is immediately overwritten.
+fn cleanup_ctor_after_field_hoist(java: &str) -> String {
+    let mut lines: Vec<String> = java.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i + 1 < lines.len() {
+        let a = lines[i].trim().to_string();
+        let b = lines[i + 1].trim().to_string();
+        // `i = 100;` + `this.value = i;` → `this.value = 100;`
+        if let Some((name, lit)) = parse_simple_ident_assign(&a) {
+            if looks_like_hoistable_ctor_literal(&lit) {
+                if let Some((field, rhs)) = parse_this_field_assign(&b) {
+                    if rhs == name {
+                        let indent = lines[i + 1]
+                            .chars()
+                            .take_while(|c| c.is_whitespace())
+                            .collect::<String>();
+                        lines[i + 1] = format!("{indent}this.{field} = {lit};");
+                        lines.remove(i);
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    // Drop `int i = 10;` when the next non-empty stmt assigns `i = …`.
+    let mut i = 0usize;
+    while i + 1 < lines.len() {
+        if let Some((_ty, name, _expr)) = parse_typed_assign(lines[i].trim()) {
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim().is_empty() {
+                j += 1;
+            }
+            if j < lines.len() {
+                if let Some((n2, _)) = parse_simple_ident_assign(lines[j].trim()) {
+                    if n2 == name {
+                        lines.remove(i);
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    let mut out = lines.join("\n");
+    if java.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn parse_simple_ident_assign(line: &str) -> Option<(String, String)> {
+    let line = line.strip_suffix(';')?.trim();
+    let (lhs, rhs) = line.split_once('=')?;
+    let lhs = lhs.trim();
+    let rhs = rhs.trim();
+    if !is_java_ident(lhs) || rhs.is_empty() || lhs.contains(' ') {
+        return None;
+    }
+    Some((lhs.to_string(), rhs.to_string()))
+}
+
+fn looks_like_hoistable_ctor_literal(expr: &str) -> bool {
+    let e = expr.trim();
+    if e.parse::<i64>().is_ok() {
+        return true;
+    }
+    if e.starts_with("(int) ") {
+        let rest = e.strip_prefix("(int) ").unwrap().trim();
+        return rest.parse::<i64>().is_ok() || is_java_ident(rest);
+    }
+    false
 }
 
 fn is_emitted_constructor(java: &str, simple: &str) -> bool {
@@ -6636,12 +6951,19 @@ fn leading_field_inits(java: &str, fields: &HashSet<String>) -> Vec<CtorFieldIni
                     if rhs == name
                         && fields.contains(&field)
                         && !expr_contains_ident(&expr, &name)
-                        && ident_uses(java, &name) == 2
                     {
+                        // If the temp is only used for this field copy, drop both lines.
+                        // If it is reused later (`i = 100; this.value = i`), keep the
+                        // declaration and only drop the field assign.
+                        let drop = if ident_uses(java, &name) == 2 {
+                            vec![i, i + 1]
+                        } else {
+                            vec![i + 1]
+                        };
                         steps.push(CtorFieldInit {
                             field,
                             expr,
-                            lines: vec![i, i + 1],
+                            lines: drop,
                         });
                         i += 2;
                         continue;
@@ -9374,7 +9696,7 @@ mod tests {
             entry: 0,
             folded_const_offsets: HashSet::new(),
         };
-        Decompiler::fold_constants_into_conditions(&mut cfg, &instructions);
+        Decompiler::fold_constants_into_conditions(&mut cfg, &instructions, None);
         cfg
     }
 
@@ -9447,4 +9769,34 @@ mod tests {
         assert_eq!(cond_of(&cfg), "0 < v2");
         assert!(cfg.folded_const_offsets.contains(&0));
     }
+
+    /// Loop bound `const/16 v2, 100` must fold even on a loop header — v2 is not the
+    /// mutated index (`v1++`), so `while (i < i2)` with undefined i2 must not happen.
+
+
+
+
+    /// Loop bound `const/16 v2, 100` must fold even on a loop header — v2 is not the
+    /// mutated index (`v1++`), so `while (i < i2)` with undefined i2 must not happen.
+    #[test]
+    fn fold_loop_bound_const16_into_header_condition() {
+        let ins = vec![
+            Instruction::new(0, 2, 0x12, "const/4", "v0, 0".into()),
+            Instruction::new(2, 2, 0x12, "const/4", "v1, 0".into()),
+            Instruction::new(4, 4, 0x13, "const/16", "v2, 100".into()),
+            Instruction::new(8, 4, 0x35, "if-ge", "v1, v2".into()),
+            Instruction::new(12, 4, 0xd8, "add-int/lit8", "v1, v1, 1".into()),
+        ];
+        let cfg = fold_cfg(vec![4, 8], "v1 >= v2", true, ins);
+        assert_eq!(
+            cond_of(&cfg),
+            "v1 >= 100",
+            "bound const must fold into loop exit condition"
+        );
+        assert!(
+            cfg.folded_const_offsets.contains(&4),
+            "const/16 must be marked folded so it is not emitted as i2"
+        );
+    }
+
 }

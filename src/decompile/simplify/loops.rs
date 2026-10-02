@@ -157,6 +157,175 @@ pub(crate) fn parse_array_length_assign(line: &str) -> Option<(String, String)> 
 
 /// `i = right.length; i = left.length + i; int[] out = new int[i]; i = 0;` →
 /// `int[] out = new int[left.length + right.length]; i = 0;`
+
+
+/// `j = right.length; i = left.length + j; int[] out = new int[i];`
+/// → `int[] out = new int[left.length + right.length];`
+pub(crate) fn fold_array_alloc_length_sum_via_temp(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut remove: HashSet<usize> = HashSet::new();
+    let mut replacements: HashMap<usize, String> = HashMap::new();
+    for (alloc_idx, line) in lines.iter().enumerate() {
+        let binding = strip_trailing_comment(line);
+        let stmt = binding.trim();
+        let Some(eq) = stmt.find(" = ") else { continue };
+        let lhs = stmt[..eq].trim();
+        let Some(arr_var) = lhs.strip_prefix("int[] ") else { continue };
+        let arr_var = arr_var.trim();
+        let rhs = stmt[eq + 3..].trim_end_matches(';').trim();
+        let Some(size_var) = rhs
+            .strip_prefix("new int[")
+            .and_then(|s| s.strip_suffix(']'))
+        else {
+            continue;
+        };
+        let size_var = size_var.trim();
+        if !is_java_ident(size_var) {
+            continue;
+        }
+        let Some(sum_idx) = (0..alloc_idx).rev().find(|&i| {
+            parse_simple_assign_line(lines[i]).is_some_and(|(v, r)| {
+                v == size_var
+                    && r.split('+').map(str::trim).filter(|p| !p.is_empty()).count() == 2
+            })
+        }) else {
+            continue;
+        };
+        let Some((_, sum_rhs)) = parse_simple_assign_line(lines[sum_idx]) else {
+            continue;
+        };
+        let parts: Vec<&str> = sum_rhs.split('+').map(str::trim).collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let (p0, p1) = (parts[0], parts[1]);
+        let resolve = |p: &str| -> Option<String> {
+            if p.ends_with(".length") {
+                return Some(p.to_string());
+            }
+            if !is_java_ident(p) {
+                return None;
+            }
+            (0..sum_idx).rev().find_map(|i| {
+                let (v, r) = parse_simple_assign_line(lines[i])?;
+                if v == p && r.ends_with(".length") {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+        };
+        let Some(a) = resolve(p0) else { continue };
+        let Some(b) = resolve(p1) else { continue };
+        // Prefer left.length + right.length order when names suggest it.
+        let (left, right) = if a.contains("left") || b.contains("right") {
+            (a, b)
+        } else if a.contains("right") || b.contains("left") {
+            (b, a)
+        } else {
+            (a, b)
+        };
+        let indent = leading_indent(line);
+        replacements.insert(
+            alloc_idx,
+            format!("{indent}int[] {arr_var} = new int[{left} + {right}];"),
+        );
+        remove.insert(sum_idx);
+        // Remove the length temps if unused afterward (best-effort: if assigned just before).
+        for i in 0..sum_idx {
+            if let Some((v, r)) = parse_simple_assign_line(lines[i]) {
+                if r.ends_with(".length") && (p0 == v || p1 == v) {
+                    remove.insert(i);
+                }
+            }
+        }
+    }
+    if replacements.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if remove.contains(&idx) {
+            continue;
+        }
+        if let Some(repl) = replacements.get(&idx) {
+            out.push_str(repl);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if body.ends_with('\n') {
+        out
+    } else {
+        out.trim_end().to_string()
+    }
+}
+
+
+
+/// After length-sum fold, normalize merge indices to source-like `i`/`j`/`k`.
+pub(crate) fn repair_merge_index_inits(body: &str) -> String {
+    if !body.contains("new int[left.length + right.length]") {
+        return body.to_string();
+    }
+    let mut body = body.to_string();
+    // D8 often emits j=left, k=right, k_0=out. Source uses i/j/k.
+    if body.contains("left[j]")
+        && body.contains("right[k]")
+        && (body.contains("out[k_0") || body.contains("out[k_0++]"))
+    {
+        body = replace_ident_as_expr(&body, "k_0", "k__out");
+        body = replace_ident_as_expr(&body, "k", "j__right");
+        body = replace_ident_as_expr(&body, "j", "i");
+        body = replace_ident_as_expr(&body, "j__right", "j");
+        body = replace_ident_as_expr(&body, "k__out", "k");
+    }
+    let has_i0 = body
+        .lines()
+        .any(|l| strip_trailing_comment(l).trim().starts_with("int i = 0"));
+    let has_j0 = body
+        .lines()
+        .any(|l| strip_trailing_comment(l).trim().starts_with("int j = 0"));
+    if has_i0 && has_j0 {
+        return body;
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::new();
+    let mut done = false;
+    for line in &lines {
+        let t = strip_trailing_comment(line).trim().to_string();
+        if !done
+            && (t == "j = 0;"
+                || t == "j = 0"
+                || t == "i = 0;"
+                || t.starts_with("int j = 0")
+                || t.starts_with("int k = 0"))
+        {
+            let indent = leading_indent(line);
+            if !has_i0 {
+                out.push_str(&format!("{indent}int i = 0;\n"));
+            }
+            if !has_j0 {
+                out.push_str(&format!("{indent}int j = 0;\n"));
+            }
+            if t.starts_with("int k = 0") {
+                out.push_str(line);
+                out.push('\n');
+            }
+            done = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if body.ends_with('\n') {
+        out
+    } else {
+        out.trim_end().to_string()
+    }
+}
+
 pub(crate) fn fold_array_alloc_length_sum(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
     let mut remove: HashSet<usize> = HashSet::new();
@@ -943,6 +1112,25 @@ pub(crate) fn polish_adjacent_array_swap_block(
 
 /// Recover nested counting for-loops from d8's `while (true) { … if (0 >= n-1) return; else … }`.
 /// Recover nested counting for-loops from d8's `while (true) { … if (0 >= n-1) return; else … }`.
+
+/// `i_0 = n - 1` where `n` was `arr.length` earlier in the method.
+fn parse_named_length_minus_one(line: &str, before: &[&str]) -> Option<(String, String)> {
+    let (var, rhs) = parse_simple_assign_line(line)?;
+    let compact = rhs.replace(' ', "");
+    let base = compact.strip_suffix("-1")?;
+    if !is_java_ident(base) {
+        return None;
+    }
+    for bl in before.iter().rev() {
+        if let Some((v, arr)) = parse_array_length_assign(bl) {
+            if v == base {
+                return Some((var, arr));
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn restore_while_true_nested_for_once(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
     for w in 0..lines.len() {
@@ -957,6 +1145,10 @@ pub(crate) fn restore_while_true_nested_for_once(body: &str) -> String {
         }
         let (if_line, arr, outer_tmp, has_init_line) =
             if let Some((outer_tmp, arr)) = parse_length_minus_one_assign(lines[w + 1]) {
+                (w + 2, arr, outer_tmp, true)
+            } else if let Some((outer_tmp, arr)) =
+                parse_named_length_minus_one(lines[w + 1], &lines[..w])
+            {
                 (w + 2, arr, outer_tmp, true)
             } else if lines[w + 1].trim().starts_with("if (0 >= ") {
                 let if_trim = lines[w + 1].trim();
@@ -1040,13 +1232,22 @@ pub(crate) fn restore_while_true_nested_for_once(body: &str) -> String {
             }
         }
         let mut last = else_close;
-        while last > k && lines[last - 1].trim().is_empty() {
+        while last > k
+            && (lines[last - 1].trim().is_empty() || lines[last - 1].trim() == "continue;")
+        {
             last -= 1;
         }
         if last <= k {
             continue;
         }
-        let inc_ok = is_index_increment(lines[last - 1], &outer_tmp)
+        // When the exit test is `i >= bound`, the outer index is `i` (not the bound temp).
+        let outer_idx = if cond.contains("i >=") || cond.contains("i > ") {
+            "i"
+        } else {
+            outer_tmp.as_str()
+        };
+        let inc_ok = is_index_increment(lines[last - 1], outer_idx)
+            || is_index_increment(lines[last - 1], &outer_tmp)
             || is_index_increment(lines[last - 1], inner_idx);
         if !inc_ok {
             continue;
@@ -1242,6 +1443,73 @@ pub(crate) fn restore_foreach_array(body: &str) -> String {
 
 /// D8 merge: `while (true) { len = a.length; if (i >= len) DRAIN; else if (j < b.length) BODY }`
 /// → `while (i < a.length && j < b.length) { BODY } DRAIN`
+
+
+/// Hoist `int length = arr.length;` out of a loop that uses `length` in its condition.
+pub(crate) fn hoist_loop_bound_length_decl(body: &str) -> String {
+    let mut lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let is_loop = t.starts_with("for (") || t.starts_with("while (");
+        if !is_loop {
+            i += 1;
+            continue;
+        }
+        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let Some(end) = find_closing_brace_line(&line_refs, i) else {
+            i += 1;
+            continue;
+        };
+        // Find first `int NAME = X.length;` inside the loop used in the header.
+        let header = lines[i].clone();
+        let mut hoist_idx = None;
+        let mut hoist_line = None;
+        let mut name = None;
+        for j in i + 1..end {
+            let Some((lhs, rhs)) = parse_simple_assign_line(&lines[j]) else {
+                continue;
+            };
+            let stmt = strip_trailing_comment(&lines[j]);
+            let st = stmt.trim();
+            if !st.starts_with("int ") {
+                continue;
+            }
+            if !rhs.trim().ends_with(".length") {
+                continue;
+            }
+            if ident_occurs(&header, &lhs) {
+                hoist_idx = Some(j);
+                hoist_line = Some(lines[j].clone());
+                name = Some(lhs);
+                break;
+            }
+        }
+        if let (Some(j), Some(hl), Some(n)) = (hoist_idx, hoist_line, name) {
+            // Only hoist if this is the first decl of n in the method before the loop.
+            let earlier = lines[..i].iter().any(|l| {
+                parse_simple_assign_line(l).is_some_and(|(lhs, _)| lhs == n)
+                    || strip_trailing_comment(l).trim().starts_with(&format!("int {n}"))
+            });
+            if !earlier {
+                let indent = leading_indent(&lines[i]).to_string();
+                let hl_trim = hl.trim().to_string();
+                lines[j] = String::new();
+                lines.insert(i, format!("{indent}{hl_trim}"));
+                // adjust indices: inserted before loop
+                i += 2; // skip inserted + loop header
+                continue;
+            }
+        }
+        i = end + 1;
+    }
+    let mut out = lines.join("\n");
+    if body.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 pub(crate) fn restore_d8_merge_copy_loops(body: &str) -> String {
     let mut current = body.to_string();
     for _ in 0..6 {
@@ -1391,28 +1659,59 @@ fn restore_d8_merge_loop_once(body: &str) -> String {
                 let Some(cond_j) = parse_if_condition(lines[j_if]) else {
                     continue;
                 };
-                let Some((idx_j, bound_j)) =
+                // D8 may emit `if (j < right.length) { BODY }` or the inverted
+                // `if (j >= right.length) { break; } BODY`.
+                let parsed = if let Some((idx_j, bound_j)) =
                     cond_j.split_once(" < ").map(|(a, b)| (a.trim(), b.trim()))
-                else {
-                    continue;
-                };
-                if let Some(arr) = bound_j.strip_suffix(".length") {
-                    right_arr = arr.trim().to_string();
-                }
-                let inner = find_if_else_bodies(&lines, j_if).or_else(|| {
-                    let close = find_closing_brace_line(&lines, j_if)?;
-                    Some(IfElseBodies {
-                        then_lo: j_if + 1,
-                        then_hi: close,
-                        else_lo: close,
-                        else_hi: close,
-                        _close: close,
+                {
+                    let mut right_arr = right_arr.clone();
+                    if let Some(arr) = bound_j.strip_suffix(".length") {
+                        right_arr = arr.trim().to_string();
+                    }
+                    let inner = find_if_else_bodies(&lines, j_if).or_else(|| {
+                        let close = find_closing_brace_line(&lines, j_if)?;
+                        Some(IfElseBodies {
+                            then_lo: j_if + 1,
+                            then_hi: close,
+                            else_lo: close,
+                            else_hi: close,
+                            _close: close,
+                        })
+                    });
+                    inner.map(|inner| {
+                        (
+                            idx_j.to_string(),
+                            right_arr,
+                            inner.then_lo,
+                            inner.then_hi,
+                        )
                     })
-                });
-                let Some(inner) = inner else {
+                } else if let Some((idx_j, bound_j)) =
+                    cond_j.split_once(" >= ").map(|(a, b)| (a.trim(), b.trim()))
+                {
+                    let mut right_arr = right_arr.clone();
+                    if let Some(arr) = bound_j.strip_suffix(".length") {
+                        right_arr = arr.trim().to_string();
+                    }
+                    // Prefer brace-closed `if (…) { break; }` without else.
+                    find_closing_brace_line(&lines, j_if).and_then(|close| {
+                        let then_only =
+                            strip_trailing_continues_in_range(&lines, j_if + 1, close);
+                        if then_only.trim() != "break;" && then_only.trim() != "break" {
+                            return None;
+                        }
+                        if close + 1 >= bodies.else_hi {
+                            return None;
+                        }
+                        Some((idx_j.to_string(), right_arr, close + 1, bodies.else_hi))
+                    })
+                } else {
+                    None
+                };
+                let Some((idx_j, right_arr, merge_lo, merge_hi)) = parsed else {
                     continue;
                 };
-                (idx_j.to_string(), right_arr, inner.then_lo, inner.then_hi)
+                (idx_j, right_arr, merge_lo, merge_hi)
             };
         let merge_body = strip_trailing_continues_in_range(&lines, merge_lo, merge_hi);
         if merge_body.trim().is_empty() {
@@ -1494,6 +1793,11 @@ fn restore_d8_merge_drain_once(body: &str) -> String {
         if !left_store.contains(&format!("{left_arr}[")) {
             continue;
         }
+        // Outer merge loops also match this shape; their else arm has nested `if`s.
+        // Real drain else arms are straight copy sequences.
+        if left_store.lines().any(|l| l.trim().starts_with("if (")) {
+            continue;
+        }
         let then = skip_blank(&lines, bodies.then_lo, bodies.then_hi);
         if then >= bodies.then_hi || !lines[then].trim().starts_with("while (") {
             continue;
@@ -1558,6 +1862,127 @@ fn restore_d8_merge_drain_once(body: &str) -> String {
 /// A `while (cond)` that is the whole method and ends in `if (…) return` cannot
 /// actually exit on `!cond` (the method would not return). javac lowered
 /// `while (true)` that way for `foo2`.
+
+
+/// `while (c) { if (inner) { BODY } }` with no else — when BODY updates the loop
+/// index and never breaks, the missing false-arm is almost always `break`
+/// (breakInLoop / similar d8 shapes).
+pub(crate) fn repair_missing_loop_else_break(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut changed = false;
+    while i < lines.len() {
+        let Some(wcond) = parse_while_condition(lines[i]) else {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+            continue;
+        };
+        if wcond == "true" {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+        let Some(wclose) = find_closing_brace_line(&lines, i) else {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+            continue;
+        };
+        let inner_start = skip_blank(&lines, i + 1, wclose);
+        if inner_start >= wclose || !lines[inner_start].trim().starts_with("if (") {
+            for j in i..=wclose {
+                out.push_str(lines[j]);
+                out.push('\n');
+            }
+            i = wclose + 1;
+            continue;
+        }
+        let Some(icond) = parse_if_condition(lines[inner_start]) else {
+            for j in i..=wclose {
+                out.push_str(lines[j]);
+                out.push('\n');
+            }
+            i = wclose + 1;
+            continue;
+        };
+        let Some(iclose) = find_closing_brace_line(&lines, inner_start) else {
+            for j in i..=wclose {
+                out.push_str(lines[j]);
+                out.push('\n');
+            }
+            i = wclose + 1;
+            continue;
+        };
+        // Only `if {…}` with no else, and nothing else in the while body.
+        if lines[iclose].trim() != "}" {
+            for j in i..=wclose {
+                out.push_str(lines[j]);
+                out.push('\n');
+            }
+            i = wclose + 1;
+            continue;
+        }
+        let after_if = skip_blank(&lines, iclose + 1, wclose);
+        if after_if < wclose {
+            for j in i..=wclose {
+                out.push_str(lines[j]);
+                out.push('\n');
+            }
+            i = wclose + 1;
+            continue;
+        }
+        let then_body = lines[inner_start + 1..iclose]
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>();
+        if then_body.is_empty() || then_body.iter().any(|l| *l == "break;" || *l == "break") {
+            for j in i..=wclose {
+                out.push_str(lines[j]);
+                out.push('\n');
+            }
+            i = wclose + 1;
+            continue;
+        }
+        // Heuristic: then-arm updates a simple index compared in the while cond.
+        let updated = then_body.iter().any(|l| {
+            l.contains(" = ") && (l.contains(" + 1") || l.ends_with("++;") || l.contains(" += 1"))
+        });
+        if !updated {
+            for j in i..=wclose {
+                out.push_str(lines[j]);
+                out.push('\n');
+            }
+            i = wclose + 1;
+            continue;
+        }
+        let wind = leading_indent(lines[i]);
+        let iind = leading_indent(lines[inner_start]);
+        for j in i..iclose {
+            out.push_str(lines[j]);
+            out.push('\n');
+        }
+        out.push_str(&format!("{iind}}} else {{\n"));
+        out.push_str(&format!("{iind}    break;\n"));
+        out.push_str(&format!("{iind}}}\n"));
+        out.push_str(&format!("{wind}}}\n"));
+        changed = true;
+        i = wclose + 1;
+        let _ = icond;
+    }
+    if !changed {
+        return body.to_string();
+    }
+    if body.ends_with('\n') {
+        out
+    } else {
+        out.trim_end().to_string()
+    }
+}
+
 pub(crate) fn rewrite_nonreturning_while(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
     let Some(w) = lines.iter().position(|l| l.trim().starts_with("while (")) else {
@@ -1656,29 +2081,62 @@ pub(crate) fn fold_const_break_into_while(body: &str) -> String {
             i += 1;
             continue;
         };
-        let Some(assign_idx) = (i + 1..close).find(|&k| !lines[k].trim().is_empty()) else {
+        let Some(first_idx) = (i + 1..close).find(|&k| !lines[k].trim().is_empty()) else {
             i += 1;
             continue;
         };
-        let Some((var, lit)) = parse_simple_assign_line(lines[assign_idx]) else {
-            i += 1;
-            continue;
-        };
-        if !is_numeric_literal(&lit) {
-            i += 1;
-            continue;
-        }
-        let Some(if_idx) = (assign_idx + 1..close).find(|&k| !lines[k].trim().is_empty()) else {
-            i += 1;
-            continue;
-        };
-        if leading_indent(lines[if_idx]) != leading_indent(lines[assign_idx]) {
-            i += 1;
-            continue;
-        }
-        let Some(if_cond) = parse_if_condition(lines[if_idx]) else {
-            i += 1;
-            continue;
+        // Direct `if (i == 10) { break; }` (no temp), or `t = 10; if (i == t) { break; }`.
+        let (assign_idx, if_idx, var, lit, if_cond) = if let Some(if_cond) =
+            parse_if_condition(lines[first_idx])
+        {
+            let mut lit_opt = None;
+            let mut var_opt = None;
+            for op in ["==", "!="] {
+                let needle = format!(" {op} ");
+                if let Some((a, b)) = if_cond.split_once(&needle) {
+                    let a = a.trim();
+                    let b = b.trim();
+                    if is_java_ident(a) && is_numeric_literal(b) {
+                        var_opt = Some(a.to_string());
+                        lit_opt = Some(b.to_string());
+                        break;
+                    }
+                    if is_java_ident(b) && is_numeric_literal(a) {
+                        var_opt = Some(b.to_string());
+                        lit_opt = Some(a.to_string());
+                        break;
+                    }
+                }
+            }
+            let (Some(var), Some(lit)) = (var_opt, lit_opt) else {
+                i += 1;
+                continue;
+            };
+            (first_idx, first_idx, var, lit, if_cond)
+        } else {
+            let assign_idx = first_idx;
+            let Some((var, lit)) = parse_simple_assign_line(lines[assign_idx]) else {
+                i += 1;
+                continue;
+            };
+            if !is_numeric_literal(&lit) {
+                i += 1;
+                continue;
+            }
+            let Some(if_idx) = (assign_idx + 1..close).find(|&k| !lines[k].trim().is_empty())
+            else {
+                i += 1;
+                continue;
+            };
+            if leading_indent(lines[if_idx]) != leading_indent(lines[assign_idx]) {
+                i += 1;
+                continue;
+            }
+            let Some(if_cond) = parse_if_condition(lines[if_idx]) else {
+                i += 1;
+                continue;
+            };
+            (assign_idx, if_idx, var, lit, if_cond)
         };
         let Some(if_close) = find_closing_brace_line(&lines, if_idx) else {
             i += 1;
@@ -1695,17 +2153,31 @@ pub(crate) fn fold_const_break_into_while(body: &str) -> String {
             i += 1;
             continue;
         }
-        let Some((cmp_var, op)) = cmp_against_temp(&if_cond, &var) else {
-            i += 1;
-            continue;
+        let (cmp_var, op) = if assign_idx == if_idx {
+            // Direct literal compare already parsed into var/lit.
+            let op = if if_cond.contains(" == ") {
+                "=="
+            } else if if_cond.contains(" != ") {
+                "!="
+            } else {
+                i += 1;
+                continue;
+            };
+            (var.clone(), op)
+        } else {
+            let Some((cmp_var, op)) = cmp_against_temp(&if_cond, &var) else {
+                i += 1;
+                continue;
+            };
+            if lines[if_close + 1..close]
+                .iter()
+                .any(|l| ident_occurs(l, &var))
+            {
+                i += 1;
+                continue;
+            }
+            (cmp_var, op)
         };
-        if lines[if_close + 1..close]
-            .iter()
-            .any(|l| ident_occurs(l, &var))
-        {
-            i += 1;
-            continue;
-        }
         let extra = match op {
             "==" => format!("{cmp_var} != {lit}"),
             "!=" => format!("{cmp_var} == {lit}"),

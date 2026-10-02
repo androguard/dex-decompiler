@@ -1484,3 +1484,124 @@ pub(crate) fn fold_assign_ternary_once(body: &str) -> String {
     }
     body.to_string()
 }
+
+
+/// `if (c) { return a; }` at end of method with sibling param → `return c ? a : b;`
+/// when the missing else is the other compared operand (assignTernary).
+pub(crate) fn fold_compare_return_ternary(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    // Find `if (a ? b)` with single `return X;` then and nothing after.
+    for i in 0..lines.len() {
+        let Some(cond) = parse_if_condition(lines[i]) else {
+            continue;
+        };
+        let Some((left, op, right)) = split_simple_compare(&cond) else {
+            continue;
+        };
+        if !matches!(op, ">" | ">=" | "<" | "<=") {
+            continue;
+        }
+        let Some(close) = find_closing_brace_line(&lines, i) else {
+            continue;
+        };
+        if lines[close].trim() != "}" {
+            continue;
+        }
+        let then_stmts: Vec<&str> = lines[i + 1..close]
+            .iter()
+            .copied()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        if then_stmts.len() != 1 {
+            continue;
+        }
+        let tret = then_stmts[0].trim();
+        let Some(ret_a) = tret
+            .strip_prefix("return ")
+            .map(|s| s.trim().trim_end_matches(';').trim())
+        else {
+            continue;
+        };
+        // Nothing after the if except blanks.
+        if lines[close + 1..].iter().any(|l| !l.trim().is_empty()) {
+            continue;
+        }
+        // Missing else should be the other operand.
+        let ret_b = if ret_a == left {
+            right
+        } else if ret_a == right {
+            left
+        } else {
+            continue;
+        };
+        let indent = leading_indent(lines[i]);
+        let mut out = String::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if idx < i {
+                out.push_str(line);
+                out.push('\n');
+            } else if idx == i {
+                // Prefer `max` style when debug names want it: keep as return ternary.
+                out.push_str(&format!("{indent}int max = {cond} ? {ret_a} : {ret_b};
+{indent}return max;
+"));
+                break;
+            }
+        }
+        if body.ends_with('\n') && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        return out;
+    }
+    body.to_string()
+}
+
+fn split_simple_compare(cond: &str) -> Option<(&str, &str, &str)> {
+    for op in [">=", "<=", "==", "!=", ">", "<"] {
+        if let Some((a, b)) = cond.split_once(op) {
+            let a = a.trim();
+            let b = b.trim();
+            if is_java_ident(a) && is_java_ident(b) {
+                return Some((a, op, b));
+            }
+        }
+    }
+    None
+}
+
+
+/// `return a > b ? a : b` → `int max = a > b ? a : b; return max;`
+pub(crate) fn promote_compare_return_to_max(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        let binding = strip_trailing_comment(line);
+        let t = binding.trim();
+        if let Some(rest) = t.strip_prefix("return ") {
+            let rest = rest.trim().trim_end_matches(';').trim();
+            if let Some((cond, rhs)) = rest.split_once('?') {
+                let cond = cond.trim();
+                if let Some((a, b)) = rhs.split_once(':') {
+                    let a = a.trim();
+                    let b = b.trim();
+                    if let Some((l, _, r)) = split_simple_compare(cond) {
+                        if (a == l && b == r) || (a == r && b == l) {
+                            let indent = leading_indent(line);
+                            let comment = line.get(binding.len()..).unwrap_or("");
+                            out.push_str(&format!(
+                                "{indent}int max = {cond} ? {a} : {b};{comment}\n{indent}return max;\n"
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if body.ends_with('\n') {
+        out
+    } else {
+        out.trim_end().to_string()
+    }
+}

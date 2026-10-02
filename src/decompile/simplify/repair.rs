@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::loops::parse_index_compare_bound;
 use super::util::*;
 
 /// `arr4` used before `int[] arr4` is usually a scalar temp misnamed as an array local.
@@ -585,4 +586,307 @@ pub(crate) fn repair_loop_length_index_shadow(body: &str) -> String {
     } else {
         out.trim_end().to_string()
     }
+}
+
+/// D8 reuses the loop-bound register for `key.length` / `i % key.length`.
+/// When the bound ident is reassigned in the body, rename that chain to a fresh temp.
+pub(crate) fn repair_loop_bound_reassigns(body: &str) -> String {
+    let mut out_lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
+    let mut i = 0;
+    while i < out_lines.len() {
+        let t = out_lines[i].trim().to_string();
+        let bound_opt = if t.starts_with("while (") {
+            parse_while_condition(&out_lines[i])
+                .and_then(|c| parse_index_compare_bound(&c))
+                .map(|(_, b, _)| b)
+        } else if t.starts_with("for (") {
+            t.find('(').and_then(|open| {
+                t.rfind(')').and_then(|close| {
+                    let inner = &t[open + 1..close];
+                    let parts: Vec<&str> = inner.split(';').map(str::trim).collect();
+                    if parts.len() >= 2 {
+                        parse_index_compare_bound(parts[1]).map(|(_, b, _)| b)
+                    } else {
+                        None
+                    }
+                })
+            })
+        } else {
+            None
+        };
+        let Some(bound) = bound_opt else {
+            i += 1;
+            continue;
+        };
+        if !is_java_ident(&bound) {
+            i += 1;
+            continue;
+        }
+        let line_refs: Vec<&str> = out_lines.iter().map(|s| s.as_str()).collect();
+        let Some(end) = find_closing_brace_line(&line_refs, i) else {
+            i += 1;
+            continue;
+        };
+        let reassigned = out_lines[i + 1..end].iter().any(|l| {
+            parse_simple_assign_line(l).is_some_and(|(lhs, _)| lhs == bound)
+        });
+        if !reassigned {
+            i = end + 1;
+            continue;
+        }
+        let mut n = 0u32;
+        let fresh = loop {
+            let cand = format!("{bound}_{n}");
+            if !out_lines.iter().any(|l| ident_occurs(l, &cand)) {
+                break cand;
+            }
+            n += 1;
+        };
+        for line in &mut out_lines[i + 1..end] {
+            *line = replace_ident_as_expr(line, &bound, &fresh);
+        }
+        for line in &mut out_lines[i + 1..end] {
+            let binding = strip_trailing_comment(line);
+            let stmt = binding.trim();
+            if let Some(rest) = stmt.strip_prefix(&format!("{fresh} = ")) {
+                let indent = leading_indent(line);
+                let comment = line.get(binding.len()..).unwrap_or("");
+                *line = format!("{indent}int {fresh} = {rest}{comment}");
+                break;
+            }
+            if stmt.starts_with("int ") && stmt.contains(&format!(" {fresh} = ")) {
+                break;
+            }
+        }
+        fold_length_then_rem_in_range(&mut out_lines, i + 1, end, &fresh);
+        i = end + 1;
+    }
+    let mut out = out_lines.join("\n");
+    if body.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn fold_length_then_rem_in_range(lines: &mut [String], start: usize, end: usize, var: &str) {
+    let mut i = start;
+    while i + 1 < end {
+        let Some((v1, rhs1)) = parse_simple_assign_line(&lines[i]) else {
+            i += 1;
+            continue;
+        };
+        if v1 != var || !rhs1.trim().ends_with(".length") {
+            i += 1;
+            continue;
+        }
+        let Some((v2, rhs2)) = parse_simple_assign_line(&lines[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        if v2 != var {
+            i += 1;
+            continue;
+        }
+        let compact = rhs2.replace(' ', "");
+        let suffix = format!("%{var}");
+        if let Some(idx_part) = compact.strip_suffix(suffix.as_str()) {
+            let indent = leading_indent(&lines[i]);
+            let typed = strip_trailing_comment(&lines[i])
+                .trim()
+                .starts_with("int ");
+            let lhs = if typed || lines[i].trim().starts_with("int ") {
+                format!("int {var}")
+            } else {
+                var.to_string()
+            };
+            lines[i] = format!("{indent}{lhs} = {idx_part} % {};", rhs1.trim());
+            lines[i + 1] = String::new();
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// `int k = 0; int k_0 = 0; … out[k_0++]` → use `k` (drop redundant SSA copy).
+pub(crate) fn repair_merge_k0_index(body: &str) -> String {
+    if !(body.contains("int k = 0") && body.contains("int k_0 = 0") && body.contains("k_0++")) {
+        return body.to_string();
+    }
+    let mut lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
+    lines.retain(|l| {
+        let t = strip_trailing_comment(l).trim().to_string();
+        t != "int k_0 = 0;" && t != "k_0 = 0;"
+    });
+    let joined = lines.join("\n");
+    let joined = replace_ident_as_expr(&joined, "k_0", "k");
+    if body.ends_with('\n') && !joined.ends_with('\n') {
+        format!("{joined}\n")
+    } else {
+        joined
+    }
+}
+
+
+/// `arrN = hmacSha256(...)` → `byte[] mac = hmacSha256(...)` when used as `.length` in a return sum.
+pub(crate) fn repair_hmac_result_name(body: &str) -> String {
+    if !body.contains("hmacSha256(") {
+        return body.to_string();
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let mut rename: Option<String> = None;
+    for line in &lines {
+        let binding = strip_trailing_comment(line);
+        let t = binding.trim();
+        let Some(eq) = t.find(" = ") else { continue };
+        let lhs = t[..eq].trim();
+        let rhs = t[eq + 3..].trim();
+        if !rhs.contains("hmacSha256(") {
+            continue;
+        }
+        let var = lhs.rsplit(' ').next().unwrap_or(lhs);
+        if var == "mac" || !is_java_ident(var) {
+            continue;
+        }
+        if var.starts_with("arr") || !lhs.contains(' ') {
+            rename = Some(var.to_string());
+            break;
+        }
+    }
+    let Some(old) = rename else {
+        return body.to_string();
+    };
+    if !body.contains(&format!("{old}.length")) {
+        return body.to_string();
+    }
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let binding = strip_trailing_comment(line);
+        let t = binding.trim();
+        let mut current = line.to_string();
+        if let Some(eq) = t.find(" = ") {
+            let lhs = t[..eq].trim();
+            let rhs = t[eq + 3..].trim();
+            if rhs.contains("hmacSha256(") {
+                let var = lhs.rsplit(' ').next().unwrap_or(lhs);
+                if var == old {
+                    let indent = leading_indent(line);
+                    let comment = line.get(binding.len()..).unwrap_or("");
+                    current = format!("{indent}byte[] mac = {rhs}{comment}");
+                }
+            }
+        }
+        if current == *line {
+            current = replace_ident_as_expr(&current, &old, "mac");
+        }
+        out.push_str(&current);
+        if idx + 1 < lines.len() || body.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !body.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Sole `length_N = arr.length` used as quickSort bound → `length`.
+pub(crate) fn repair_sole_length_ssa(body: &str) -> String {
+    if body
+        .lines()
+        .any(|l| strip_trailing_comment(l).trim().starts_with("int length ="))
+    {
+        return body.to_string();
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    for line in body.lines() {
+        if let Some((var, rhs)) = parse_simple_assign_line(line) {
+            if var.starts_with("length_") && rhs.trim().ends_with(".length") {
+                candidates.push(var);
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    if candidates.len() != 1 {
+        return body.to_string();
+    }
+    let old = &candidates[0];
+    if !body.contains("quickSort(") && !body.contains(&format!("{old} - 1")) {
+        return body.to_string();
+    }
+    let mut out = replace_ident_as_expr(body, old, "length");
+    if body.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// `int[] arrN = new int[]{…}; arrN = mergeSort(arrN);` → `int[] sorted = mergeSort(new int[]{…});`
+pub(crate) fn repair_mergesort_sorted_arg(body: &str) -> String {
+    if !body.contains("mergeSort(") {
+        return body.to_string();
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    for i in 0..lines.len().saturating_sub(1) {
+        let Some((var, rhs)) = parse_simple_assign_line(lines[i]) else {
+            continue;
+        };
+        if !rhs.trim().starts_with("new int[]") {
+            continue;
+        }
+        let binding = strip_trailing_comment(lines[i]);
+        let t = binding.trim();
+        if !t.contains("int[] ") {
+            continue;
+        }
+        let next_binding = strip_trailing_comment(lines[i + 1]);
+        let nt = next_binding.trim();
+        let assign = format!("{var} = ");
+        let Some(rest) = nt.strip_prefix(&assign) else {
+            continue;
+        };
+        let call = rest.trim().trim_end_matches(';').trim();
+        let prefix = "mergeSort(";
+        // Accept FQN or simple mergeSort
+        let args_start = match call.rfind(prefix) {
+            Some(p) => p + prefix.len(),
+            None => continue,
+        };
+        if !call.ends_with(')') {
+            continue;
+        }
+        let args = &call[args_start..call.len() - 1];
+        if args.trim() != var {
+            continue;
+        }
+        let indent = leading_indent(lines[i]);
+        let call_prefix = &call[..args_start];
+        let new_line = format!("{indent}int[] sorted = {call_prefix}{rhs});");
+        let mut out = String::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if idx == i {
+                out.push_str(&new_line);
+                out.push('\n');
+                continue;
+            }
+            if idx == i + 1 {
+                continue;
+            }
+            let mut cur = line.to_string();
+            // Later uses of arrN.length etc. after reassignment → sorted
+            if idx > i + 1 {
+                cur = replace_ident_as_expr(&cur, &var, "sorted");
+            }
+            out.push_str(&cur);
+            if idx + 1 < lines.len() || body.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        if !body.ends_with('\n') && out.ends_with('\n') {
+            out.pop();
+        }
+        return out;
+    }
+    body.to_string()
 }

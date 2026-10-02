@@ -569,6 +569,10 @@ pub(crate) fn is_simple_field_path(s: &str) -> bool {
     if s.ends_with(".class") {
         return false;
     }
+    // Array/string `.length` is not a static field like `System.out`.
+    if s.ends_with(".length") {
+        return false;
+    }
     s.split('.').all(|p| !p.is_empty() && is_java_ident(p))
 }
 
@@ -580,6 +584,8 @@ pub(crate) fn is_temp_like_name(var: &str) -> bool {
     if var.is_empty() {
         return false;
     }
+    // Keep `result` / `length` as meaningful locals (jadx shrink, quickSort bounds).
+    // Debug-name overlay for synthetic roles is handled in `type_infer`, not here.
     // Array-index temps from SemanticRole::Index (often hold a literal 0/1).
     if matches!(var, "i" | "j" | "k") {
         return true;
@@ -1412,6 +1418,10 @@ pub(crate) fn is_index_increment(line: &str, i: &str) -> bool {
         || t == format!("{} = {} + 1;", i, i)
         || t == format!("{} += 1;", i)
     {
+        return true;
+    }
+    // `out[k++] = …` / `arr[i++]` — postincrement embedded in an expression.
+    if t.contains(&format!("{i}++")) || t.contains(&format!("++{i}")) {
         return true;
     }
     if let Some((var, rhs)) = parse_simple_assign_line(line) {

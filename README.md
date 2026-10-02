@@ -200,6 +200,21 @@ let java = Decompiler::with_options(
 .decompile()?;
 ```
 
+## Testing / CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and PR:
+
+```bash
+cargo check --locked --all-targets
+cargo test --locked --all-targets
+cargo test --locked --test decompiler_tests   # fixture + source/type fidelity
+cargo build --locked --release --bin dex-decompile
+```
+
+`type_fidelity` prefers a local AndroguardTest APK when present, otherwise uses in-repo `testdata/classes4.dex` so CI does not need a sibling androguard checkout. Override with `ANDROGUARD_TEST_APK=/path/to/app-debug.apk`.
+
+`--locked` requires a committed `Cargo.lock` at the repo root (CI will fail if it is missing or stale).
+
 ## Benchmark vs Droid ASC
 
 Compare our CLI, Python bindings, and upstream [droidasc](https://github.com/MG1937/ASC):
@@ -208,6 +223,35 @@ Compare our CLI, Python bindings, and upstream [droidasc](https://github.com/MG1
 cargo build --release --bin dex-decompile
 python3 scripts/bench_asc_compare.py --install-asc --install-py
 ```
+
+## Benchmark vs jadx
+
+Compare full-tree and single-class decompile speed / RSS / output size against [jadx](https://github.com/skylot/jadx) (`--no-res` for a fair Java-only compare):
+
+```bash
+cargo build --release --bin dex-decompile
+
+# Default: small fixture DEX (fast)
+python3 scripts/bench_decompiler_compare.py --install-jadx
+
+# Larger APK — prefer single-class (full tree can take minutes)
+python3 scripts/bench_decompiler_compare.py --install-jadx \
+  --input testdata/bugbazaar/bugbazaar.apk \
+  --class com.google.firebase.FirebaseApp \
+  --workloads single-class \
+  --runs 3 --json-out /tmp/decomp_bench.json
+```
+
+`--install-jadx` downloads jadx into `scripts/.cache/jadx_bench/` when it is not on `PATH`. Set `JAVA_HOME` (or install Android Studio’s JBR) so jadx can run. Pin jadx parallelism with `JADX_THREADS=1` for less noisy timings.
+
+Example on `testdata/androguard_test_classes.dex` (release, 3 runs):
+
+| workload | dex-decompile | jadx | ours/jadx |
+|----------|---------------|------|-----------|
+| full | ~420 ms | ~1.0 s | **~0.42×** (~2.4× faster here) |
+| single-class | ~8 ms | ~520 ms | **~0.02×** (~65× faster here) |
+| RSS full | ~40 MiB | ~460 MiB | |
+| RSS single-class | ~9 MiB | ~265 MiB | |
 
 ## Dependencies
 

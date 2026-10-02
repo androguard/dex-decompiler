@@ -19,11 +19,14 @@ use super::util::*;
 pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     let body = restore_synchronized_from_monitors(body);
     let body = fold_running_arithmetic(&body);
+    let body = repair_self_ref_postinc_div(&body);
     let body = fold_postinc_division(&body);
     let body = fold_const_break_into_while(&body);
     let body = rewrite_nonreturning_while(&body);
     let body = fold_array_length_assigns(&body);
     let body = fold_array_alloc_length_sum(&body);
+    let body = fold_array_alloc_length_sum_via_temp(&body);
+    let body = repair_merge_index_inits(&body);
     let body = fold_length_sum_return(&body);
     let lines: Vec<String> = body.lines().map(String::from).collect();
     if lines.len() < 2 {
@@ -222,6 +225,14 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
                     };
                     let parts_inlined: Vec<String> =
                         parts.iter().map(|p| inline_const(p)).collect();
+                    // Keep literal-only chains as StringBuilder (source fidelity / builderChain).
+                    let all_string_lits = parts_inlined.iter().all(|p| {
+                        let t = p.trim();
+                        t.starts_with('"') && t.ends_with('"')
+                    });
+                    if all_string_lits {
+                        // fall through to emit original lines
+                    } else {
                     let concat = parts_inlined.join(" + ");
 
                     if dest == "return" {
@@ -255,6 +266,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
                     writeln!(out, "{}{} = {};", indent, dest, concat).ok();
                     i = j + 1;
                     continue;
+                    }
                 }
             }
             if j > chain_start + 1 {
@@ -275,6 +287,8 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = out.replace(" + -", " - ");
     // Fold assign ternary before dead-assign cleanup removes unused x=a / x=b arms.
     out = fold_assign_ternary(&out);
+    out = fold_compare_return_ternary(&out);
+    out = promote_compare_return_to_max(&out);
     // Inline "var = System.out;" → replace var.println(x) with System.out.println(x) and remove the assignment.
     out = inline_static_field_refs(&out);
     // Restore for-each before dead-code cleanup drops loop-bound length temps (e.g. length_0 = row.length).
@@ -283,11 +297,14 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = restore_foreach_iterator(&out);
     out = restore_foreach_array(&out);
     out = restore_counting_for_loop(&out);
+    out = hoist_loop_bound_length_decl(&out);
+    out = repair_missing_loop_else_break(&out);
     // Remove bare "var; /* move-exception */" lines and inline single-use temps (consts / simple copies).
     out = inline_global_literal_temps(&out);
     out = repair_self_sized_new_array(&out);
     out = repair_register_reuse_scalars(&out);
     out = repair_loop_length_index_shadow(&out);
+    out = repair_loop_bound_reassigns(&out);
     out = restore_array_store_postincrement(&out);
     out = restore_d8_merge_copy_loops(&out);
     // Fold instanceof into `if` before cleanup drops unused `z0 = x instanceof T`.
@@ -329,6 +346,9 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = restore_do_while_text(&out);
     // `$SwitchMap$[e.ordinal()]` / `e.ordinal()` → `switch (e)`
     out = restore_enum_switchmap(&out);
+    out = repair_hmac_result_name(&out);
+    out = repair_sole_length_ssa(&out);
+    out = repair_mergesort_sorted_arg(&out);
     // try + finally-close → try-with-resources
     out = restore_try_with_resources(&out);
     // `(T) new T(...)` / `(T)(T)x` strip
@@ -357,6 +377,8 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     // Cleanup may simplify array-index temps after the first loop-restore pass.
     out = restore_while_true_nested_for(&out);
     out = restore_counting_for_loop(&out);
+    out = hoist_loop_bound_length_decl(&out);
+    out = repair_missing_loop_else_break(&out);
     out = repair_register_reuse_scalars(&out);
     // Only in constructors: simplify "receiver.<init>();" (no args) to "super();".
     if is_constructor {
@@ -391,6 +413,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = normalize_java_indent(&out);
     out = repair_register_reuse_scalars(&out);
     out = repair_loop_length_index_shadow(&out);
+    out = repair_loop_bound_reassigns(&out);
     out = restore_array_store_postincrement(&out);
     out = restore_d8_merge_copy_loops(&out);
     out = cleanup_decompiler_artifacts(&out);

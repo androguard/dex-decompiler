@@ -58,6 +58,31 @@ pub fn region_is_empty_with_cfg(region: &Region, cfg: &MethodCfg) -> bool {
     }
 }
 
+/// True when the region is only a `goto` to the loop's break target (should emit `break;`).
+pub fn region_is_loop_break(
+    region: &Region,
+    cfg: &MethodCfg,
+    break_target: Option<BlockId>,
+) -> bool {
+    let Some(bt) = break_target else {
+        return false;
+    };
+    match region {
+        Region::Block(bid) => matches!(
+            &cfg.blocks.get(*bid).map(|b| &b.end),
+            Some(BlockEnd::Goto(t)) if *t == bt
+        ),
+        Region::Seq(children) => {
+            let nonempty: Vec<_> = children
+                .iter()
+                .filter(|c| !region_is_empty(c))
+                .collect();
+            nonempty.len() == 1 && region_is_loop_break(nonempty[0], cfg, break_target)
+        }
+        _ => false,
+    }
+}
+
 /// True when a CFG block has no real work: no instructions, or only the terminating goto.
 fn block_is_effectively_empty(b: &crate::decompile::cfg::CfgBlock) -> bool {
     if b.instruction_offsets.is_empty() {
@@ -1111,6 +1136,11 @@ fn build_regions_rec(
             if allowed.map(|a| !a.contains(t)).unwrap_or(false) {
                 return Some(block_region);
             }
+            // Shared join already claimed by the sibling arm (assignTernary diamond):
+            // keep this block; do not fail the whole arm with `?`.
+            if emitted.contains(t) {
+                return Some(block_region);
+            }
             let next = build_regions_rec(cfg, *t, loop_header, emitted, allowed)?;
             Some(Region::Seq(vec![block_region, next]))
         }
@@ -1169,7 +1199,21 @@ fn build_regions_rec(
                     allowed,
                 )
                 .unwrap_or_else(|| Region::Seq(vec![]));
-                let then_r = Region::Seq(vec![]);
+                // skip_join: taken branch *is* the join (empty then). Otherwise the taken
+                // arm still has real work (assignTernary's `max = b`) before the join.
+                let then_r = if skip_join || *branch_target == join_id {
+                    Region::Seq(vec![])
+                } else {
+                    build_regions_rec_until(
+                        cfg,
+                        *branch_target,
+                        &stop_at,
+                        loop_header,
+                        emitted,
+                        allowed,
+                    )
+                    .unwrap_or_else(|| Region::Seq(vec![]))
+                };
                 // Emit the join block alone. Do NOT follow its goto/fall-through here —
                 // those successors belong to the enclosing region (e.g. the next else-if arm).
                 // Following the join was stealing later arms and leaving this if's body empty.

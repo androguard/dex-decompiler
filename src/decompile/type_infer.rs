@@ -71,36 +71,28 @@ pub fn infer_types(
     code: &CodeItem,
     stmts: &[IrStmt],
 ) -> HashMap<VarId, String> {
+    let field_types = FieldTypeIndex::build(dex);
+    let return_index = MethodReturnIndex::build(dex);
+    infer_types_cached(dex, encoded, code, stmts, &field_types, &return_index)
+}
+
+/// Same as [`infer_types`], but reuses prebuilt field / method-return indexes
+/// (avoids O(fields + methods) rebuild on every CFG block).
+pub(crate) fn infer_types_cached(
+    dex: &DexFile,
+    encoded: &EncodedMethod,
+    code: &CodeItem,
+    stmts: &[IrStmt],
+    field_types: &FieldTypeIndex,
+    return_index: &MethodReturnIndex,
+) -> HashMap<VarId, String> {
     let mut types: HashMap<VarId, String> = HashMap::new();
     let info = match dex.get_method_info(encoded.method_idx) {
         Ok(i) => i,
         Err(_) => return types,
     };
     let find_method_return_type_java = |target: &str, num_args: usize| -> Option<String> {
-        if let Some(t) = known_api_return_type(target) {
-            return Some(t.to_string());
-        }
-        let n = dex.header.method_ids_size as usize;
-        for idx in 0..n {
-            if let Ok(mi) = dex.get_method_info(idx as u32) {
-                let key = format!("{}.{}", java::descriptor_to_java(&mi.class), mi.name);
-                if key == target && mi.params.len() == num_args {
-                    return Some(java::descriptor_to_java(&mi.return_type));
-                }
-            }
-        }
-        // Receiver-style targets (`v0.equals`, `java.lang.String.endsWith`) when the
-        // declaring class isn't fully resolved from this DEX's method_ids alone.
-        if let Some(dot) = target.rfind('.') {
-            let method = &target[dot + 1..];
-            if let Some(t) = known_api_return_type(method) {
-                return Some(t.to_string());
-            }
-            if let Some(t) = known_api_return_type(&format!("java.lang.String.{}", method)) {
-                return Some(t.to_string());
-            }
-        }
-        None
+        return_index.lookup(target, num_args)
     };
     let ins_size = code.ins_size as u32;
     let registers_size = code.registers_size as u32;
@@ -112,7 +104,6 @@ pub fn infer_types(
         .map(|p| java::descriptor_to_java(p))
         .collect();
     let return_type_java = java::descriptor_to_java(&info.return_type);
-    let field_types = FieldTypeIndex::build(dex);
 
     // Seed param registers (version 0) at the high end of the Dalvik frame.
     let param_base = registers_size.saturating_sub(ins_size);
@@ -204,7 +195,7 @@ pub fn infer_types(
                             None
                         })
                     }
-                    IrExpr::Raw(s) => infer_typed_raw(dex, &field_types, s, &types),
+                    IrExpr::Raw(s) => infer_typed_raw(dex, field_types, s, &types),
                     IrExpr::PendingResult => None,
                 };
                 if let Some(t) = ty {
@@ -218,6 +209,58 @@ pub fn infer_types(
         }
     }
     types
+}
+
+/// Fast lookup of invoke return types: `Class.method` → [(arity, java_type), …].
+pub(crate) struct MethodReturnIndex {
+    by_key: HashMap<String, Vec<(usize, String)>>,
+}
+
+impl MethodReturnIndex {
+    pub(crate) fn build(dex: &DexFile) -> Self {
+        let mut by_key: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+        let n = dex.header.method_ids_size;
+        for idx in 0..n {
+            let Ok(mi) = dex.get_method_info(idx) else {
+                continue;
+            };
+            let key = format!("{}.{}", java::descriptor_to_java(&mi.class), mi.name);
+            let ret = java::descriptor_to_java(&mi.return_type);
+            by_key
+                .entry(key)
+                .or_default()
+                .push((mi.params.len(), ret));
+        }
+        Self { by_key }
+    }
+
+    fn lookup(&self, target: &str, num_args: usize) -> Option<String> {
+        if let Some(t) = known_api_return_type(target) {
+            return Some(t.to_string());
+        }
+        if let Some(entries) = self.by_key.get(target) {
+            if let Some((_, ty)) = entries.iter().find(|(n, _)| *n == num_args) {
+                return Some(ty.clone());
+            }
+        }
+        // Receiver-style targets (`v0.equals`, `java.lang.String.endsWith`).
+        if let Some(dot) = target.rfind('.') {
+            let method = &target[dot + 1..];
+            if let Some(t) = known_api_return_type(method) {
+                return Some(t.to_string());
+            }
+            if let Some(t) = known_api_return_type(&format!("java.lang.String.{method}")) {
+                return Some(t.to_string());
+            }
+            let fq = format!("java.lang.String.{method}");
+            if let Some(entries) = self.by_key.get(&fq) {
+                if let Some((_, ty)) = entries.iter().find(|(n, _)| *n == num_args) {
+                    return Some(ty.clone());
+                }
+            }
+        }
+        None
+    }
 }
 
 fn looks_like_wide_bits_literal(s: &str) -> bool {
@@ -260,6 +303,26 @@ pub fn enrich_types_with_register_map_and_debug(
     stmts: &[IrStmt],
 ) {
     let field_types = FieldTypeIndex::build(dex);
+    enrich_types_with_field_index(
+        dex,
+        type_map,
+        reg_types,
+        debug_types,
+        stmts,
+        &field_types,
+    );
+}
+
+/// Same as [`enrich_types_with_register_map_and_debug`], but reuses a cached field index
+/// (avoids rebuilding owner→field→type for every CFG block).
+pub(crate) fn enrich_types_with_field_index(
+    dex: &DexFile,
+    type_map: &mut HashMap<VarId, String>,
+    reg_types: &HashMap<u32, String>,
+    debug_types: Option<&HashMap<u32, String>>,
+    stmts: &[IrStmt],
+    field_types: &FieldTypeIndex,
+) {
     for stmt in stmts {
         if let IrStmt::Assign { dst, rhs, .. } = stmt {
             if let Some(dbg) = debug_types.and_then(|m| m.get(&dst.reg)) {
@@ -292,7 +355,7 @@ pub fn enrich_types_with_register_map_and_debug(
             }
             if !type_map.contains_key(dst) {
                 if let IrExpr::Raw(r) = rhs {
-                    if let Some(ty) = infer_typed_raw(dex, &field_types, r, type_map) {
+                    if let Some(ty) = infer_typed_raw(dex, field_types, r, type_map) {
                         type_map.insert(*dst, ty);
                     }
                 }
@@ -334,7 +397,7 @@ pub fn enrich_types_with_register_map_and_debug(
                 }
                 let ty = match rhs {
                     IrExpr::Var(v) => type_map.get(v).cloned(),
-                    IrExpr::Raw(s) => infer_typed_raw(dex, &field_types, s, type_map),
+                    IrExpr::Raw(s) => infer_typed_raw(dex, field_types, s, type_map),
                     IrExpr::Call { .. } | IrExpr::PendingResult => None,
                 };
                 if let Some(t) = ty {
@@ -369,12 +432,12 @@ fn vars_in_stmt(stmt: &IrStmt) -> Vec<VarId> {
 }
 
 /// owner Java name → field name → Java type.
-struct FieldTypeIndex {
+pub(crate) struct FieldTypeIndex {
     by_owner: HashMap<String, HashMap<String, String>>,
 }
 
 impl FieldTypeIndex {
-    fn build(dex: &DexFile) -> Self {
+    pub(crate) fn build(dex: &DexFile) -> Self {
         let mut by_owner: HashMap<String, HashMap<String, String>> = HashMap::new();
         let n = dex.header.field_ids_size;
         for idx in 0..n {
@@ -960,9 +1023,12 @@ fn unify_names_by_register(names: &mut HashMap<VarId, String>, type_map: &HashMa
             }
             // `const/16 v0, 1002` then `array-length v0, arr` share a register and `int`
             // type. Do not collapse the constant onto the name `length`.
+            // Also keep rem/index SSA versions from inheriting a `.length` name.
             let na = names.get(&a).map(|s| s.as_str()).unwrap_or("");
             let nb = names.get(&b).map(|s| s.as_str()).unwrap_or("");
-            if (na == "length") != (nb == "length") {
+            let a_len = na == "length" || na.starts_with("length_");
+            let b_len = nb == "length" || nb.starts_with("length_");
+            if a_len != b_len {
                 continue;
             }
             union(&mut parent, a, b);
@@ -1054,8 +1120,12 @@ pub(crate) fn preferred_debug_type_for_reg<'a>(
 
 fn name_quality(name: &str, typ: Option<&str>) -> i32 {
     let mut score = 3;
-    if name == "this" || name == "result" || name == "length" {
+    if name == "this" {
         return 20;
+    }
+    // Role names lose to debug locals (`sum`/`max`/`out`/`n`) after overlay.
+    if name == "result" || name == "length" {
+        return 5;
     }
     if name == "i" || name == "j" || name == "k" {
         return 12;
@@ -1156,7 +1226,19 @@ fn name_for_var(
                 *index_counter = index_counter.saturating_add(1);
                 return names[idx].to_string();
             }
-            SemanticRole::Length => return "length".to_string(),
+            SemanticRole::Length => {
+                // D8 often reuses distinct registers for successive array-length
+                // temps; give each a unique display name so `data.length` and
+                // `key.length` do not collapse to one `length` variable.
+                let c = counters.entry("length").or_insert(0);
+                let name = if *c == 0 {
+                    "length".to_string()
+                } else {
+                    format!("length_{}", *c)
+                };
+                *c += 1;
+                return name;
+            }
             SemanticRole::Array => {
                 let c = counters.entry("arr").or_insert(0);
                 let name = format!("arr{}", *c);

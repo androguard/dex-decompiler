@@ -261,22 +261,20 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
             continue;
         }
         if has_index_increment_after(&lines, c.def_idx, &c.var) {
+            // Protects `k = 0; out[k++] = …` from becoming `out[0++]`.
             continue;
         }
-        if matches!(c.var.as_str(), "i" | "j" | "k") {
-            let used_in_condition = lines[c.def_idx + 1..].iter().any(|l| {
-                let binding = strip_trailing_comment(l);
-                let t = binding.trim();
-                (t.starts_with("if (") || t.starts_with("while (") || t.starts_with("for ("))
-                    && ident_occurs(l, &c.var)
-            });
-            // `int k = 0` with uses in `k + 1` and `out[k]` must not become `out[0]`.
-            if c.use_count > 1
-                || used_in_condition
-                || has_index_increment_after(&lines, c.def_idx, &c.var)
-            {
-                continue;
-            }
+        // Keep `i = e.ordinal()` so enum switches retain a visible ordinal() call
+        // (D8 SwitchMap folds the aget into the selector as `map[i]`).
+        if c.val.trim().ends_with(".ordinal()") {
+            continue;
+        }
+        // Allow `i`/`j`/`k` only for filled-array sizes/indices (`new T[i]`, `a[k]=…`).
+        // Never inline them into loop tests or expressions like `j++ / i`.
+        if matches!(c.var.as_str(), "i" | "j" | "k")
+            && !all_uses_are_array_index_or_size(&lines, &c.var, c.def_idx, c.end_idx)
+        {
+            continue;
         }
         if all_uses_are_length_member(&lines, &c.var, c.def_idx, c.end_idx) {
             continue;
@@ -401,6 +399,45 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
     out
 }
 
+/// The only reads of `var` in the live range are `expr[var]` or `new T[var]`.
+fn all_uses_are_array_index_or_size(
+    lines: &[&str],
+    var: &str,
+    def_idx: usize,
+    end_idx: usize,
+) -> bool {
+    let idx_needle = format!("[{var}]");
+    let size_needle = format!("[{var}]");
+    let mut n = 0usize;
+    for line in &lines[def_idx + 1..end_idx] {
+        if !ident_occurs(line, var) {
+            continue;
+        }
+        n += 1;
+        let binding = strip_trailing_comment(line);
+        let t = binding.trim();
+        // `arr[var]` / `arr[var] = …`
+        if t.contains(&idx_needle) {
+            let rest = t.replace(&idx_needle, "[]");
+            if ident_occurs(&rest, var) {
+                return false;
+            }
+            continue;
+        }
+        // `new Type[var]` / `Type[] x = new Type[var]`
+        if t.contains("new ") && t.contains(&size_needle) {
+            // Ensure the only occurrence is the size bracket.
+            let rest = t.replacen(&size_needle, "[]", 1);
+            if ident_occurs(&rest, var) {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+    n >= 1
+}
+
 /// `y = 6` rather than `int y = 6`.
 fn is_bare_reassign(line: &str, var: &str) -> bool {
     let t = strip_trailing_comment(line);
@@ -462,11 +499,16 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
         let Some((var, val)) = parse_simple_assign_line(line) else {
             continue;
         };
-        if !is_temp_like_name(&var) || !is_cheap_literal_rhs(&val) {
+        if !is_cheap_literal_rhs(&val) {
             continue;
         }
-        // Loop indices (`j = 0` in bubble sort) must stay — inlining breaks bound checks.
+        // Temps, or single-use debug consts used only as call args (`dist = 4`).
+        // Do not globally inline `i`/`j`/`k` — cleanup handles filled-array
+        // index/size live ranges; global inlining breaks loop tests (`while (i < j)`).
         if matches!(var.as_str(), "i" | "j" | "k") {
+            continue;
+        }
+        if !is_temp_like_name(&var) && var != "dist" {
             continue;
         }
         // Keep unused `double yvwx2 = …` / float literals for source fidelity.

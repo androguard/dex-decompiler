@@ -95,6 +95,7 @@ pub fn restore_string_switch(body: &str) -> String {
         }
         i += 1;
     }
+    collapse_string_switch_dispatch(&mut lines);
     // Drop blank lines left by guard removal (preserve indent structure lightly).
     let mut cleaned = Vec::with_capacity(lines.len());
     for (idx, line) in lines.iter().enumerate() {
@@ -162,9 +163,25 @@ pub(crate) fn clear_string_equals_guards(lines: &mut [String], start: usize, exp
             || (tk.contains(".equals(")
                 && (tk.contains(expr) || tk.contains(&format!("\"{expr}"))));
         if is_guard && tk.starts_with("if (") {
+            // Removing `if (s.equals(...)) {` must also drop its matching `}`,
+            // otherwise depth tracking ends the outer switch early.
+            let close = if tk.contains('{') {
+                let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+                find_closing_brace_line(&refs, k)
+            } else {
+                None
+            };
             lines[k] = String::new();
             if k + 1 < lines.len() && lines[k + 1].trim() == "break;" {
                 lines[k + 1] = String::new();
+            }
+            if let Some(close) = close {
+                if lines[close].trim() == "}" {
+                    lines[close] = String::new();
+                }
+                // Brace pair removed as a unit — do not perturb nest.
+                k += 1;
+                continue;
             }
         } else if tk == "break;"
             && lines
@@ -192,6 +209,79 @@ pub fn java_string_hash_code(s: &str) -> i32 {
         h = h.wrapping_mul(31).wrapping_add(c as i32);
     }
     h
+}
+
+
+
+/// Remove packed-switch dispatch junk: `switch (1) { case 0: case 1: … default: break; }`
+/// left after string-hash lowering, and clear leftover `z0 = s.equals(...)` assigns.
+fn collapse_string_switch_dispatch(lines: &mut Vec<String>) {
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        // Single-line junk: `switch (1) { case 0: case 1: default: break; }`
+        if let Some(rest) = t.strip_prefix("switch (") {
+            if let Some(brace) = rest.find(") {") {
+                let inner = rest[..brace].trim();
+                let is_disc = inner == "1" || inner == "0" || inner.chars().all(|c| c.is_ascii_digit());
+                if is_disc && t.contains('}') && t[t.find('{').unwrap_or(0)..].contains("case") {
+                    let after_brace = t.split('{').nth(1).unwrap_or("");
+                    let only_labels = after_brace.split_whitespace().all(|w| {
+                        w == "}"
+                            || w == "break;"
+                            || w == "break"
+                            || w == "default:"
+                            || w.starts_with("case")
+                            || w.ends_with(':')
+                    });
+                    // Multi-statement body would have `;` that isn't `break;`
+                    let has_real_stmt = after_brace.contains('=') || after_brace.contains("return");
+                    if only_labels && !has_real_stmt {
+                        lines[i] = String::new();
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Some(inner) = t
+            .strip_prefix("switch (")
+            .and_then(|s| s.strip_suffix(") {"))
+        {
+            let inner = inner.trim();
+            if inner == "1" || inner == "0" {
+                let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+                if let Some(close) = find_closing_brace_line(&refs, i) {
+                    let body = lines[i + 1..close]
+                        .iter()
+                        .map(|l| l.trim())
+                        .filter(|l| !l.is_empty())
+                        .collect::<Vec<_>>();
+                    let only_labels = body.iter().all(|l| {
+                        l.starts_with("case ")
+                            || *l == "default:"
+                            || *l == "break;"
+                            || *l == "break"
+                            || *l == "}"
+                    });
+                    if only_labels {
+                        for line in &mut lines[i..=close] {
+                            *line = String::new();
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Clear leftover equals assigns that only fed the packed-switch discriminant.
+        if let Some((lhs, rhs)) = parse_simple_assign_line(&lines[i]) {
+            if is_temp_like_name(&lhs) && rhs.contains(".equals(") {
+                lines[i] = String::new();
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Extract string literal from `recv.equals("…")` or `"…".equals(recv)` (optional `!` / `if`).

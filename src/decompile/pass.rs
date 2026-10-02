@@ -255,7 +255,9 @@ impl Pass for DeadAssignPass {
                     return false;
                 }
                 if let IrStmt::Assign { dst, rhs, .. } = s {
-                    if matches!(rhs, IrExpr::Raw(r) if is_numeric_const_rhs(r)) {
+                    // Keep unused float/double/long literals for source fidelity
+                    // (debug locals). Plain int consts stay subject to SSA liveness.
+                    if matches!(rhs, IrExpr::Raw(r) if is_fp_or_wide_const_rhs(r)) {
                         return true;
                     }
                     used.contains(dst)
@@ -313,6 +315,28 @@ fn is_numeric_const_rhs(rhs: &str) -> bool {
         return s[2..].chars().all(|c| c.is_ascii_hexdigit());
     }
     s.parse::<i64>().is_ok()
+}
+
+/// Float / double / long literals only — used by SSA dead-assign so unused
+/// `int` consts can still be dropped while source-fidelity wide/fp locals stay.
+fn is_fp_or_wide_const_rhs(rhs: &str) -> bool {
+    let s = rhs.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if s.ends_with('f') || s.ends_with('F') {
+        return s[..s.len() - 1].parse::<f32>().is_ok();
+    }
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        return s.parse::<f64>().is_ok();
+    }
+    if let Some(rest) = s.strip_suffix('L').or_else(|| s.strip_suffix('l')) {
+        if rest.starts_with("0x") || rest.starts_with("0X") {
+            return rest[2..].chars().all(|c| c.is_ascii_hexdigit());
+        }
+        return rest.parse::<i64>().is_ok();
+    }
+    false
 }
 
 /// Collect all register numbers that are read (used) in the IR.
