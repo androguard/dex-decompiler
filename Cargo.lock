@@ -444,6 +444,7 @@ dependencies = [
 [[package]]
 name = "dex-parser"
 version = "0.1.0"
+source = "git+https://github.com/androguard/dex-parser?branch=main#e4c7cfb5f4eb52fb685abb4cebd4ec1693a1d6ad"
 dependencies = [
  "clap",
  "dex-bytecode",
