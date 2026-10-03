@@ -1177,12 +1177,44 @@ impl<'a> Decompiler<'a> {
                     if accessors::should_skip_method_emit(&info.name, m.access_flags) {
                         continue;
                     }
+                    if kotlin::should_hide_kotlin_method(&info.name, &kt) {
+                        continue;
+                    }
                 }
                 methods_java.push(self.decompile_method(
                     m,
                     Some(&simple_class_name),
                     Some(&class_name),
                 )?);
+            }
+            // Jadx kotlin-metadata: Km property names (or data-class toString) → field aliases.
+            let mut prop_names = kt.property_names.clone();
+            if prop_names.is_empty() && kt.is_data {
+                for mj in &methods_java {
+                    if mj.contains(" toString(") || mj.contains("String toString(") {
+                        let parsed = kotlin::parse_data_class_tostring_props(mj);
+                        if !parsed.is_empty() {
+                            prop_names = parsed;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !prop_names.is_empty() {
+                let field_name_list: Vec<String> =
+                    instance_fields.iter().map(|(_, _, n)| n.clone()).collect();
+                let field_renames =
+                    kotlin::suggest_property_field_renames(&field_name_list, &prop_names);
+                if !field_renames.is_empty() {
+                    for (_, _, name) in &mut instance_fields {
+                        if let Some((_, new)) = field_renames.iter().find(|(o, _)| o == name) {
+                            *name = new.clone();
+                        }
+                    }
+                    for mj in &mut methods_java {
+                        *mj = kotlin::apply_field_alias_renames(mj, &field_renames);
+                    }
+                }
             }
             let field_names: HashSet<String> = instance_fields
                 .iter()

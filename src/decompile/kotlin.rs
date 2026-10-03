@@ -1076,11 +1076,14 @@ pub fn restore_coroutine_invoke_suspend(body: &str) -> String {
 
 /// Strip / rewrite common Kotlin → Java boilerplate toward more idiomatic Java.
 pub fn restore_kotlin_idioms(body: &str) -> String {
-    let mut cleaned = body.to_string();
+    // Jadx ProcessKotlinInternals: harvest names from Intrinsics.* before stripping.
+    let mut cleaned = apply_intrinsics_var_names(body);
 
     // Null-check intrinsics are noise in Java restores.
+    // Use [ \t]* (not \s*) after `;` so we don't swallow the next line's indent
+    // and prevent a second `(?m)^` match.
     let null_check_re = Regex::new(
-        r#"(?m)^\s*kotlin\.jvm\.internal\.Intrinsics\.(?:checkNotNullParameter|checkNotNullExpressionValue|checkParameterIsNotNull|checkExpressionValueIsNotNull)\([^;]*\);\s*\n?"#,
+        r#"(?m)^[ \t]*(?:kotlin\.jvm\.internal\.)?Intrinsics\.(?:checkNotNullParameter|checkNotNullExpressionValue|checkParameterIsNotNull|checkExpressionValueIsNotNull|checkNotNull)\s*\([^;]*\);[ \t]*\n?"#,
     );
     if let Ok(re) = null_check_re {
         cleaned = re.replace_all(&cleaned, "").into_owned();
@@ -1093,6 +1096,8 @@ pub fn restore_kotlin_idioms(body: &str) -> String {
         "kotlin.jvm.internal.Intrinsics.throwJavaNpe()",
         "throw new NullPointerException()",
     );
+    cleaned = cleaned.replace("Intrinsics.throwNpe()", "throw new NullPointerException()");
+    cleaned = cleaned.replace("Intrinsics.throwJavaNpe()", "throw new NullPointerException()");
 
     // Companion.INSTANCE.foo → Companion.foo (common R8/Kotlin emit).
     let companion_re = Regex::new(r"([A-Za-z0-9_$.]+)\.Companion\.INSTANCE\.");
@@ -1118,6 +1123,209 @@ pub fn restore_kotlin_idioms(body: &str) -> String {
     cleaned = cleaned.replace("kotlin.Unit.INSTANCE", "/* Unit */ null");
 
     cleaned
+}
+
+/// Trim Kotlin Intrinsics name markers (`$this$foo` → `foo`, `$bar` → `bar`).
+pub fn trim_kotlin_intrinsics_name(s: &str) -> String {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("$this$") {
+        return rest.to_string();
+    }
+    if let Some(rest) = s.strip_prefix('$') {
+        return rest.to_string();
+    }
+    s.to_string()
+}
+
+fn is_valid_java_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// True if a local name looks synthetic / register-like (safe to overwrite from Intrinsics).
+fn is_synthetic_kotlin_local(s: &str) -> bool {
+    if s.is_empty() || s == "this" || s == "super" {
+        return false;
+    }
+    // Single-letter locals are common Kotlin/R8 temps.
+    if s.len() == 1 && s.chars().all(|c| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    // v0, p12, r0, i0, x0, …
+    if s.len() >= 2 {
+        let mut chars = s.chars();
+        let prefix = chars.next().unwrap_or('\0');
+        if matches!(prefix, 'v' | 'p' | 'r' | 'i' | 'x' | 't')
+            && chars.all(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    if let Some(rest) = s.strip_prefix("arg") {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+    }
+    if let Some(rest) = s.strip_prefix("local") {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+/// Apply Intrinsics check* string arguments as local renames (jadx-style), then leave
+/// the call sites for [`restore_kotlin_idioms`] to strip.
+pub fn apply_intrinsics_var_names(body: &str) -> String {
+    let Ok(re) = Regex::new(
+        r#"(?:kotlin\.jvm\.internal\.)?Intrinsics\.(?:checkNotNullParameter|checkNotNullExpressionValue|checkParameterIsNotNull|checkExpressionValueIsNotNull)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,(?:\s*"[^"]*"\s*,)?\s*"([^"]+)"\s*\)"#,
+    ) else {
+        return body.to_string();
+    };
+    let mut renames: Vec<(String, String)> = Vec::new();
+    for caps in re.captures_iter(body) {
+        let old = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let raw_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let new_name = trim_kotlin_intrinsics_name(raw_name);
+        if old.is_empty() || new_name.is_empty() || old == new_name {
+            continue;
+        }
+        if !is_valid_java_ident(&new_name) {
+            continue;
+        }
+        // Only overwrite synthetic / short temps (jadx renames registers freely;
+        // we avoid clobbering already-meaningful names).
+        if !is_synthetic_kotlin_local(old) {
+            continue;
+        }
+        if !renames.iter().any(|(o, _)| o == old) {
+            renames.push((old.to_string(), new_name));
+        }
+    }
+    if renames.is_empty() {
+        return body.to_string();
+    }
+    apply_identifier_renames(body, &renames)
+}
+
+fn apply_identifier_renames(body: &str, renames: &[(String, String)]) -> String {
+    let mut out = body.to_string();
+    for (old, new) in renames {
+        if old == new {
+            continue;
+        }
+        // Word-boundary-ish replace: avoid renaming prefixes inside longer idents.
+        let Ok(re) = Regex::new(&format!(r"\b{}\b", regex::escape(old))) else {
+            continue;
+        };
+        out = re.replace_all(&out, new.as_str()).into_owned();
+    }
+    out
+}
+
+/// Rewrite `this.old` / `Outer.this.old` field refs after metadata property aliases.
+pub fn apply_field_alias_renames(body: &str, renames: &[(String, String)]) -> String {
+    let mut out = body.to_string();
+    for (old, new) in renames {
+        if old == new {
+            continue;
+        }
+        let Ok(re) = Regex::new(&format!(r"\bthis\.{}\b", regex::escape(old))) else {
+            continue;
+        };
+        out = re
+            .replace_all(&out, format!("this.{new}").as_str())
+            .into_owned();
+    }
+    out
+}
+
+/// Hide Kotlin data-class `componentN` synthetics from Java output (rarely useful).
+pub fn should_hide_kotlin_method(name: &str, info: &KotlinClassInfo) -> bool {
+    if !info.is_data {
+        return false;
+    }
+    if let Some(rest) = name.strip_prefix("component") {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+/// Suggest field renames from metadata property names for synthetic DEX field names.
+/// Maps in declaration order when counts align or when the DEX name looks synthetic.
+pub fn suggest_property_field_renames(
+    field_names: &[String],
+    property_names: &[String],
+) -> Vec<(String, String)> {
+    if property_names.is_empty() || field_names.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut used_props = std::collections::HashSet::new();
+    // Prefer exact case-insensitive matches first.
+    for f in field_names {
+        if let Some(p) = property_names
+            .iter()
+            .find(|p| p.eq_ignore_ascii_case(f) && !used_props.contains(p.as_str()))
+        {
+            if p != f {
+                out.push((f.clone(), p.clone()));
+            }
+            used_props.insert(p.clone());
+        }
+    }
+    // Then zip synthetic fields with remaining properties in order.
+    let mut prop_iter = property_names
+        .iter()
+        .filter(|p| !used_props.contains(p.as_str()));
+    for f in field_names {
+        if out.iter().any(|(o, _)| o == f) {
+            continue;
+        }
+        if !is_synthetic_kotlin_local(f) && f.len() > 2 {
+            continue;
+        }
+        if let Some(p) = prop_iter.next() {
+            if p != f && is_valid_java_ident(p) {
+                out.push((f.clone(), p.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Parse data-class `toString` bodies for property names (`"User(name=" + this.name`).
+pub fn parse_data_class_tostring_props(body: &str) -> Vec<String> {
+    let Ok(re) = Regex::new(r#""[A-Za-z0-9_.$]*\(([A-Za-z_][A-Za-z0-9_]*)="#) else {
+        return Vec::new();
+    };
+    let mut props = Vec::new();
+    // First segment: ClassName(prop=
+    for caps in re.captures_iter(body) {
+        if let Some(m) = caps.get(1) {
+            let n = m.as_str();
+            if is_valid_java_ident(n) && !props.iter().any(|p| p == n) {
+                props.push(n.to_string());
+            }
+        }
+    }
+    // Subsequent: ", prop="
+    let Ok(re2) = Regex::new(r#""(?:, |; )?([A-Za-z_][A-Za-z0-9_]*)=""#) else {
+        return props;
+    };
+    for caps in re2.captures_iter(body) {
+        if let Some(m) = caps.get(1) {
+            let n = m.as_str();
+            // Skip the class-name(prop= already captured / noise like "true="
+            if n == "true" || n == "false" || n == "null" {
+                continue;
+            }
+            if is_valid_java_ident(n) && !props.iter().any(|p| p == n) {
+                props.push(n.to_string());
+            }
+        }
+    }
+    props
 }
 
 /// Encode protobuf fields for tests (varint + length-delimited only).
@@ -1449,5 +1657,60 @@ mod tests {
         assert!(out.contains("Foo.Companion.bar()"), "{out}");
         assert!(out.contains("/* DefaultImpls */ this.qux("), "{out}");
         assert!(out.contains("/* Unit */ null"), "{out}");
+    }
+
+    #[test]
+    fn intrinsics_renames_synthetic_locals_before_strip() {
+        let body = r#"
+        Intrinsics.checkNotNullParameter(v0, "userName");
+        Intrinsics.checkNotNullParameter(p1, "$this$ctx");
+        String s = v0;
+        use(p1);
+"#;
+        let out = restore_kotlin_idioms(body);
+        assert!(!out.contains("checkNotNullParameter"), "{out}");
+        assert!(out.contains("String s = userName"), "{out}");
+        assert!(out.contains("use(ctx)"), "{out}");
+        assert!(!out.contains("v0"), "{out}");
+        assert!(!out.contains("p1"), "{out}");
+    }
+
+    #[test]
+    fn trim_intrinsics_name_markers() {
+        assert_eq!(trim_kotlin_intrinsics_name("$this$foo"), "foo");
+        assert_eq!(trim_kotlin_intrinsics_name("$bar"), "bar");
+        assert_eq!(trim_kotlin_intrinsics_name("baz"), "baz");
+    }
+
+    #[test]
+    fn property_field_renames_and_tostring_parse() {
+        let renames = suggest_property_field_renames(
+            &["a".into(), "b".into()],
+            &["name".into(), "age".into()],
+        );
+        assert_eq!(
+            renames,
+            vec![("a".into(), "name".into()), ("b".into(), "age".into())]
+        );
+        let body = r#"
+        return "User(name=" + this.a + ", age=" + this.b + ")";
+"#;
+        let props = parse_data_class_tostring_props(body);
+        assert!(props.contains(&"name".to_string()), "{props:?}");
+        assert!(props.contains(&"age".to_string()), "{props:?}");
+        let rewritten = apply_field_alias_renames(body, &renames);
+        assert!(rewritten.contains("this.name"), "{rewritten}");
+        assert!(rewritten.contains("this.age"), "{rewritten}");
+    }
+
+    #[test]
+    fn hide_data_component_methods() {
+        let mut info = KotlinClassInfo::default();
+        info.is_data = true;
+        assert!(should_hide_kotlin_method("component1", &info));
+        assert!(should_hide_kotlin_method("component12", &info));
+        assert!(!should_hide_kotlin_method("copy", &info));
+        info.is_data = false;
+        assert!(!should_hide_kotlin_method("component1", &info));
     }
 }
