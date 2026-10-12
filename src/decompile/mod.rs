@@ -790,19 +790,7 @@ impl<'a> Decompiler<'a> {
                 .as_ref()
                 .and_then(|r| r.class.get(&class_name).cloned())
                 .unwrap_or_else(|| class_name.clone());
-            let (rel_dir, file_name) = class_name_to_path(&output_class_name);
-            let full_dir = base_path.join(rel_dir);
-            std::fs::create_dir_all(&full_dir).map_err(|e| {
-                DexDecompilerError::Decompilation(format!(
-                    "create dir {}: {}",
-                    full_dir.display(),
-                    e
-                ))
-            })?;
-            let file_path = full_dir.join(file_name);
-            std::fs::write(&file_path, class_java).map_err(|e| {
-                DexDecompilerError::Decompilation(format!("write {}: {}", file_path.display(), e))
-            })?;
+            write_decompiled_class(base_path, &output_class_name, &class_java)?;
         }
         Ok(())
     }
@@ -840,23 +828,7 @@ impl<'a> Decompiler<'a> {
                     .as_ref()
                     .and_then(|r| r.class.get(class_name).cloned())
                     .unwrap_or_else(|| class_name.clone());
-                let (rel_dir, file_name) = class_name_to_path(&output_class_name);
-                let full_dir = base_path.join(rel_dir);
-                std::fs::create_dir_all(&full_dir).map_err(|e| {
-                    DexDecompilerError::Decompilation(format!(
-                        "create dir {}: {}",
-                        full_dir.display(),
-                        e
-                    ))
-                })?;
-                let file_path = full_dir.join(file_name);
-                std::fs::write(&file_path, &class_java).map_err(|e| {
-                    DexDecompilerError::Decompilation(format!(
-                        "write {}: {}",
-                        file_path.display(),
-                        e
-                    ))
-                })?;
+                write_decompiled_class(base_path, &output_class_name, &class_java)?;
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if let Some(p) = progress {
                     p(n, total, class_name);
@@ -918,23 +890,7 @@ impl<'a> Decompiler<'a> {
                     .as_ref()
                     .and_then(|r| r.class.get(class_name).cloned())
                     .unwrap_or_else(|| class_name.clone());
-                let (rel_dir, file_name) = class_name_to_path(&output_class_name);
-                let full_dir = base_path.join(rel_dir);
-                std::fs::create_dir_all(&full_dir).map_err(|e| {
-                    DexDecompilerError::Decompilation(format!(
-                        "create dir {}: {}",
-                        full_dir.display(),
-                        e
-                    ))
-                })?;
-                let file_path = full_dir.join(file_name);
-                std::fs::write(&file_path, &class_java).map_err(|e| {
-                    DexDecompilerError::Decompilation(format!(
-                        "write {}: {}",
-                        file_path.display(),
-                        e
-                    ))
-                })?;
+                write_decompiled_class(base_path, &output_class_name, &class_java)?;
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if let Some(p) = progress {
                     p(n, total, class_name);
@@ -7961,21 +7917,153 @@ fn format_condition(mnemonic: &str, resolved_operands: &str) -> String {
     }
 }
 
+/// True when `segment` is a single safe filesystem path component.
+pub fn is_safe_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.contains('/')
+        && !segment.contains('\\')
+        && !segment.contains('\0')
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 /// Map Java class name to (relative_dir, file_name) for dumping.
 /// e.g. "com.example.MyClass" -> ("com/example", "MyClass.java"), "Outer$Inner" -> ("", "Outer$Inner.java").
+///
+/// Rejects path-traversal segments (`..`, separators). Unsafe names are redirected under
+/// `_unsafe/<hex>.java` so dumps never escape the output directory.
 pub fn class_name_to_path(class_name: &str) -> (std::path::PathBuf, String) {
-    let parts: Vec<&str> = class_name.split('.').collect();
-    if parts.len() <= 1 {
-        return (std::path::PathBuf::new(), format!("{}.java", class_name));
+    match try_class_name_to_path(class_name) {
+        Ok(v) => v,
+        Err(_) => {
+            let digest = simple_name_digest(class_name);
+            (
+                std::path::PathBuf::from("_unsafe"),
+                format!("{digest}.java"),
+            )
+        }
+    }
+}
+
+fn try_class_name_to_path(
+    class_name: &str,
+) -> std::result::Result<(std::path::PathBuf, String), String> {
+    if class_name.is_empty() {
+        return Err("empty class name".into());
+    }
+    let parts: Vec<&str> = class_name.split('.').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Err("empty class name".into());
+    }
+    if !parts.iter().all(|p| is_safe_path_segment(p)) {
+        return Err(format!("unsafe class path: {class_name}"));
+    }
+    if parts.len() == 1 {
+        return Ok((
+            std::path::PathBuf::new(),
+            format!("{}.java", parts[0]),
+        ));
     }
     let simple_name = parts[parts.len() - 1];
     let package_dir = parts[..parts.len() - 1].join("/");
-    let path = if package_dir.is_empty() {
-        std::path::PathBuf::new()
-    } else {
-        std::path::PathBuf::from(package_dir)
-    };
-    (path, format!("{}.java", simple_name))
+    Ok((
+        std::path::PathBuf::from(package_dir),
+        format!("{simple_name}.java"),
+    ))
+}
+
+fn simple_name_digest(s: &str) -> String {
+    // Stable, non-crypto fingerprint for fallback filenames (FNV-1a 64-bit).
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+    /// Resolve `base/rel_dir/file_name` and ensure it stays under `base`.
+pub fn resolve_under_base(
+    base: &std::path::Path,
+    rel_dir: &std::path::Path,
+    file_name: &str,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let stem = file_name.strip_suffix(".java").unwrap_or(file_name);
+    if !is_safe_path_segment(stem) {
+        return Err(format!("unsafe file name: {file_name}"));
+    }
+    for c in rel_dir.components() {
+        match c {
+            std::path::Component::Normal(s) => {
+                let s = s.to_string_lossy();
+                if !is_safe_path_segment(&s) {
+                    return Err(format!("unsafe path segment: {s}"));
+                }
+            }
+            std::path::Component::CurDir => {}
+            _ => return Err(format!("unsafe relative dir: {}", rel_dir.display())),
+        }
+    }
+    let full_dir = base.join(rel_dir);
+    let file_path = full_dir.join(file_name);
+    let base_n = normalize_os_path(base).ok_or_else(|| {
+        format!("invalid output base: {}", base.display())
+    })?;
+    let file_n = normalize_os_path(&file_path).ok_or_else(|| {
+        format!("path escapes output directory: {}", file_path.display())
+    })?;
+    if !file_n.starts_with(&base_n) {
+        return Err(format!(
+            "path escapes output directory: {}",
+            file_path.display()
+        ));
+    }
+    Ok(file_path)
+}
+
+fn normalize_os_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    Some(out)
+}
+
+fn write_decompiled_class(
+    base_path: &std::path::Path,
+    output_class_name: &str,
+    class_java: &str,
+) -> Result<()> {
+    let (rel_dir, file_name) = class_name_to_path(output_class_name);
+    let file_path = resolve_under_base(base_path, &rel_dir, &file_name)
+        .map_err(DexDecompilerError::Decompilation)?;
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            DexDecompilerError::Decompilation(format!(
+                "create dir {}: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+    }
+    std::fs::write(&file_path, class_java).map_err(|e| {
+        DexDecompilerError::Decompilation(format!("write {}: {}", file_path.display(), e))
+    })?;
+    Ok(())
 }
 
 /// Resolve one operand token (e.g. string@5 -> "hello", type@2 -> java.lang.String).
@@ -9597,6 +9685,18 @@ mod tests {
         let (dir, file) = super::class_name_to_path("com.example.Outer$Inner");
         assert_eq!(dir, std::path::PathBuf::from("com/example"));
         assert_eq!(file, "Outer$Inner.java");
+    }
+
+    #[test]
+    fn class_name_to_path_rejects_traversal_into_unsafe() {
+        let (dir, file) = super::class_name_to_path("com../../tmp.Evil");
+        assert_eq!(dir, std::path::PathBuf::from("_unsafe"));
+        assert!(file.ends_with(".java"));
+        let (dir2, _) = super::class_name_to_path("../../tmp/evil");
+        assert_eq!(dir2, std::path::PathBuf::from("_unsafe"));
+        let base = std::path::Path::new("/tmp/out");
+        let path = super::resolve_under_base(base, &dir, &file).unwrap();
+        assert!(path.starts_with(base));
     }
 
     #[test]
