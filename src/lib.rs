@@ -38,8 +38,8 @@ pub use getclass::{
 };
 pub use input::{
     extract_android_manifest_from_apk, extract_dex_entries_from_apk, extract_dex_entries_lazy,
-    is_classes_dex_name, load_dexes_from_bytes, load_dexes_from_path, load_dexes_from_paths,
-    looks_like_text_xml,
+    findrefs_on_apk_bytes, findrefs_on_apk_path, is_classes_dex_name, load_dexes_from_bytes,
+    load_dexes_from_path, load_dexes_from_paths, load_mapped_apk, looks_like_text_xml, MappedInput,
 };
 pub use semgrep::{
     builtin_android_rules, default_android_rule_paths, load_android_rules, load_rules_from_dir,
@@ -57,13 +57,14 @@ pub use taint::{
     SolveOptions, SolveResult, SourceModel, TaintConfig,
 };
 pub use xref::{
-    find_field_xrefs, find_field_xrefs_fast, find_method_call_traces,
+    find_extends, find_field_xrefs, find_field_xrefs_fast, find_impls, find_method_call_traces,
     find_method_call_traces_by_class_method, find_method_call_traces_with_index, find_method_callees,
     find_method_callees_by_class_method, find_method_callers, find_method_callers_by_class_method,
-    find_method_callers_by_name, find_method_callers_fast, find_string_xrefs, find_type_xrefs,
-    find_method_xrefs_fast, CallTraceFrame, CallTracePath, FastRefSite, FieldXref, FieldXrefsInfo,
-    MethodCallTracesInfo, MethodCallee, MethodCalleesInfo, MethodCaller, MethodCallersInfo,
-    ReverseCallIndex,
+    find_method_callers_by_name, find_method_callers_fast, find_method_xrefs_fast,
+    find_string_xrefs, find_type_xrefs, findrefs_kind, findrefs_kind_on_bytes,
+    findrefs_kind_on_dexes, hierarchy_as_sites, CallTraceFrame, CallTracePath, FastRefSite,
+    FieldXref, FieldXrefsInfo, MethodCallTracesInfo, MethodCallee, MethodCalleesInfo, MethodCaller,
+    MethodCallersInfo, ReverseCallIndex,
 };
 
 /// Parse a DEX file from raw bytes. Returns decompiler Result (maps parser errors to Parse).

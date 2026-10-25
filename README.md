@@ -222,6 +222,19 @@ cargo build --release --bin dex-decompile
 python3 scripts/bench_asc_compare.py --install-asc --install-py
 ```
 
+WeChat / QQ–scale APKs (same class of artifact ASC/rust_ASC advertise — supply your own APK; not redistributed):
+
+```bash
+export ASC_BENCH_WECHAT=/path/to/wechat-8-0-79.apk   # ~285 MB com.tencent.mm
+python3 scripts/bench_asc_compare.py --preset wechat --install-asc --install-py \
+  --runs 3 --json-out /tmp/asc_wechat.json
+
+export ASC_BENCH_QQ=/path/to/qq.apk
+python3 scripts/bench_asc_compare.py --preset qq --skip-asc --runs 3
+```
+
+Path loads use `MappedInput` (mmap on native; buffered `Bytes` on WASM). DEX 041 logical containers are split via apk-parser `iter_logical_dexes`.
+
 ## Benchmark vs jadx
 
 Compare full-tree and single-class decompile speed / RSS / output size against [jadx](https://github.com/skylot/jadx) (`--no-res` for a fair Java-only compare):

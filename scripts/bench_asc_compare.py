@@ -24,12 +24,19 @@ Examples:
 
   # Point at a specific Python that has dex_decompiler installed
   python3 scripts/bench_asc_compare.py --py-python dex-decompiler-py/.venv/bin/python
+
+WeChat / QQ scale (honest mega-APK compare; paths via env or flags):
+  export ASC_BENCH_WECHAT=/path/to/wechat.apk   # e.g. ~285 MB com.tencent.mm
+  export ASC_BENCH_QQ=/path/to/qq.apk
+  python3 scripts/bench_asc_compare.py --preset wechat --install-asc --install-py
+  python3 scripts/bench_asc_compare.py --preset qq --skip-asc --runs 3
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import shutil
 import statistics
@@ -52,6 +59,53 @@ DEFAULT_METHOD_CLASS = "com.google.firebase.FirebaseApp"
 DEFAULT_FIELD = "instances"
 ASC_REPO_URL = "https://github.com/MG1937/ASC.git"
 CACHE_DIR = ROOT / "scripts" / ".cache" / "asc_bench"
+
+# Mega-APK presets (same class of artifact ASC/rust_ASC advertise). Supply the
+# APK yourself — we do not redistribute WeChat/QQ. Env overrides paths.
+_PRESETS: dict[str, dict[str, object]] = {
+    "default": {
+        "apk": DEFAULT_APK,
+        "class_name": DEFAULT_CLASS,
+        "string_value": DEFAULT_STRING,
+        "type_value": DEFAULT_TYPE,
+        "method_value": DEFAULT_METHOD,
+        "method_class": DEFAULT_METHOD_CLASS,
+        "field_value": DEFAULT_FIELD,
+        "field_class": None,
+    },
+    # WeChat 8.x (~280–300 MB, com.tencent.mm) — pick a stable, common class.
+    "wechat": {
+        "apk": Path(
+            os.environ.get(
+                "ASC_BENCH_WECHAT",
+                str(Path.home() / "Downloads" / "wechat-8-0-79.apk"),
+            )
+        ),
+        "class_name": "com.tencent.mm.app.Application",
+        "string_value": "tencent",
+        "type_value": "Lcom/tencent/mm/app/Application;",
+        "method_value": "onCreate",
+        "method_class": "com.tencent.mm.app.Application",
+        "field_value": "TAG",
+        "field_class": "com.tencent.mm.app.Application",
+    },
+    # QQ (~200+ MB, com.tencent.mobileqq)
+    "qq": {
+        "apk": Path(
+            os.environ.get(
+                "ASC_BENCH_QQ",
+                str(Path.home() / "Downloads" / "qq.apk"),
+            )
+        ),
+        "class_name": "com.tencent.mobileqq.SplashActivity",
+        "string_value": "tencent",
+        "type_value": "Lcom/tencent/mobileqq/SplashActivity;",
+        "method_value": "onCreate",
+        "method_class": "com.tencent.mobileqq.SplashActivity",
+        "field_value": "TAG",
+        "field_class": None,
+    },
+}
 PY_VENV_CANDIDATES = [
     ROOT / "dex-decompiler-py" / ".venv" / "bin" / "python",
     ROOT / "dex-decompiler-py" / ".venv" / "Scripts" / "python.exe",
@@ -527,13 +581,20 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--apk", type=Path, default=DEFAULT_APK)
-    ap.add_argument("--class", dest="class_name", default=DEFAULT_CLASS)
-    ap.add_argument("--string", dest="string_value", default=DEFAULT_STRING)
-    ap.add_argument("--type", dest="type_value", default=DEFAULT_TYPE)
-    ap.add_argument("--method", dest="method_value", default=DEFAULT_METHOD)
-    ap.add_argument("--method-class", dest="method_class", default=DEFAULT_METHOD_CLASS)
-    ap.add_argument("--field", dest="field_value", default=DEFAULT_FIELD)
+    ap.add_argument(
+        "--preset",
+        choices=sorted(_PRESETS),
+        default="default",
+        help="Workload preset: default fixture, or wechat/qq mega-APKs "
+        "(set ASC_BENCH_WECHAT / ASC_BENCH_QQ, or place APKs under ~/Downloads)",
+    )
+    ap.add_argument("--apk", type=Path, default=None)
+    ap.add_argument("--class", dest="class_name", default=None)
+    ap.add_argument("--string", dest="string_value", default=None)
+    ap.add_argument("--type", dest="type_value", default=None)
+    ap.add_argument("--method", dest="method_value", default=None)
+    ap.add_argument("--method-class", dest="method_class", default=None)
+    ap.add_argument("--field", dest="field_value", default=None)
     ap.add_argument("--field-class", dest="field_class", default=None)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--warmup", type=int, default=1)
@@ -573,8 +634,35 @@ def main() -> int:
     ap.add_argument("--json-out", type=Path, default=None)
     args = ap.parse_args()
 
+    preset = _PRESETS[args.preset]
+    if args.apk is None:
+        args.apk = Path(preset["apk"])  # type: ignore[arg-type]
+    if args.class_name is None:
+        args.class_name = str(preset["class_name"])
+    if args.string_value is None:
+        args.string_value = str(preset["string_value"])
+    if args.type_value is None:
+        args.type_value = str(preset["type_value"])
+    if args.method_value is None:
+        args.method_value = str(preset["method_value"])
+    if args.method_class is None:
+        args.method_class = str(preset["method_class"])
+    if args.field_value is None:
+        args.field_value = str(preset["field_value"])
+    if args.field_class is None and preset.get("field_class") is not None:
+        args.field_class = str(preset["field_class"])
+
     if not args.apk.is_file():
-        raise SystemExit(f"APK not found: {args.apk}")
+        hint = ""
+        if args.preset == "wechat":
+            hint = " (set ASC_BENCH_WECHAT=/path/to/wechat.apk)"
+        elif args.preset == "qq":
+            hint = " (set ASC_BENCH_QQ=/path/to/qq.apk)"
+        raise SystemExit(f"APK not found: {args.apk}{hint}")
+    eprint(
+        f"preset={args.preset} apk={args.apk} "
+        f"({args.apk.stat().st_size / (1024 * 1024):.1f} MiB)"
+    )
 
     our = resolve_our_bin(args.dex_decompile)
 

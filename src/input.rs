@@ -1,4 +1,7 @@
 //! Load DEX bytes from `.dex` files or APK/ZIP archives.
+//!
+//! Path loads prefer memory-mapping on native targets (zero-copy APK view).
+//! WASM / fallback builds always use owned `Vec<u8>` (`MappedInput::Bytes`).
 
 use std::io::Cursor;
 use std::path::Path;
@@ -8,6 +11,62 @@ use zip::ZipArchive;
 
 use crate::error::{DexDecompilerError, Result};
 use crate::{parse_dex, DexFile};
+
+/// Owned or mmapped APK/DEX bytes.
+///
+/// Use [`MappedInput::open`] for path-based queries. On `wasm32`, only the
+/// bytes variant is available so the same API works in browser builds.
+pub enum MappedInput {
+    /// Memory-mapped file (native only).
+    #[cfg(not(target_arch = "wasm32"))]
+    Mmap(memmap2::Mmap),
+    /// Fully buffered copy (WASM default, or mmap unavailable).
+    Bytes(Vec<u8>),
+}
+
+impl MappedInput {
+    /// Open `path` via mmap when available; otherwise read into memory.
+    pub fn open(path: &Path) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::fs::File;
+            let file = File::open(path).map_err(|e| {
+                DexDecompilerError::Parse(format!("open {}: {e}", path.display()))
+            })?;
+            // Empty files cannot be mmapped on some platforms.
+            let meta = file.metadata().map_err(|e| {
+                DexDecompilerError::Parse(format!("stat {}: {e}", path.display()))
+            })?;
+            if meta.len() > 0 {
+                // SAFETY: file is opened read-only for the lifetime of the map.
+                match unsafe { memmap2::Mmap::map(&file) } {
+                    Ok(m) => return Ok(Self::Mmap(m)),
+                    Err(_) => { /* fall through to read */ }
+                }
+            }
+        }
+        let bytes = std::fs::read(path).map_err(|e| {
+            DexDecompilerError::Parse(format!("read {}: {e}", path.display()))
+        })?;
+        Ok(Self::Bytes(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Mmap(m) => m,
+            Self::Bytes(b) => b,
+        }
+    }
+
+    pub fn is_mmap(&self) -> bool {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Mmap(_) => true,
+            Self::Bytes(_) => false,
+        }
+    }
+}
 
 /// True if `name` looks like a Dalvik `classes*.dex` entry.
 pub fn is_classes_dex_name(name: &str) -> bool {
@@ -89,6 +148,101 @@ pub fn extract_dex_entries_lazy(apk_bytes: &[u8]) -> Result<Vec<(String, Vec<u8>
     Ok(out)
 }
 
+/// ASC-style findrefs: parallel inflate+scan per `classes*.dex` (native), sequential on WASM.
+///
+/// Avoids building a full [`DexFile`] per entry — uses RawDex/FastRef then cheap method_ids
+/// name resolution. Returns `(dex_index, sites)` in entry order (smallest-compressed first).
+pub fn findrefs_on_apk_bytes(
+    apk_bytes: &[u8],
+    kind: &str,
+    value: &str,
+    class_desc: Option<&str>,
+    exact_class: bool,
+) -> Result<Vec<(usize, crate::xref::FastRefSite)>> {
+    use crate::xref::{findrefs_kind_on_bytes, FastRefSite};
+
+    if looks_like_dex(apk_bytes) {
+        let sites = findrefs_kind_on_bytes(apk_bytes, kind, value, class_desc, exact_class)?;
+        return Ok(sites
+            .into_iter()
+            .map(|s| (0usize, s))
+            .collect());
+    }
+
+    let index = ZipIndex::parse(apk_bytes)
+        .map_err(|e| DexDecompilerError::Parse(format!("open APK ZipIndex: {e}")))?;
+    let entries: Vec<_> = dex_entries(&index).into_iter().cloned().collect();
+    if entries.is_empty() {
+        return Err(DexDecompilerError::Parse(
+            "APK/ZIP contains no classes*.dex".into(),
+        ));
+    }
+
+    // Inflate + FastRef per entry. Parallel on native (ASC process-pool analogue).
+    let per_entry: Result<Vec<Vec<(usize, FastRefSite)>>> = {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            entries
+                .par_iter()
+                .enumerate()
+                .map(|(dex_i, e)| {
+                    let data = index.read_entry(e).map_err(|err| {
+                        DexDecompilerError::Parse(format!("inflate {}: {err}", e.filename))
+                    })?;
+                    let mut sites = Vec::new();
+                    for (_name, bytes) in iter_logical_dexes(&e.filename, data) {
+                        let hit = findrefs_kind_on_bytes(
+                            &bytes,
+                            kind,
+                            value,
+                            class_desc,
+                            exact_class,
+                        )?;
+                        sites.extend(hit.into_iter().map(|s| (dex_i, s)));
+                    }
+                    Ok(sites)
+                })
+                .collect()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut all = Vec::with_capacity(entries.len());
+            for (dex_i, e) in entries.iter().enumerate() {
+                let data = index.read_entry(e).map_err(|err| {
+                    DexDecompilerError::Parse(format!("inflate {}: {err}", e.filename))
+                })?;
+                let mut sites = Vec::new();
+                for (_name, bytes) in iter_logical_dexes(&e.filename, data) {
+                    let hit =
+                        findrefs_kind_on_bytes(&bytes, kind, value, class_desc, exact_class)?;
+                    sites.extend(hit.into_iter().map(|s| (dex_i, s)));
+                }
+                all.push(sites);
+            }
+            Ok(all)
+        }
+    };
+
+    let mut out = Vec::new();
+    for chunk in per_entry? {
+        out.extend(chunk);
+    }
+    Ok(out)
+}
+
+/// Path-based findrefs: mmap APK on native, then [`findrefs_on_apk_bytes`].
+pub fn findrefs_on_apk_path(
+    path: &Path,
+    kind: &str,
+    value: &str,
+    class_desc: Option<&str>,
+    exact_class: bool,
+) -> Result<Vec<(usize, crate::xref::FastRefSite)>> {
+    let mapped = MappedInput::open(path)?;
+    findrefs_on_apk_bytes(mapped.as_bytes(), kind, value, class_desc, exact_class)
+}
+
 /// Extract `AndroidManifest.xml` bytes from an APK/ZIP (binary AXML or text).
 pub fn extract_android_manifest_from_apk(apk_bytes: &[u8]) -> Result<Vec<u8>> {
     let cursor = Cursor::new(apk_bytes);
@@ -117,10 +271,21 @@ pub fn looks_like_text_xml(bytes: &[u8]) -> bool {
 }
 
 /// Load one path as DEX or APK (auto-detect by magic / extension).
+///
+/// Prefers mmap on native targets; WASM always buffers (`MappedInput::Bytes`).
 pub fn load_dexes_from_path(path: &Path) -> Result<Vec<DexFile>> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| DexDecompilerError::Parse(format!("read {}: {e}", path.display())))?;
-    load_dexes_from_bytes(&bytes, path)
+    let mapped = MappedInput::open(path)?;
+    load_dexes_from_bytes(mapped.as_bytes(), path)
+}
+
+/// Like [`load_dexes_from_path`], but returns the mapped/buffered input so
+/// callers can keep the backing store alive while holding `DexFile` views... 
+/// actually DexFile owns its data — this returns `(MappedInput, Vec<DexFile>)`
+/// for APIs that still need the raw APK bytes (getclass / manifest).
+pub fn load_mapped_apk(path: &Path) -> Result<(MappedInput, Vec<DexFile>)> {
+    let mapped = MappedInput::open(path)?;
+    let dexes = load_dexes_from_bytes(mapped.as_bytes(), path)?;
+    Ok((mapped, dexes))
 }
 
 /// Parse raw bytes as a single DEX, or as an APK/ZIP containing DEX files.
@@ -210,5 +375,26 @@ mod tests {
                 "classes3.dex".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn mapped_input_bytes_variant_always_available() {
+        let owned = MappedInput::Bytes(b"dex\n035\0".to_vec());
+        assert!(!owned.is_mmap());
+        assert_eq!(owned.as_bytes(), b"dex\n035\0");
+    }
+
+    #[test]
+    fn mapped_input_open_empty_falls_back_to_bytes() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "dex_decompiler_mmap_empty_{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"").unwrap();
+        let mapped = MappedInput::open(&path).unwrap();
+        assert!(!mapped.is_mmap());
+        assert!(mapped.as_bytes().is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 }

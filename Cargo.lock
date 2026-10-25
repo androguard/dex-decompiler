@@ -76,11 +76,11 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "apkparser"
 version = "0.1.0"
-source = "git+https://github.com/androguard/apk-parser?branch=main#7a0ad5241194336fb7c0b218f790985170571ec3"
 dependencies = [
  "axmldecoder",
  "byteorder",
  "clap",
+ "crc32fast",
  "der",
  "ecdsa",
  "flate2",
@@ -432,6 +432,7 @@ dependencies = [
  "dex-bytecode",
  "dex-parser",
  "indicatif",
+ "memmap2",
  "rayon",
  "regex",
  "serde",
@@ -721,6 +722,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "memmap2"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "minimal-lexical"

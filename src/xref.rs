@@ -1086,6 +1086,139 @@ fn method_ui_map(
     Ok(out)
 }
 
+/// Normalize a user type name to a Dalvik descriptor for hierarchy queries.
+fn hierarchy_descriptor(name: &str) -> String {
+    let n = name.trim();
+    if n.starts_with('L') && n.ends_with(';') {
+        return n.to_string();
+    }
+    if n.len() == 1 || n.starts_with('[') {
+        return n.to_string();
+    }
+    format!("L{};", n.replace('.', "/"))
+}
+
+fn type_eq(a: &str, b: &str) -> bool {
+    a == b || hierarchy_descriptor(a) == hierarchy_descriptor(b)
+}
+
+/// Classes whose direct superclass is `base` (ASC `findrefs extends`).
+///
+/// Returns Dalvik descriptors of matching classes.
+pub fn find_extends(dex: &DexFile, base: &str) -> Result<Vec<String>> {
+    use dex_parser::NO_INDEX;
+    let target = hierarchy_descriptor(base);
+    let mut out = Vec::new();
+    for class_result in dex.class_defs() {
+        let class_def = class_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        if class_def.superclass_idx == NO_INDEX {
+            continue;
+        }
+        let super_desc = dex
+            .get_type(class_def.superclass_idx)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        if type_eq(&super_desc, &target) {
+            let name = dex
+                .get_type(class_def.class_idx)
+                .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+/// Classes that directly implement interface `iface` (ASC `findrefs impl`).
+pub fn find_impls(dex: &DexFile, iface: &str) -> Result<Vec<String>> {
+    let target = hierarchy_descriptor(iface);
+    let mut out = Vec::new();
+    for class_result in dex.class_defs() {
+        let class_def = class_result.map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        let ifaces = dex
+            .get_interfaces(&class_def)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+        if ifaces.iter().any(|i| type_eq(i, &target)) {
+            let name = dex
+                .get_type(class_def.class_idx)
+                .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+/// Hierarchy hits as FastRefSite-shaped rows (class_name set; method fields empty).
+///
+/// `class_name` keeps the Dalvik descriptor so ASC-style CLIs can print it as-is.
+pub fn hierarchy_as_sites(classes: &[String]) -> Vec<FastRefSite> {
+    classes
+        .iter()
+        .map(|c| FastRefSite {
+            class_name: c.clone(),
+            method_name: String::new(),
+            method_idx: 0,
+            file_offset: 0,
+            offset: 0,
+            pool_idx: 0,
+            class_idx: 0,
+            method_idx_in_class: 0,
+        })
+        .collect()
+}
+
+/// One-DEX findrefs for ASC kinds (`string|type|method|field|extends|impl`).
+pub fn findrefs_kind(
+    dex: &DexFile,
+    kind: &str,
+    value: &str,
+    class_desc: Option<&str>,
+    exact_class: bool,
+) -> Result<Vec<FastRefSite>> {
+    match kind {
+        "string" => find_string_xrefs(dex, value),
+        "type" => find_type_xrefs(dex, value),
+        "method" => find_method_xrefs_fast(dex, class_desc, Some(value), exact_class),
+        "field" => find_field_xrefs_fast(dex, class_desc, Some(value), exact_class),
+        "extends" => Ok(hierarchy_as_sites(&find_extends(dex, value)?)),
+        "impl" => Ok(hierarchy_as_sites(&find_impls(dex, value)?)),
+        other => Err(DexDecompilerError::Parse(format!(
+            "unknown findrefs kind {other:?} (string|type|method|field|extends|impl)"
+        ))),
+    }
+}
+
+/// Multi-DEX findrefs. Parallel over DEX files on native; sequential on WASM.
+pub fn findrefs_kind_on_dexes(
+    dexes: &[DexFile],
+    kind: &str,
+    value: &str,
+    class_desc: Option<&str>,
+    exact_class: bool,
+) -> Result<Vec<(usize, Vec<FastRefSite>)>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        dexes
+            .par_iter()
+            .enumerate()
+            .map(|(dex_i, dex)| {
+                findrefs_kind(dex, kind, value, class_desc, exact_class)
+                    .map(|sites| (dex_i, sites))
+            })
+            .collect()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut out = Vec::with_capacity(dexes.len());
+        for (dex_i, dex) in dexes.iter().enumerate() {
+            out.push((
+                dex_i,
+                findrefs_kind(dex, kind, value, class_desc, exact_class)?,
+            ));
+        }
+        Ok(out)
+    }
+}
+
 pub fn find_string_xrefs(dex: &DexFile, needle: &str) -> Result<Vec<FastRefSite>> {
     let raw = dex_parser::RawDex::from_dex(dex);
     let mut fr = dex_parser::FastRef::from_raw(raw);
@@ -1142,25 +1275,18 @@ pub fn find_method_xrefs_fast(
 }
 
 fn fast_sites_to_ui(dex: &DexFile, sites: Vec<dex_parser::RefSite>) -> Result<Vec<FastRefSite>> {
-    let wanted: std::collections::HashSet<u32> = sites.iter().map(|s| s.method_idx).collect();
-    let ui = method_ui_map(dex, &wanted)?;
-    let mut out = Vec::new();
+    // Resolve class/method from method_ids only — do NOT walk class_data
+    // (method_ui_map). That dominated WeChat-scale string findrefs with 100k+ hits.
+    let mut out = Vec::with_capacity(sites.len());
     for s in sites {
-        let (class_idx, method_idx_in_class, class_name) = ui
-            .get(&s.method_idx)
-            .cloned()
-            .unwrap_or((0, 0, String::new()));
         let info = dex.get_method_info(s.method_idx).ok();
         let method_name = info
             .as_ref()
             .map(|i| i.name.to_string())
             .unwrap_or_default();
-        let class_name = if class_name.is_empty() {
-            info.map(|i| java::descriptor_to_java(&i.class))
-                .unwrap_or_default()
-        } else {
-            class_name
-        };
+        let class_name = info
+            .map(|i| java::descriptor_to_java(&i.class))
+            .unwrap_or_default();
         out.push(FastRefSite {
             class_name,
             method_name,
@@ -1168,11 +1294,103 @@ fn fast_sites_to_ui(dex: &DexFile, sites: Vec<dex_parser::RefSite>) -> Result<Ve
             file_offset: s.file_off,
             offset: s.insn_off,
             pool_idx: s.pool_idx,
-            class_idx,
-            method_idx_in_class,
+            class_idx: 0,
+            method_idx_in_class: 0,
         });
     }
     Ok(out)
+}
+
+/// Resolve containing method class+name from `method_ids` via [`RawDex`] (no full parse).
+fn raw_sites_to_ui(data: &[u8], sites: Vec<dex_parser::RefSite>) -> Result<Vec<FastRefSite>> {
+    let raw = dex_parser::RawDex::parse(data).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    let mut out = Vec::with_capacity(sites.len());
+    for s in sites {
+        let (class_desc, method_name) = raw_method_names(&raw, s.method_idx).unwrap_or_default();
+        out.push(FastRefSite {
+            class_name: java::descriptor_to_java(&class_desc),
+            method_name,
+            method_idx: s.method_idx,
+            file_offset: s.file_off,
+            offset: s.insn_off,
+            pool_idx: s.pool_idx,
+            class_idx: 0,
+            method_idx_in_class: 0,
+        });
+    }
+    Ok(out)
+}
+
+fn raw_method_names(raw: &dex_parser::RawDex<'_>, method_idx: u32) -> Result<(String, String)> {
+    if method_idx >= raw.method_ids.size {
+        return Ok((String::new(), String::new()));
+    }
+    let off = raw.method_ids.off as usize + method_idx as usize * 8;
+    let class_idx = raw
+        .u16_at(off)
+        .map_err(|e| DexDecompilerError::Parse(e.to_string()))? as u32;
+    let name_idx = raw
+        .u32_at(off + 4)
+        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    let desc_idx = raw
+        .type_descriptor_idx(class_idx)
+        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    let class_bytes = raw
+        .string_payload_bytes(desc_idx)
+        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    let name_bytes = raw
+        .string_payload_bytes(name_idx)
+        .map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    let class = dex_parser::dex::decode_mutf8(class_bytes).unwrap_or_default();
+    let name = dex_parser::dex::decode_mutf8(name_bytes).unwrap_or_default();
+    Ok((class, name))
+}
+
+/// FastRefs on raw DEX bytes (no full [`DexFile`] parse).
+pub fn findrefs_kind_on_bytes(
+    data: &[u8],
+    kind: &str,
+    value: &str,
+    class_desc: Option<&str>,
+    exact_class: bool,
+) -> Result<Vec<FastRefSite>> {
+    let mut fr =
+        dex_parser::FastRef::new(data).map_err(|e| DexDecompilerError::Parse(e.to_string()))?;
+    let sites = match kind {
+        "string" => fr
+            .find_strings(value)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?,
+        "type" => fr
+            .find_types(value)
+            .map_err(|e| DexDecompilerError::Parse(e.to_string()))?,
+        "method" => {
+            let q = dex_parser::MemberQuery {
+                class: class_desc.map(|c| (c.to_string(), exact_class)),
+                name: Some(value.to_string()),
+            };
+            fr.find_methods(&q)
+                .map_err(|e| DexDecompilerError::Parse(e.to_string()))?
+        }
+        "field" => {
+            let q = dex_parser::MemberQuery {
+                class: class_desc.map(|c| (c.to_string(), exact_class)),
+                name: Some(value.to_string()),
+            };
+            fr.find_fields(&q)
+                .map_err(|e| DexDecompilerError::Parse(e.to_string()))?
+        }
+        "extends" | "impl" => {
+            // Hierarchy needs class_defs iteration; fall back to light DexFile parse.
+            let dex = crate::parse_dex(data)?;
+            return findrefs_kind(&dex, kind, value, class_desc, exact_class);
+        }
+        other => {
+            return Err(DexDecompilerError::Parse(format!(
+                "unknown findrefs kind {other:?} (string|type|method|field|extends|impl)"
+            )));
+        }
+    };
+    raw_sites_to_ui(data, sites)
 }
 
 #[cfg(test)]

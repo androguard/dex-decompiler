@@ -2,10 +2,11 @@
 
 use ::dex_decompiler::java;
 use ::dex_decompiler::{
-    default_config, enrich_mas, find_field_xrefs_fast, find_method_xrefs_fast, getclass_java,
-    load_dexes_from_bytes, parse_dex, scan_dex_parallel, slice_class_from_input, solve_dexes,
+    default_config, enrich_mas, find_field_xrefs_fast, find_method_xrefs_fast, findrefs_kind_on_dexes,
+    findrefs_on_apk_bytes, findrefs_on_apk_path, getclass_java, load_dexes_from_bytes,
+    load_mapped_apk, parse_dex, scan_dex_parallel, slice_class_from_input, solve_dexes,
     to_dalvik_descriptor, Decompiler, DecompilerOptions, DexFile, EncodedMethod, FastRefSite,
-    MasLink, MethodCaller, RenameMap, SolveOptions,
+    MappedInput, MasLink, MethodCaller, RenameMap, SolveOptions,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -590,11 +591,52 @@ fn enrich_mas_py(
     })
 }
 
-/// ASC findrefs over DEX or APK bytes.
+fn sites_to_py(py: Python<'_>, kind: &str, dex_i: usize, sites: &[FastRefSite]) -> PyResult<Vec<PyObject>> {
+    let mut all = Vec::with_capacity(sites.len());
+    for s in sites {
+        let dict = PyDict::new(py);
+        dict.set_item("dex", dex_i)?;
+        dict.set_item("kind", kind)?;
+        dict.set_item("class_name", &s.class_name)?;
+        dict.set_item("method_name", &s.method_name)?;
+        dict.set_item("method_idx", s.method_idx)?;
+        dict.set_item("file_offset", s.file_offset)?;
+        dict.set_item("pool_idx", s.pool_idx)?;
+        dict.set_item("class_idx", s.class_idx)?;
+        dict.set_item("method_idx_in_class", s.method_idx_in_class)?;
+        all.push(dict.into_any().unbind());
+    }
+    Ok(all)
+}
+
+#[allow(dead_code)] // kept for in-memory DexFile batches / WASM callers
+fn findrefs_on_dexes(
+    dexes: &[DexFile],
+    kind: &str,
+    value: &str,
+    class_name: Option<&str>,
+    fuzzy_class: bool,
+) -> PyResult<Vec<PyObject>> {
+    let exact_class = !fuzzy_class;
+    let class_desc = class_name.map(to_dalvik_descriptor);
+    Python::with_gil(|py| {
+        let per_dex = py
+            .allow_threads(|| {
+                findrefs_kind_on_dexes(dexes, kind, value, class_desc.as_deref(), exact_class)
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let mut all = Vec::new();
+        for (dex_i, sites) in per_dex {
+            all.extend(sites_to_py(py, kind, dex_i, &sites)?);
+        }
+        Ok(all)
+    })
+}
+
+/// ASC findrefs over DEX or APK bytes (WASM-friendly; no mmap).
 ///
-/// `kind` is one of: `"string"`, `"type"`, `"method"`, `"field"`.
-/// For method/field, `class_name` optionally restricts the owning class
-/// (Java or Dalvik form); set `fuzzy_class=True` for substring class match.
+/// Parallel inflate+FastRef on native multi-DEX APKs. `kind`:
+/// `"string"`, `"type"`, `"method"`, `"field"`, `"extends"`, `"impl"`.
 #[pyfunction]
 #[pyo3(signature = (data, kind, value, class_name=None, fuzzy_class=false))]
 fn findrefs(
@@ -604,6 +646,72 @@ fn findrefs(
     class_name: Option<&str>,
     fuzzy_class: bool,
 ) -> PyResult<Vec<PyObject>> {
+    let exact_class = !fuzzy_class;
+    let class_desc = class_name.map(to_dalvik_descriptor);
+    Python::with_gil(|py| {
+        let hits = py
+            .allow_threads(|| {
+                findrefs_on_apk_bytes(data, kind, value, class_desc.as_deref(), exact_class)
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        hits_to_py(py, kind, &hits)
+    })
+}
+
+/// Path-based findrefs: mmaps the APK on native targets (bytes fallback on WASM).
+#[pyfunction]
+#[pyo3(signature = (path, kind, value, class_name=None, fuzzy_class=false))]
+fn findrefs_path(
+    path: &str,
+    kind: &str,
+    value: &str,
+    class_name: Option<&str>,
+    fuzzy_class: bool,
+) -> PyResult<Vec<PyObject>> {
+    let exact_class = !fuzzy_class;
+    let class_desc = class_name.map(to_dalvik_descriptor);
+    Python::with_gil(|py| {
+        let hits = py
+            .allow_threads(|| {
+                findrefs_on_apk_path(
+                    Path::new(path),
+                    kind,
+                    value,
+                    class_desc.as_deref(),
+                    exact_class,
+                )
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        hits_to_py(py, kind, &hits)
+    })
+}
+
+fn hits_to_py(
+    py: Python<'_>,
+    kind: &str,
+    hits: &[(usize, FastRefSite)],
+) -> PyResult<Vec<PyObject>> {
+    let mut all = Vec::with_capacity(hits.len());
+    for (dex_i, s) in hits {
+        all.extend(sites_to_py(py, kind, *dex_i, std::slice::from_ref(s))?);
+    }
+    Ok(all)
+}
+
+/// Path-based getclass (mmap APK on native).
+#[pyfunction]
+#[pyo3(signature = (path, class_name))]
+fn getclass_path(path: &str, class_name: &str) -> PyResult<String> {
+    let mapped = MappedInput::open(Path::new(path))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    getclass_java(mapped.as_bytes(), class_name, DecompilerOptions::default())
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// List string-pool values across all DEX files (optional case-insensitive filter).
+#[pyfunction]
+#[pyo3(signature = (data, filter=None))]
+fn liststring(data: &[u8], filter: Option<&str>) -> PyResult<Vec<String>> {
     let path = Path::new(if data.len() >= 4 && &data[0..4] == b"dex\n" {
         "input.dex"
     } else {
@@ -611,52 +719,35 @@ fn findrefs(
     });
     let dexes =
         load_dexes_from_bytes(data, path).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let exact_class = !fuzzy_class;
-    let class_desc = class_name.map(to_dalvik_descriptor);
-    Python::with_gil(|py| {
-        let mut all = Vec::new();
-        for (dex_i, dex) in dexes.iter().enumerate() {
-            let sites: Vec<FastRefSite> = match kind {
-                "string" => ::dex_decompiler::find_string_xrefs(dex, value)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                "type" => ::dex_decompiler::find_type_xrefs(dex, value)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                "method" => find_method_xrefs_fast(
-                    dex,
-                    class_desc.as_deref(),
-                    Some(value),
-                    exact_class,
-                )
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                "field" => find_field_xrefs_fast(
-                    dex,
-                    class_desc.as_deref(),
-                    Some(value),
-                    exact_class,
-                )
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                other => {
-                    return Err(PyValueError::new_err(format!(
-                        "unknown kind {other:?} (string|type|method|field)"
-                    )));
+    liststring_dexes(&dexes, filter)
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, filter=None))]
+fn liststring_path(path: &str, filter: Option<&str>) -> PyResult<Vec<String>> {
+    let (_mapped, dexes) =
+        load_mapped_apk(Path::new(path)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    liststring_dexes(&dexes, filter)
+}
+
+fn liststring_dexes(dexes: &[DexFile], filter: Option<&str>) -> PyResult<Vec<String>> {
+    let needle = filter.map(|s| s.to_ascii_lowercase());
+    let mut out = Vec::new();
+    for dex in dexes {
+        let n = dex.header.string_ids_size;
+        for i in 0..n {
+            let s = dex
+                .get_string(i)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            if let Some(ref n) = needle {
+                if !s.to_ascii_lowercase().contains(n) {
+                    continue;
                 }
-            };
-            for s in sites {
-                let dict = PyDict::new(py);
-                dict.set_item("dex", dex_i)?;
-                dict.set_item("kind", kind)?;
-                dict.set_item("class_name", &s.class_name)?;
-                dict.set_item("method_name", &s.method_name)?;
-                dict.set_item("method_idx", s.method_idx)?;
-                dict.set_item("file_offset", s.file_offset)?;
-                dict.set_item("pool_idx", s.pool_idx)?;
-                dict.set_item("class_idx", s.class_idx)?;
-                dict.set_item("method_idx_in_class", s.method_idx_in_class)?;
-                all.push(dict.into_any().unbind());
             }
+            out.push(s);
         }
-        Ok(all)
-    })
+    }
+    Ok(out)
 }
 
 /// Python module entry point.
@@ -665,8 +756,12 @@ fn dex_decompiler(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DexFileWrapper>()?;
     m.add_function(wrap_pyfunction!(parse_dex_py, m)?)?;
     m.add_function(wrap_pyfunction!(getclass, m)?)?;
+    m.add_function(wrap_pyfunction!(getclass_path, m)?)?;
     m.add_function(wrap_pyfunction!(slice_class, m)?)?;
     m.add_function(wrap_pyfunction!(findrefs, m)?)?;
+    m.add_function(wrap_pyfunction!(findrefs_path, m)?)?;
+    m.add_function(wrap_pyfunction!(liststring, m)?)?;
+    m.add_function(wrap_pyfunction!(liststring_path, m)?)?;
     m.add_function(wrap_pyfunction!(to_dalvik, m)?)?;
     m.add_function(wrap_pyfunction!(enrich_mas_py, m)?)?;
     Ok(())

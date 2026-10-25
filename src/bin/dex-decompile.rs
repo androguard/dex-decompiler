@@ -472,95 +472,85 @@ fn run_findrefs(args: &Args, kind: &str) -> Result<()> {
         .findrefs_value
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--findrefs requires --findrefs-value"))?;
-    let owned = load_dexes_from_paths(
-        &args
-            .input
-            .iter()
-            .map(std::path::Path::new)
-            .collect::<Vec<_>>(),
-    )?;
-    for (i, dex) in owned.iter().enumerate() {
-        match kind {
-            "string" => {
-                let sites = dex_decompiler::xref::find_string_xrefs(dex, value)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                println!("DEX[{i}] string {value:?}: {} site(s)", sites.len());
-                for s in sites.iter().take(200) {
-                    println!(
-                        "  {}#{}  @0x{:x}  pool={}",
-                        s.class_name, s.method_name, s.file_offset, s.pool_idx
-                    );
-                }
+    let class_desc = args
+        .findrefs_class
+        .as_ref()
+        .map(|c| dalvik_descriptor(c));
+    let exact_class = !args.findrefs_fuzzy_class;
+
+    // Single APK/DEX path: parallel inflate+FastRef (ASC-shaped). Multi-input
+    // falls back to sequential load.
+    let hits: Vec<(usize, dex_decompiler::FastRefSite)> = if args.input.len() == 1 {
+        dex_decompiler::findrefs_on_apk_path(
+            std::path::Path::new(&args.input[0]),
+            kind,
+            value,
+            class_desc.as_deref(),
+            exact_class,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        let owned = load_dexes_from_paths(
+            &args
+                .input
+                .iter()
+                .map(std::path::Path::new)
+                .collect::<Vec<_>>(),
+        )?;
+        dex_decompiler::findrefs_kind_on_dexes(
+            &owned,
+            kind,
+            value,
+            class_desc.as_deref(),
+            exact_class,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .into_iter()
+        .flat_map(|(i, sites)| sites.into_iter().map(move |s| (i, s)))
+        .collect()
+    };
+
+    if kind == "extends" || kind == "impl" {
+        println!("{kind} {value:?}: {} class(es)", hits.len());
+        for (_i, s) in hits.iter().take(500) {
+            println!("  {}", s.class_name);
+        }
+        return Ok(());
+    }
+
+    println!("{kind} {value:?}: {} site(s)", hits.len());
+    for (i, s) in hits.iter().take(200) {
+        println!(
+            "  DEX[{i}] {}#{}  @0x{:x}  pool={}",
+            s.class_name, s.method_name, s.file_offset, s.pool_idx
+        );
+    }
+    if hits.len() > 200 {
+        println!("  ... ({} more)", hits.len() - 200);
+    }
+
+    if args.fast_xref && kind == "method" {
+        // Optional caller expansion still needs a full DEX load for the pools hit.
+        let owned = load_dexes_from_paths(
+            &args
+                .input
+                .iter()
+                .map(std::path::Path::new)
+                .collect::<Vec<_>>(),
+        )?;
+        let mut seen = std::collections::HashSet::new();
+        for (dex_i, s) in &hits {
+            if !seen.insert(s.pool_idx) {
+                continue;
             }
-            "type" => {
-                let sites = dex_decompiler::xref::find_type_xrefs(dex, value)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                println!("DEX[{i}] type {value:?}: {} site(s)", sites.len());
-                for s in sites.iter().take(200) {
-                    println!(
-                        "  {}#{}  @0x{:x}  pool={}",
-                        s.class_name, s.method_name, s.file_offset, s.pool_idx
-                    );
-                }
-            }
-            "method" => {
-                let q = dex_parser::MemberQuery {
-                    class: args.findrefs_class.as_ref().map(|c| {
-                        (dalvik_descriptor(c), !args.findrefs_fuzzy_class)
-                    }),
-                    name: Some(value.to_string()),
-                };
-                let raw = dex_parser::RawDex::from_dex(dex);
-                let mut fr = dex_parser::FastRef::from_raw(raw);
-                let sites = fr.find_methods(&q).map_err(|e| anyhow::anyhow!("{e}"))?;
-                println!("DEX[{i}] method: {} site(s)", sites.len());
-                for s in sites.iter().take(200) {
-                    println!(
-                        "  method_idx={} pool={} @0x{:x}",
-                        s.method_idx, s.pool_idx, s.file_off
-                    );
-                }
-                if args.fast_xref {
-                    let mut seen = std::collections::HashSet::new();
-                    for s in &sites {
-                        if !seen.insert(s.pool_idx) {
-                            continue;
-                        }
-                        let info = if args.fast_xref {
-                            dex_decompiler::xref::find_method_callers_fast(dex, s.pool_idx)
-                        } else {
-                            dex_decompiler::xref::find_method_callers(dex, s.pool_idx)
-                        }
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        println!(
-                            "  callers of pool {}: {} (fast-xref)",
-                            s.pool_idx,
-                            info.callers.len()
-                        );
-                    }
-                }
-            }
-            "field" => {
-                let class = args
-                    .findrefs_class
-                    .as_deref()
-                    .map(dalvik_descriptor);
-                let sites = dex_decompiler::xref::find_field_xrefs_fast(
-                    dex,
-                    class.as_deref(),
-                    Some(value),
-                    !args.findrefs_fuzzy_class,
-                )
+            let Some(dex) = owned.get(*dex_i) else { continue };
+            let info = dex_decompiler::xref::find_method_callers_fast(dex, s.pool_idx)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-                println!("DEX[{i}] field: {} site(s)", sites.len());
-                for s in sites.iter().take(200) {
-                    println!(
-                        "  {}#{}  @0x{:x}",
-                        s.class_name, s.method_name, s.file_offset
-                    );
-                }
-            }
-            other => anyhow::bail!("unknown --findrefs kind {other} (string|type|method|field)"),
+            println!(
+                "  callers of pool {}: {} (fast-xref)",
+                s.pool_idx,
+                info.callers.len()
+            );
         }
     }
     Ok(())
@@ -1354,7 +1344,7 @@ struct Args {
     #[arg(long = "getclass", value_name = "CLASS")]
     getclass: Option<String>,
 
-    /// Fast findrefs kind: string | type | method | field
+    /// Fast findrefs kind: string | type | method | field | extends | impl
     #[arg(long = "findrefs", value_name = "KIND")]
     findrefs: Option<String>,
 
