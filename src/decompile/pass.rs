@@ -666,8 +666,9 @@ fn rewrite_varids_in_text(s: &str, map: &HashMap<VarId, VarId>) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&s[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -795,8 +796,9 @@ fn rename_vars_in_text(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
             i = j;
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&s[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -933,8 +935,9 @@ fn replace_whole_ident(text: &str, var: &str, replacement: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -1642,5 +1645,26 @@ mod tests {
             }
             other => panic!("expected Return(Raw(...)), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn text_rewrites_keep_non_ascii() {
+        let text = "v1 = \"┌─┐ 友盟\" + v2; // 日志";
+        let mut map = HashMap::new();
+        map.insert(VarId::new(1, 0), VarId::new(3, 0));
+        assert_eq!(
+            rewrite_varids_in_text(text, &map),
+            "v3 = \"┌─┐ 友盟\" + v2; // 日志"
+        );
+        let mut cur_ver = HashMap::new();
+        cur_ver.insert(2u32, 1u32);
+        assert_eq!(
+            rename_vars_in_text(text, &cur_ver),
+            "v1 = \"┌─┐ 友盟\" + v2_1; // 日志"
+        );
+        assert_eq!(
+            replace_whole_ident(text, "v2", "x"),
+            "v1 = \"┌─┐ 友盟\" + x; // 日志"
+        );
     }
 }
