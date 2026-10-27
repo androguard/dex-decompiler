@@ -7698,8 +7698,13 @@ fn replace_register_names(condition: &str, reg_to_name: &HashMap<u32, String>) -
                 }
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        let ch_len = condition[i..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        result.push_str(&condition[i..i + ch_len]);
+        i += ch_len;
     }
     result
 }
@@ -8234,8 +8239,9 @@ fn replace_ident_in_body(body: &str, from: &str, to: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = body[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -9958,6 +9964,20 @@ mod tests {
         assert!(
             cfg.folded_const_offsets.contains(&4),
             "const/16 must be marked folded so it is not emitted as i2"
+        );
+    }
+
+    #[test]
+    fn text_rewrites_keep_non_ascii() {
+        let mut names = HashMap::new();
+        names.insert(0u32, "count".to_string());
+        assert_eq!(
+            replace_register_names("v0.equals(\"┌─┐ 友盟\")", &names),
+            "count.equals(\"┌─┐ 友盟\")"
+        );
+        assert_eq!(
+            replace_ident_in_body("return p0 + \"╚═╝ 日志\";", "p0", "it"),
+            "return it + \"╚═╝ 日志\";"
         );
     }
 
