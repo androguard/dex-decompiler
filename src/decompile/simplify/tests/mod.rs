@@ -717,6 +717,22 @@ mod pipeline {
         assert!(out.contains("i == 0"), "became null:\n{out}");
         assert!(!out.contains("== null"), "{out}");
     }
+
+    #[test]
+    fn text_rewrites_keep_non_ascii() {
+        assert_eq!(
+            replace_ident_as_expr("log(\"┌─┐ 友盟\", x, a.x);", "x", "y"),
+            "log(\"┌─┐ 友盟\", y, a.x);"
+        );
+        assert_eq!(
+            replace_ident_as_expr("a.日志 = 日志;", "日志", "v"),
+            "a.日志 = v;"
+        );
+        assert_eq!(
+            polish_booleanish_int_args("w.setVisible(1); s = \"╚═╝ 日志\";"),
+            "w.setVisible(true); s = \"╚═╝ 日志\";"
+        );
+    }
 }
 
 mod string_switch {

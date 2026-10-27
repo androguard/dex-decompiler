@@ -953,8 +953,9 @@ pub(crate) fn replace_ident_as_expr(text: &str, var: &str, replacement: &str) ->
             if before_ok && after_ok {
                 // Do not substitute into field names (`arr.length` is not variable `length`).
                 if i > 0 && bytes[i - 1] == b'.' {
-                    out.push(bytes[i] as char);
-                    i += 1;
+                    let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    out.push_str(&text[i..i + ch_len]);
+                    i += ch_len;
                     continue;
                 }
                 let next = bytes.get(i + v.len()).copied();
@@ -971,8 +972,9 @@ pub(crate) fn replace_ident_as_expr(text: &str, var: &str, replacement: &str) ->
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }

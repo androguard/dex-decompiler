@@ -791,8 +791,9 @@ pub(crate) fn polish_booleanish_int_args(body: &str) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = body[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
