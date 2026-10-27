@@ -720,9 +720,10 @@ fn parse_type_sig(s: &str) -> Option<(String, usize)> {
                         name.push('.');
                         i += 1;
                     }
-                    c => {
-                        name.push(c as char);
-                        i += 1;
+                    _ => {
+                        let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                        name.push_str(&s[i..i + ch_len]);
+                        i += ch_len;
                     }
                 }
             }
@@ -768,6 +769,12 @@ mod tests {
     fn signature_list_of_string() {
         let s = signature_type_to_java("Ljava/util/List<Ljava/lang/String;>;").unwrap();
         assert_eq!(s, "java.util.List<java.lang.String>");
+    }
+
+    #[test]
+    fn signature_non_ascii_class_name() {
+        let s = signature_type_to_java("Lc/a/友盟/日志<Lc/a/┌─┐;>;").unwrap();
+        assert_eq!(s, "c.a.友盟.日志<c.a.┌─┐>");
     }
 
     #[test]
