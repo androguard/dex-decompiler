@@ -733,6 +733,16 @@ mod pipeline {
             "w.setVisible(true); s = \"╚═╝ 日志\";"
         );
     }
+
+    #[test]
+    fn split_args_non_ascii_before_comma() {
+        let line = "        invoke-virtual( café, v1, Foo.bar(java.lang.String, int) );";
+        let (args, method_name) = parse_invoke_args_and_method(line).unwrap();
+        assert_eq!(args, "café, v1");
+        assert_eq!(method_name, "Foo.bar");
+        assert_eq!(split_first_arg("问题, v1").as_deref(), Some("问题"));
+        assert_eq!(split_first_arg("\"é,\", v1").as_deref(), Some("\"é,\""));
+    }
 }
 
 mod string_switch {
