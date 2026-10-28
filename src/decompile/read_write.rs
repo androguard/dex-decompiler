@@ -344,7 +344,7 @@ pub fn instruction_reads_writes(mnemonic: &str, ops_resolved: &str) -> (Vec<u32>
 fn parse_invoke_arg_regs(ops: &str) -> Vec<u32> {
     let mut depth = 0u32;
     let mut last_comma = None;
-    for (i, c) in ops.chars().enumerate() {
+    for (i, c) in ops.char_indices() {
         match c {
             '(' => depth = depth.saturating_add(1),
             ')' => depth = depth.saturating_sub(1),
@@ -361,7 +361,13 @@ fn parse_invoke_arg_regs(ops: &str) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::instruction_reads_writes;
+    use super::{instruction_reads_writes, parse_invoke_arg_regs};
+
+    #[test]
+    fn invoke_arg_regs_non_ascii_before_comma() {
+        assert_eq!(parse_invoke_arg_regs("v0, 问, Lfoo;->m(I)V"), vec![0]);
+        assert_eq!(parse_invoke_arg_regs("v2, v3, La/é;->m(II)V"), vec![2, 3]);
+    }
 
     #[test]
     fn move_read_write() {

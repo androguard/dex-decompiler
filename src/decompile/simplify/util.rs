@@ -40,7 +40,7 @@ pub(crate) fn parse_invoke_args_and_method(line: &str) -> Option<(String, String
     // Find the last comma at paren depth 0 (method ref can contain commas in param types).
     let mut depth = 0u32;
     let mut last_comma_at = None;
-    for (i, c) in inner.chars().enumerate() {
+    for (i, c) in inner.char_indices() {
         match c {
             '(' => depth = depth.saturating_add(1),
             ')' => depth = depth.saturating_sub(1),
@@ -953,8 +953,9 @@ pub(crate) fn replace_ident_as_expr(text: &str, var: &str, replacement: &str) ->
             if before_ok && after_ok {
                 // Do not substitute into field names (`arr.length` is not variable `length`).
                 if i > 0 && bytes[i - 1] == b'.' {
-                    out.push(bytes[i] as char);
-                    i += 1;
+                    let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    out.push_str(&text[i..i + ch_len]);
+                    i += ch_len;
                     continue;
                 }
                 let next = bytes.get(i + v.len()).copied();
@@ -971,8 +972,9 @@ pub(crate) fn replace_ident_as_expr(text: &str, var: &str, replacement: &str) ->
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -1157,7 +1159,7 @@ pub(crate) fn split_first_arg(args: &str) -> Option<String> {
     let mut depth = 0i32;
     let mut in_str = false;
     let mut escape = false;
-    for (i, c) in args.chars().enumerate() {
+    for (i, c) in args.char_indices() {
         if in_str {
             if escape {
                 escape = false;

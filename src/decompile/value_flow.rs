@@ -94,7 +94,7 @@ fn extract_invoke_method_ref(ops_resolved: &str) -> Option<String> {
     }
     let mut depth = 0u32;
     let mut last_comma_at = None;
-    for (i, c) in inner.chars().enumerate() {
+    for (i, c) in inner.char_indices() {
         match c {
             '(' => depth = depth.saturating_add(1),
             ')' => depth = depth.saturating_sub(1),
@@ -395,6 +395,14 @@ mod tests {
 
     fn condition_no_branch(_: &Instruction) -> String {
         "true".into()
+    }
+
+    #[test]
+    fn invoke_method_ref_non_ascii_before_comma() {
+        assert_eq!(
+            extract_invoke_method_ref("café, v1, pkg.Clz.m(java.lang.String, int)").as_deref(),
+            Some("pkg.Clz.m")
+        );
     }
 
     /// Linear bytecode: const/4 v0,0 (0..2); move v1,v0 (2..4); return v1 (4..6).

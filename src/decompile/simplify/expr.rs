@@ -230,7 +230,7 @@ pub(crate) fn split_leading_cast(expr: &str) -> Option<(String, String)> {
     }
     let mut depth = 0i32;
     let mut end = None;
-    for (i, c) in e.chars().enumerate() {
+    for (i, c) in e.char_indices() {
         match c {
             '(' => depth += 1,
             ')' => {
@@ -1287,5 +1287,26 @@ fn parse_copy_from(line: &str, from: &str) -> Option<String> {
         Some(var)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_leading_cast_non_ascii() {
+        assert_eq!(
+            split_leading_cast("(java.lang.String)\u{205f}x"),
+            Some(("java.lang.String".to_string(), "x".to_string()))
+        );
+        assert_eq!(
+            split_leading_cast("(\u{205f}java.lang.String)x"),
+            Some(("java.lang.String".to_string(), "x".to_string()))
+        );
+        assert_eq!(
+            split_leading_cast("(a.问.Foo) é"),
+            Some(("a.问.Foo".to_string(), "é".to_string()))
+        );
     }
 }

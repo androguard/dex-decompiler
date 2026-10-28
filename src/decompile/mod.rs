@@ -2161,7 +2161,7 @@ impl<'a> Decompiler<'a> {
             return Ok(None);
         }
         let indent = first_line.len() - first_line.trim_start().len();
-        let indent_str: String = first_line.chars().take(indent).collect();
+        let indent_str = first_line[..indent].to_string();
         let mut body = {
             let mut cache = self.inner_run_body_cache.borrow_mut();
             let cache_key = format!("{inner_class_name}#{sam_name}");
@@ -2294,7 +2294,7 @@ impl<'a> Decompiler<'a> {
         first_line: &str,
     ) -> Result<Option<(String, usize)>> {
         let indent = first_line.len() - first_line.trim_start().len();
-        let indent_str: String = first_line.chars().take(indent).collect();
+        let indent_str = first_line[..indent].to_string();
         let Some(inner_class_name) = self.find_inner_thread_class(enclosing_class, args.len())?
         else {
             return Ok(None);
@@ -6470,7 +6470,7 @@ fn to_super_style(target: &str, args: &str) -> (String, String) {
 
 fn find_first_comma(s: &str) -> Option<usize> {
     let mut depth = 0u32;
-    for (i, c) in s.chars().enumerate() {
+    for (i, c) in s.char_indices() {
         match c {
             '(' => depth += 1,
             ')' => depth = depth.saturating_sub(1),
@@ -6493,7 +6493,7 @@ fn parse_invoke_call_parts(ops_resolved: &str) -> Option<(String, String, Vec<St
     // Find last comma at depth 0 to split args from method ref.
     let mut depth = 0u32;
     let mut last_comma_at = None;
-    for (i, c) in inner.chars().enumerate() {
+    for (i, c) in inner.char_indices() {
         match c {
             '(' => depth = depth.saturating_add(1),
             ')' => depth = depth.saturating_sub(1),
@@ -7698,8 +7698,13 @@ fn replace_register_names(condition: &str, reg_to_name: &HashMap<u32, String>) -
                 }
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        let ch_len = condition[i..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        result.push_str(&condition[i..i + ch_len]);
+        i += ch_len;
     }
     result
 }
@@ -8234,8 +8239,9 @@ fn replace_ident_in_body(body: &str, from: &str, to: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = body[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -9959,6 +9965,36 @@ mod tests {
             cfg.folded_const_offsets.contains(&4),
             "const/16 must be marked folded so it is not emitted as i2"
         );
+    }
+
+    #[test]
+    fn text_rewrites_keep_non_ascii() {
+        let mut names = HashMap::new();
+        names.insert(0u32, "count".to_string());
+        assert_eq!(
+            replace_register_names("v0.equals(\"┌─┐ 友盟\")", &names),
+            "count.equals(\"┌─┐ 友盟\")"
+        );
+        assert_eq!(
+            replace_ident_in_body("return p0 + \"╚═╝ 日志\";", "p0", "it"),
+            "return it + \"╚═╝ 日志\";"
+        );
+    }
+
+    #[test]
+    fn invoke_split_non_ascii_before_comma() {
+        assert_eq!(
+            to_receiver_style("pkg.Clz.m", "café, v1"),
+            ("café.m".to_string(), "v1".to_string())
+        );
+        assert_eq!(
+            to_super_style("pkg.Clz.m", "this问, v1"),
+            ("super.m".to_string(), "v1".to_string())
+        );
+        let (name, args, _) =
+            parse_invoke_call_parts("café, v1, pkg.Clz.m(java.lang.String, int)").unwrap();
+        assert_eq!(name, "pkg.Clz.m");
+        assert_eq!(args, "café, v1");
     }
 
 }

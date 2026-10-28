@@ -362,7 +362,7 @@ pub(crate) fn parse_if_break_oneliner(line: &str) -> Option<String> {
     // Find matching `)` before ` break;`
     let mut depth = 0i32;
     let mut close = None;
-    for (i, c) in rest.chars().enumerate() {
+    for (i, c) in rest.char_indices() {
         match c {
             '(' => depth += 1,
             ')' => {
@@ -1707,4 +1707,17 @@ pub(crate) fn restore_try_with_resources_once(body: &str) -> String {
         return out;
     }
     body.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn if_break_oneliner_non_ascii() {
+        assert_eq!(
+            parse_if_break_oneliner("if (s.equals(\"问\")) break;").as_deref(),
+            Some("s.equals(\"问\")")
+        );
+    }
 }
